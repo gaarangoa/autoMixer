@@ -27,6 +27,32 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
+app.get("/", (_req, res) => {
+  res.type("html").send(`
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>AutoMixer API</title>
+        <style>
+          body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0d1014; color: #e8edf2; font-family: system-ui, sans-serif; }
+          main { max-width: 520px; padding: 24px; line-height: 1.5; }
+          a { color: #7fb4ff; }
+          code { background: #171d24; padding: 2px 6px; border-radius: 4px; }
+        </style>
+      </head>
+      <body>
+        <main>
+          <h1>AutoMixer API</h1>
+          <p>The API is running. Open the app at <a href="http://127.0.0.1:5173/">http://127.0.0.1:5173/</a>.</p>
+          <p>Health check: <a href="/api/health"><code>/api/health</code></a></p>
+        </main>
+      </body>
+    </html>
+  `);
+});
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "automixer", mode: "node-poc" });
 });
