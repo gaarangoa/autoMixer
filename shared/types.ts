@@ -241,6 +241,35 @@ export type AssistantRequest = {
   selectedTimeRange?: { startSample: number; endSample: number };
   ollamaBaseUrl?: string;
   ollamaModel?: string;
+  recentCritique?: MixCritique;
+};
+
+export type CritiqueSeverity = "low" | "medium" | "high";
+
+export type CritiqueIssue = {
+  category: string;
+  severity: CritiqueSeverity;
+  message: string;
+  suggestedSkills?: string[];
+};
+
+export type TrackCritique = {
+  trackId: Id;
+  trackName: string;
+  rating: number;
+  issues: CritiqueIssue[];
+  strengths: string[];
+};
+
+export type MixCritique = {
+  mixScore: number;
+  summary: string;
+  headroomDb: number;
+  integratedLufsEstimate: number;
+  truePeakDbEstimate: number;
+  mixIssues: CritiqueIssue[];
+  perTrack: TrackCritique[];
+  recommendedNextSteps: string[];
 };
 
 export type AssistantResponse =
@@ -256,4 +285,5 @@ export type AssistantResponse =
       perActionNotes?: string[];
     }
   | { status: "clarification"; question: string; reason: string }
+  | { status: "critique"; critique: MixCritique; selectedSkills: string[] }
   | { status: "err"; kind: string; message: string; rawModelOutput?: string };

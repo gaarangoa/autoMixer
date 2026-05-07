@@ -301,6 +301,51 @@ pub struct AssistantRequest {
     pub selected_region_ids: Vec<Id>,
     pub ollama_base_url: Option<String>,
     pub ollama_model: Option<String>,
+    #[serde(default)]
+    pub recent_critique: Option<MixCritique>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CritiqueSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CritiqueIssue {
+    pub category: String,
+    pub severity: CritiqueSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_skills: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackCritique {
+    pub track_id: Id,
+    pub track_name: String,
+    pub rating: f32,
+    pub issues: Vec<CritiqueIssue>,
+    #[serde(default)]
+    pub strengths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixCritique {
+    pub mix_score: f32,
+    pub summary: String,
+    pub headroom_db: f32,
+    pub integrated_lufs_estimate: f32,
+    pub true_peak_db_estimate: f32,
+    pub mix_issues: Vec<CritiqueIssue>,
+    pub per_track: Vec<TrackCritique>,
+    #[serde(default)]
+    pub recommended_next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +368,11 @@ pub enum AssistantResponse {
     Clarification {
         question: String,
         reason: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Critique {
+        critique: MixCritique,
+        selected_skills: Vec<String>,
     },
     #[serde(rename_all = "camelCase")]
     Err {

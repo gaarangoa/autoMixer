@@ -102,6 +102,20 @@ pub async fn handle_assistant(
         ));
     }
 
+    if selected_skills.iter().any(|s| s == "critique") {
+        return match try_model_critique(&base_url, &model, &request, &project.session, &selected_skills).await {
+            Ok(critique) => Ok((AssistantResponse::Critique { critique, selected_skills }, project)),
+            Err(detail) => Ok((
+                AssistantResponse::Err {
+                    kind: "ModelInvalidJson".into(),
+                    message: format!("Model {model} did not produce a valid critique: {}", detail.message),
+                    raw_model_output: detail.raw,
+                },
+                project,
+            )),
+        };
+    }
+
     let attempt =
         try_model_actions(&base_url, &model, &request, &project.session, &selected_skills).await;
 
@@ -276,7 +290,9 @@ async fn model_select_skills(
          Selected region ids: {:?}\n\n\
          Request: {}\n\n\
          Pick 1-3 skills that best fit. If undo/redo, include safety_undo. \
-         If render/export, include render_export. If section/region/chorus/verse, include region_automation.",
+         If render/export, include render_export. If section/region/chorus/verse, include region_automation. \
+         If the user is asking for a rating, critique, review, evaluation, feedback, or score \
+         (and NOT asking to apply changes), use ONLY the critique skill — do not combine it with action skills.",
         serde_json::to_string(&skill_catalog()).ok()?,
         serde_json::to_string(
             &session
@@ -338,6 +354,22 @@ async fn try_model_actions(
         .map(|(i, r)| (format!("rg{i}"), r.id.clone()))
         .collect();
     let snapshot = build_capability_snapshot(session, selected_skills);
+    let critique_block = match request.recent_critique.as_ref() {
+        Some(c) => format!(
+            "Recent critique you produced for this mix (use it as your guide; do not contradict your own findings unless the user disagrees):\n{}\n\n",
+            serde_json::to_string(&json!({
+                "mixScore": c.mix_score,
+                "summary": c.summary,
+                "headroomDb": c.headroom_db,
+                "integratedLufsEstimate": c.integrated_lufs_estimate,
+                "truePeakDbEstimate": c.true_peak_db_estimate,
+                "mixIssues": c.mix_issues,
+                "perTrack": c.per_track,
+                "recommendedNextSteps": c.recommended_next_steps,
+            })).unwrap_or_else(|_| "{}".into())
+        ),
+        None => String::new(),
+    };
     let prompt = format!(
         "You are an assistant mix engineer. Return ONLY a JSON object with this exact shape:\n\
          {{\n  \"actions\": [ <action>, ... ],\n  \"rationale\": \"...\",\n  \"perActionNotes\": [ \"...\", ... ]\n}}\n\n\
@@ -381,6 +413,7 @@ async fn try_model_actions(
          compressed material, > 14 is highly dynamic; peakDb close to 0 indicates limited headroom.\n\n\
          rationale: 1-3 sentences explaining the musical reason for the chosen moves. \
          perActionNotes: one short note per action in the same order. Both are required.\n\n\
+         {}\
          Request: {}\n",
         serde_json::to_string(selected_skills).unwrap_or_else(|_| "[]".into()),
         serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into()),
@@ -394,6 +427,7 @@ async fn try_model_actions(
         .unwrap_or_else(|_| "[]".into()),
         request.selected_track_ids,
         request.selected_region_ids,
+        critique_block,
         request.user_text
     );
 
@@ -465,6 +499,130 @@ async fn try_model_actions(
             raw: Some(repaired_real),
             parse_error: Some(format!("First parse failed ({first_error}); repair parse failed ({error}).")),
         },
+    }
+}
+
+pub struct CritiqueError {
+    pub message: String,
+    pub raw: Option<String>,
+}
+
+async fn try_model_critique(
+    base_url: &str,
+    model: &str,
+    request: &AssistantRequest,
+    session: &MixSession,
+    selected_skills: &[String],
+) -> Result<crate::model::MixCritique, CritiqueError> {
+    if session.tracks.is_empty() {
+        return Err(CritiqueError {
+            message: "Session has no tracks to critique.".into(),
+            raw: None,
+        });
+    }
+    let track_aliases: Vec<(String, String)> = session
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (format!("tk{i}"), t.id.clone()))
+        .collect();
+
+    // Render the session offline and analyze the master bus output.
+    let rendered = crate::engine::render::render_session_to_buffer(session)
+        .map_err(|e| CritiqueError { message: format!("offline render failed: {e}"), raw: None })?;
+    let master = crate::engine::source::analysis::analyze(
+        &rendered.samples,
+        rendered.channels,
+        rendered.sample_rate,
+    );
+    let true_peak_db = compute_true_peak_db(&rendered.samples);
+    let headroom_db = (-master.peak_db).max(0.0);
+
+    // Per-track snapshot mirrors the action-pipeline format so the model has
+    // the same vocabulary it already knows.
+    let snapshot = build_capability_snapshot(
+        session,
+        &["balance".into(), "tonal_eq".into(), "dynamics".into(), "space_depth".into()],
+    );
+    let master_block = json!({
+        "peakDb": round1(master.peak_db),
+        "rmsDb": round1(master.rms_db),
+        "lufs": round1(master.lufs),
+        "spectralCentroidHz": round0(master.spectral_centroid_hz),
+        "bandEnergy": {
+            "low": round2(master.low_energy),
+            "mid": round2(master.mid_energy),
+            "high": round2(master.high_energy),
+        },
+        "silencePercent": round1(master.silence_percent),
+        "dynamicRangeDb": round1(master.dynamic_range_db),
+        "truePeakDbEstimate": round1(true_peak_db),
+        "headroomDb": round1(headroom_db),
+    });
+
+    let prompt = format!(
+        "You are a senior mix engineer giving a critical assessment. Return ONLY a JSON object with this exact shape:\n\
+         {{\n  \"mixScore\": <0-10>,\n  \"summary\": \"<2-4 sentence overall verdict>\",\n  \"headroomDb\": <number>,\n  \"integratedLufsEstimate\": <number>,\n  \"truePeakDbEstimate\": <number>,\n  \"mixIssues\": [{{\"category\": \"...\", \"severity\": \"low|medium|high\", \"message\": \"...\", \"suggestedSkills\": [\"...\"]}}],\n  \"perTrack\": [{{\"trackId\": \"tk0\", \"trackName\": \"...\", \"rating\": <0-10>, \"issues\": [...], \"strengths\": [\"...\"]}}],\n  \"recommendedNextSteps\": [\"<short action>\", ...]\n}}\n\n\
+         Use ONLY trackId values from the Tracks list (tk0, tk1, ...). Categories should be one of: balance, tonality, dynamics, space, headroom, mono_compatibility. Severity reflects how much it hurts the mix.\n\n\
+         Use the audio analysis values to ground the critique. Reference the numbers when calling out issues (e.g. \"vocal centroid is 1100 Hz — too dark\"). Don't praise things that aren't there; if a track sounds fine, leave issues empty.\n\n\
+         Suggested skills must come from this set: balance, tonal_eq, dynamics, space_depth, region_automation.\n\n\
+         Master bus analysis:\n{}\n\n\
+         Per-track capability snapshot (current parameter values + audio analysis):\n{}\n\n\
+         Tracks summary:\n{}\n\n\
+         Selected track ids: {:?}\n\
+         User request: {}\n\n\
+         Audio interpretation guide: spectralCentroidHz < 1500 = dark, > 3500 = bright; bandEnergy.low > 0.6 with high < 0.1 = muddy; lufs around -23 = broadcast loudness; dynamicRangeDb < 6 = squashed, > 14 = highly dynamic; peakDb above -1 = limited headroom; truePeakDbEstimate above 0 dBTP = inter-sample clipping risk on lossy codecs.\n",
+        master_block,
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into()),
+        serde_json::to_string(
+            &session
+                .tracks
+                .iter()
+                .map(|t| json!({"id": t.id, "name": t.name, "role": t.role, "gainDb": t.gain_db, "pan": t.pan}))
+                .collect::<Vec<_>>()
+        )
+        .unwrap_or_else(|_| "[]".into()),
+        request.selected_track_ids,
+        request.user_text
+    );
+
+    let prompt = substitute_quoted(&prompt, &track_aliases, true);
+    let _ = selected_skills; // currently unused but kept for future skill-scoped critique
+    let raw_aliased = ollama_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS)
+        .await
+        .ok_or_else(|| CritiqueError { message: "Ollama did not respond within the timeout.".into(), raw: None })?;
+    eprintln!("[assistant] critique raw response:\n{raw_aliased}");
+
+    let raw_real = substitute_quoted(&raw_aliased, &track_aliases, false);
+    let extracted = extract_json_object(&raw_real).unwrap_or_else(|| raw_real.clone());
+    serde_json::from_str::<crate::model::MixCritique>(&extracted).map_err(|err| CritiqueError {
+        message: err.to_string(),
+        raw: Some(raw_real),
+    })
+}
+
+/// Cheap true-peak estimator: 4× linear oversampling and take the max abs sample.
+/// Not ITU-R BS.1770 grade, but close enough to flag inter-sample clipping risk.
+fn compute_true_peak_db(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return -120.0;
+    }
+    let mut max = 0.0_f32;
+    for w in samples.windows(2) {
+        let a = w[0];
+        let b = w[1];
+        let q1 = a + 0.25 * (b - a);
+        let q2 = a + 0.5 * (b - a);
+        let q3 = a + 0.75 * (b - a);
+        let m = a.abs().max(b.abs()).max(q1.abs()).max(q2.abs()).max(q3.abs());
+        if m > max {
+            max = m;
+        }
+    }
+    if max <= 0.0 {
+        -120.0
+    } else {
+        20.0 * max.log10()
     }
 }
 

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Download, FilePlus2, MessageSquare, Pause, Play, Power, RefreshCw, RotateCcw, RotateCw, Settings, Square, Trash2, Upload } from "lucide-react";
-import type { AssistantResponse, HistoryEntry, JsonPatch, MixAction, MixProject, MixSession, Track } from "../../shared/types";
+import type { AssistantResponse, HistoryEntry, JsonPatch, MixAction, MixCritique, MixProject, MixSession, Track } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
 
@@ -155,20 +155,23 @@ export function App() {
     }
   }
 
-  async function sendChat() {
-    if (!session || !chatText.trim()) return;
-    const userText = chatText.trim();
-    setChatText("");
+  async function sendChat(overrideText?: string) {
+    if (!session) return;
+    const userText = (overrideText ?? chatText).trim();
+    if (!userText) return;
+    if (overrideText === undefined) setChatText("");
     setMessages((items) => [...items, { role: "user", text: userText }]);
     setBusy(true);
     try {
+      const recentCritique = findLatestCritique(messages);
       const response = await api.assistant({
         sessionId: session.id,
         userText,
         selectedTrackIds,
         selectedRegionIds,
         ollamaBaseUrl: ollamaUrl,
-        ollamaModel
+        ollamaModel,
+        recentCritique
       });
       handleAssistantResponse(response);
     } catch (error) {
@@ -199,6 +202,11 @@ export function App() {
       ]);
     } else if (response.status === "clarification") {
       setMessages((items) => [...items, { role: "assistant", text: response.question }]);
+    } else if (response.status === "critique") {
+      setMessages((items) => [
+        ...items,
+        { role: "critique", critique: response.critique, skills: response.selectedSkills }
+      ]);
     } else {
       const text = response.rawModelOutput
         ? `${response.message}\n\nModel output:\n${response.rawModelOutput}`
@@ -404,6 +412,24 @@ export function App() {
             <div className="hint">Select a track and ask for a mix change.</div>
           ) : (
             messages.map((message, index) => {
+              if (message.role === "critique") {
+                const isLatestCritique = findLatestCritique(messages) === message.critique;
+                return (
+                  <CritiqueCard
+                    key={index}
+                    critique={message.critique}
+                    skills={message.skills}
+                    session={session}
+                    onApply={isLatestCritique && !busy ? () => {
+                      const steps = message.critique.recommendedNextSteps;
+                      const text = steps.length > 0
+                        ? `Apply your recommended next steps: ${steps.map((s, i) => `(${i + 1}) ${s}`).join(" ")}`
+                        : "Apply the fixes from your critique above.";
+                      void sendChat(text);
+                    } : undefined}
+                  />
+                );
+              }
               if (message.role === "assistant-turn") {
                 const canToggle = message.forwardPatch.length > 0;
                 return (
@@ -549,10 +575,13 @@ type AssistantTurnMessage = {
   applied: boolean;
 };
 
+type CritiqueMessage = { role: "critique"; critique: MixCritique; skills: string[] };
+
 type ChatMessage =
   | { role: "user"; text: string }
   | { role: "assistant"; text: string }
   | { role: "system"; text: string }
+  | CritiqueMessage
   | AssistantTurnMessage;
 
 type ActionDescription = {
@@ -664,6 +693,118 @@ function AssistantTurn({
           ))}
         </ul>
       ) : null}
+    </div>
+  );
+}
+
+function findLatestCritique(messages: ChatMessage[]): MixCritique | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "critique") return m.critique;
+  }
+  return undefined;
+}
+
+function CritiqueCard({ critique, skills, session, onApply }: { critique: MixCritique; skills: string[]; session: MixSession; onApply?: () => void }) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const ratingClass = (n: number) => (n >= 8 ? "good" : n >= 5 ? "ok" : "poor");
+  const sevClass = (s: string) => `crit-sev crit-sev-${s}`;
+  const trackName = (id: string) =>
+    session.tracks.find((t) => t.id === id)?.name ?? id;
+
+  return (
+    <div className="message critique">
+      <div className="crit-head">
+        <div className={`crit-score ${ratingClass(critique.mixScore)}`}>
+          <span className="crit-score-value">{critique.mixScore.toFixed(1)}</span>
+          <span className="crit-score-label">/ 10</span>
+        </div>
+        <div className="crit-summary">
+          <strong>Mix critique</strong>
+          <p>{critique.summary}</p>
+        </div>
+      </div>
+      <div className="crit-meters">
+        <span><span className="crit-meter-label">Headroom</span> {critique.headroomDb.toFixed(1)} dB</span>
+        <span><span className="crit-meter-label">Integrated</span> {critique.integratedLufsEstimate.toFixed(1)} LUFS</span>
+        <span><span className="crit-meter-label">True peak</span> {critique.truePeakDbEstimate.toFixed(1)} dBTP</span>
+      </div>
+      {critique.mixIssues.length > 0 ? (
+        <div className="crit-section">
+          <div className="crit-section-title">Mix-level issues</div>
+          <ul className="crit-issues">
+            {critique.mixIssues.map((issue, i) => (
+              <li key={i}>
+                <span className={sevClass(issue.severity)}>{issue.severity}</span>
+                <span className="crit-cat">{issue.category}</span>
+                <span className="crit-msg">{issue.message}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {critique.perTrack.length > 0 ? (
+        <div className="crit-section">
+          <div className="crit-section-title">Per-track</div>
+          <ul className="crit-tracks">
+            {critique.perTrack.map((tc) => {
+              const isOpen = expanded[tc.trackId] ?? false;
+              const hasDetails = tc.issues.length > 0 || tc.strengths.length > 0;
+              return (
+                <li key={tc.trackId}>
+                  <button
+                    type="button"
+                    className="crit-track-row"
+                    onClick={() => hasDetails && setExpanded((s) => ({ ...s, [tc.trackId]: !isOpen }))}
+                    disabled={!hasDetails}
+                  >
+                    {hasDetails ? (isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <span style={{ width: 14 }} />}
+                    <span className="crit-track-name">{trackName(tc.trackId) || tc.trackName}</span>
+                    <span className={`crit-track-rating ${ratingClass(tc.rating)}`}>{tc.rating.toFixed(1)}</span>
+                  </button>
+                  {isOpen && hasDetails ? (
+                    <div className="crit-track-detail">
+                      {tc.issues.length > 0 ? (
+                        <ul className="crit-issues">
+                          {tc.issues.map((issue, i) => (
+                            <li key={i}>
+                              <span className={sevClass(issue.severity)}>{issue.severity}</span>
+                              <span className="crit-cat">{issue.category}</span>
+                              <span className="crit-msg">{issue.message}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      {tc.strengths.length > 0 ? (
+                        <ul className="crit-strengths">
+                          {tc.strengths.map((s, i) => <li key={i}>{s}</li>)}
+                        </ul>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
+      {critique.recommendedNextSteps.length > 0 ? (
+        <div className="crit-section">
+          <div className="crit-section-title">Next steps</div>
+          <ol className="crit-next">
+            {critique.recommendedNextSteps.map((step, i) => <li key={i}>{step}</li>)}
+          </ol>
+        </div>
+      ) : null}
+      <div className="crit-foot">
+        {skills.length > 0 ? <span className="crit-skills">{skills.join(" · ")}</span> : <span />}
+        {onApply ? (
+          <button type="button" className="crit-apply" onClick={onApply}>
+            <Power size={14} />
+            <span>Apply suggestions</span>
+          </button>
+        ) : null}
+      </div>
     </div>
   );
 }

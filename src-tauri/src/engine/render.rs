@@ -31,13 +31,30 @@ pub struct RenderProgress {
     pub frames_total: u64,
 }
 
-pub fn render_session(session: &MixSession, output_path: &Path) -> Result<PathBuf, String> {
-    let path = if output_path.extension().is_some() {
-        output_path.to_path_buf()
-    } else {
-        output_path.with_extension("wav")
-    };
+pub struct RenderedMix {
+    pub samples: Vec<f32>,
+    pub channels: u16,
+    pub sample_rate: u32,
+}
 
+/// Run the offline mixer and return interleaved stereo f32 PCM in memory.
+/// Used by the assistant for analysis (e.g. critique) without writing a WAV.
+pub fn render_session_to_buffer(session: &MixSession) -> Result<RenderedMix, String> {
+    let (mut mixer, total_with_tail, channels, sample_rate) = build_render_mixer(session)?;
+    let mut block = vec![0.0_f32; RENDER_BLOCK * channels as usize];
+    let mut produced: u64 = 0;
+    let mut out: Vec<f32> = Vec::with_capacity((total_with_tail as usize) * channels as usize);
+    while produced < total_with_tail {
+        mixer.render(&mut block);
+        let frames_this_block = block.len() / channels as usize;
+        let to_write = ((total_with_tail - produced) as usize).min(frames_this_block);
+        out.extend_from_slice(&block[..to_write * channels as usize]);
+        produced += to_write as u64;
+    }
+    Ok(RenderedMix { samples: out, channels, sample_rate: session.sample_rate })
+}
+
+fn build_render_mixer(session: &MixSession) -> Result<(Mixer, u64, u16, f32), String> {
     // Load all source caches up front.
     let by_id: HashMap<&str, &SourceFile> =
         session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
@@ -133,11 +150,19 @@ pub fn render_session(session: &MixSession, output_path: &Path) -> Result<PathBu
     }
     let _ = producer.push(EngineCommand::Play);
 
-    // Run blocks until total_frames + a tail for reverb to decay.
     let tail_seconds = 2.0_f32;
     let tail_frames = (tail_seconds * sample_rate) as u64;
     let total_with_tail = total_frames + tail_frames;
+    Ok((mixer, total_with_tail, channels, sample_rate))
+}
 
+pub fn render_session(session: &MixSession, output_path: &Path) -> Result<PathBuf, String> {
+    let path = if output_path.extension().is_some() {
+        output_path.to_path_buf()
+    } else {
+        output_path.with_extension("wav")
+    };
+    let (mut mixer, total_with_tail, channels, _sample_rate) = build_render_mixer(session)?;
     let spec = WavSpec {
         channels,
         sample_rate: session.sample_rate,

@@ -52,6 +52,13 @@ pub fn skill_catalog() -> SkillCatalog {
                 &["render", "export", "bounce", "wav"],
                 &["render_mix"],
             ),
+            card(
+                "critique",
+                "Mix Critique",
+                "Use when the user asks for a rating, critique, evaluation, assessment, review, or feedback about the mix or a specific track. Returns analysis only — emits no actions.",
+                &["rate", "critique", "evaluate", "assess", "review", "feedback", "score", "how is", "what do you think"],
+                &[],
+            ),
         ],
     }
 }
