@@ -16,5 +16,5 @@
     "noEmit": true,
     "jsx": "react-jsx"
   },
-  "include": ["client/src", "server/src", "shared"]
+  "include": ["client/src", "shared"]
 }

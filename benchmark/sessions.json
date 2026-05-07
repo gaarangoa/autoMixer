@@ -1,0 +1,159 @@
+{
+  "rock5": {
+    "name": "Rock 5-piece",
+    "tracks": [
+      {
+        "id": "tk0", "name": "Kick", "role": "kick", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 180, "channels": 1, "sampleRate": 48000, "peakDb": -1.5, "rmsDb": -16, "lufs": -19, "spectralCentroidHz": 280, "bandEnergy": { "low": 0.78, "mid": 0.18, "high": 0.04 }, "silencePercent": 24, "dynamicRangeDb": 11 }
+      },
+      {
+        "id": "tk1", "name": "Snare", "role": "snare", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 180, "channels": 1, "sampleRate": 48000, "peakDb": -2, "rmsDb": -17, "lufs": -20, "spectralCentroidHz": 3800, "bandEnergy": { "low": 0.22, "mid": 0.41, "high": 0.37 }, "silencePercent": 35, "dynamicRangeDb": 14 }
+      },
+      {
+        "id": "tk2", "name": "Bass", "role": "bass", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 180, "channels": 1, "sampleRate": 48000, "peakDb": -3, "rmsDb": -14, "lufs": -16, "spectralCentroidHz": 220, "bandEnergy": { "low": 0.83, "mid": 0.13, "high": 0.04 }, "silencePercent": 8, "dynamicRangeDb": 7 }
+      },
+      {
+        "id": "tk3", "name": "Lead Vocal", "role": "lead_vocal", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 180, "channels": 1, "sampleRate": 48000, "peakDb": -2.5, "rmsDb": -19, "lufs": -22, "spectralCentroidHz": 2600, "bandEnergy": { "low": 0.28, "mid": 0.49, "high": 0.23 }, "silencePercent": 28, "dynamicRangeDb": 13 }
+      },
+      {
+        "id": "tk4", "name": "Lead Guitar", "role": "lead_guitar", "gainDb": 0, "pan": 0.2,
+        "audio": { "durationSeconds": 180, "channels": 2, "sampleRate": 48000, "peakDb": -1, "rmsDb": -13, "lufs": -15, "spectralCentroidHz": 2100, "bandEnergy": { "low": 0.15, "mid": 0.55, "high": 0.30 }, "silencePercent": 12, "dynamicRangeDb": 9 }
+      }
+    ],
+    "regions": []
+  },
+  "pop6": {
+    "name": "Pop 6-piece",
+    "tracks": [
+      {
+        "id": "tk0", "name": "Kick", "role": "kick", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 200, "channels": 1, "sampleRate": 48000, "peakDb": -2, "rmsDb": -16, "lufs": -19, "spectralCentroidHz": 260, "bandEnergy": { "low": 0.80, "mid": 0.16, "high": 0.04 }, "silencePercent": 20, "dynamicRangeDb": 10 }
+      },
+      {
+        "id": "tk1", "name": "Snare", "role": "snare", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 200, "channels": 1, "sampleRate": 48000, "peakDb": -2, "rmsDb": -18, "lufs": -21, "spectralCentroidHz": 4200, "bandEnergy": { "low": 0.18, "mid": 0.40, "high": 0.42 }, "silencePercent": 30, "dynamicRangeDb": 13 }
+      },
+      {
+        "id": "tk2", "name": "Hi-hat", "role": "hihat", "gainDb": -3, "pan": 0.3,
+        "audio": { "durationSeconds": 200, "channels": 1, "sampleRate": 48000, "peakDb": -6, "rmsDb": -22, "lufs": -25, "spectralCentroidHz": 9800, "bandEnergy": { "low": 0.05, "mid": 0.18, "high": 0.77 }, "silencePercent": 10, "dynamicRangeDb": 8 }
+      },
+      {
+        "id": "tk3", "name": "Bass", "role": "bass", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 200, "channels": 1, "sampleRate": 48000, "peakDb": -3, "rmsDb": -14, "lufs": -17, "spectralCentroidHz": 200, "bandEnergy": { "low": 0.82, "mid": 0.14, "high": 0.04 }, "silencePercent": 5, "dynamicRangeDb": 6 }
+      },
+      {
+        "id": "tk4", "name": "Lead Vocal", "role": "lead_vocal", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 200, "channels": 1, "sampleRate": 48000, "peakDb": -2, "rmsDb": -19, "lufs": -22, "spectralCentroidHz": 2400, "bandEnergy": { "low": 0.30, "mid": 0.50, "high": 0.20 }, "silencePercent": 25, "dynamicRangeDb": 12 }
+      },
+      {
+        "id": "tk5", "name": "Piano", "role": "piano", "gainDb": -2, "pan": -0.2,
+        "audio": { "durationSeconds": 200, "channels": 2, "sampleRate": 48000, "peakDb": -4, "rmsDb": -18, "lufs": -21, "spectralCentroidHz": 1800, "bandEnergy": { "low": 0.32, "mid": 0.46, "high": 0.22 }, "silencePercent": 18, "dynamicRangeDb": 14 }
+      }
+    ],
+    "regions": [
+      { "id": "rg0", "name": "Chorus 1", "startSample": 1920000, "endSample": 3840000, "trackIds": [] },
+      { "id": "rg1", "name": "Verse 2", "startSample": 3840000, "endSample": 5760000, "trackIds": [] }
+    ]
+  },
+  "acoustic4": {
+    "name": "Acoustic 4-piece",
+    "tracks": [
+      {
+        "id": "tk0", "name": "Lead Vocal", "role": "lead_vocal", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 220, "channels": 1, "sampleRate": 48000, "peakDb": -2, "rmsDb": -20, "lufs": -23, "spectralCentroidHz": 1300, "bandEnergy": { "low": 0.45, "mid": 0.42, "high": 0.13 }, "silencePercent": 30, "dynamicRangeDb": 15 }
+      },
+      {
+        "id": "tk1", "name": "Acoustic Guitar", "role": "acoustic_guitar", "gainDb": 0, "pan": -0.4,
+        "audio": { "durationSeconds": 220, "channels": 2, "sampleRate": 48000, "peakDb": -3, "rmsDb": -16, "lufs": -19, "spectralCentroidHz": 2800, "bandEnergy": { "low": 0.20, "mid": 0.45, "high": 0.35 }, "silencePercent": 6, "dynamicRangeDb": 12 }
+      },
+      {
+        "id": "tk2", "name": "Bass", "role": "bass", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 220, "channels": 1, "sampleRate": 48000, "peakDb": -4, "rmsDb": -15, "lufs": -18, "spectralCentroidHz": 180, "bandEnergy": { "low": 0.86, "mid": 0.11, "high": 0.03 }, "silencePercent": 4, "dynamicRangeDb": 8 }
+      },
+      {
+        "id": "tk3", "name": "Drums", "role": "drums", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 220, "channels": 2, "sampleRate": 48000, "peakDb": -2, "rmsDb": -16, "lufs": -19, "spectralCentroidHz": 2300, "bandEnergy": { "low": 0.40, "mid": 0.34, "high": 0.26 }, "silencePercent": 18, "dynamicRangeDb": 14 }
+      }
+    ],
+    "regions": []
+  },
+  "edm5": {
+    "name": "EDM 5-piece",
+    "tracks": [
+      {
+        "id": "tk0", "name": "Kick", "role": "kick", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 240, "channels": 1, "sampleRate": 48000, "peakDb": -0.5, "rmsDb": -10, "lufs": -13, "spectralCentroidHz": 240, "bandEnergy": { "low": 0.85, "mid": 0.12, "high": 0.03 }, "silencePercent": 6, "dynamicRangeDb": 4 }
+      },
+      {
+        "id": "tk1", "name": "Sub Bass", "role": "bass", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 240, "channels": 1, "sampleRate": 48000, "peakDb": -3, "rmsDb": -12, "lufs": -15, "spectralCentroidHz": 90, "bandEnergy": { "low": 0.94, "mid": 0.05, "high": 0.01 }, "silencePercent": 4, "dynamicRangeDb": 5 }
+      },
+      {
+        "id": "tk2", "name": "Lead Synth", "role": "synth", "gainDb": -1, "pan": 0.1,
+        "audio": { "durationSeconds": 240, "channels": 2, "sampleRate": 48000, "peakDb": -2, "rmsDb": -13, "lufs": -16, "spectralCentroidHz": 3400, "bandEnergy": { "low": 0.10, "mid": 0.45, "high": 0.45 }, "silencePercent": 20, "dynamicRangeDb": 6 }
+      },
+      {
+        "id": "tk3", "name": "Pad", "role": "pad", "gainDb": -4, "pan": 0,
+        "audio": { "durationSeconds": 240, "channels": 2, "sampleRate": 48000, "peakDb": -8, "rmsDb": -22, "lufs": -25, "spectralCentroidHz": 1500, "bandEnergy": { "low": 0.28, "mid": 0.47, "high": 0.25 }, "silencePercent": 5, "dynamicRangeDb": 4 }
+      },
+      {
+        "id": "tk4", "name": "Vocal Chop", "role": "lead_vocal", "gainDb": -2, "pan": 0,
+        "audio": { "durationSeconds": 240, "channels": 1, "sampleRate": 48000, "peakDb": -3, "rmsDb": -16, "lufs": -19, "spectralCentroidHz": 2900, "bandEnergy": { "low": 0.18, "mid": 0.50, "high": 0.32 }, "silencePercent": 50, "dynamicRangeDb": 9 }
+      }
+    ],
+    "regions": [
+      { "id": "rg0", "name": "Drop 1", "startSample": 2400000, "endSample": 4800000, "trackIds": [] }
+    ]
+  },
+  "muddy_mix": {
+    "name": "Muddy mix (intentionally problematic)",
+    "tracks": [
+      {
+        "id": "tk0", "name": "Kick", "role": "kick", "gainDb": -1, "pan": 0,
+        "audio": { "durationSeconds": 200, "channels": 1, "sampleRate": 48000, "peakDb": -2, "rmsDb": -15, "lufs": -18, "spectralCentroidHz": 220, "bandEnergy": { "low": 0.86, "mid": 0.12, "high": 0.02 }, "silencePercent": 22, "dynamicRangeDb": 10 }
+      },
+      {
+        "id": "tk1", "name": "Bass", "role": "bass", "gainDb": 1, "pan": 0,
+        "audio": { "durationSeconds": 200, "channels": 1, "sampleRate": 48000, "peakDb": -1, "rmsDb": -12, "lufs": -15, "spectralCentroidHz": 160, "bandEnergy": { "low": 0.88, "mid": 0.10, "high": 0.02 }, "silencePercent": 4, "dynamicRangeDb": 5 }
+      },
+      {
+        "id": "tk2", "name": "Lead Vocal", "role": "lead_vocal", "gainDb": -1, "pan": 0,
+        "audio": { "durationSeconds": 200, "channels": 1, "sampleRate": 48000, "peakDb": -3, "rmsDb": -22, "lufs": -25, "spectralCentroidHz": 1100, "bandEnergy": { "low": 0.55, "mid": 0.35, "high": 0.10 }, "silencePercent": 32, "dynamicRangeDb": 16 }
+      },
+      {
+        "id": "tk3", "name": "Rhythm Guitar", "role": "rhythm_guitar", "gainDb": 0, "pan": 0.3,
+        "audio": { "durationSeconds": 200, "channels": 2, "sampleRate": 48000, "peakDb": -2, "rmsDb": -14, "lufs": -17, "spectralCentroidHz": 1600, "bandEnergy": { "low": 0.42, "mid": 0.40, "high": 0.18 }, "silencePercent": 10, "dynamicRangeDb": 7 }
+      },
+      {
+        "id": "tk4", "name": "Piano", "role": "piano", "gainDb": -2, "pan": -0.3,
+        "audio": { "durationSeconds": 200, "channels": 2, "sampleRate": 48000, "peakDb": -4, "rmsDb": -18, "lufs": -21, "spectralCentroidHz": 1500, "bandEnergy": { "low": 0.40, "mid": 0.40, "high": 0.20 }, "silencePercent": 12, "dynamicRangeDb": 12 }
+      }
+    ],
+    "regions": []
+  },
+  "dark_band": {
+    "name": "Dark band mix",
+    "tracks": [
+      {
+        "id": "tk0", "name": "Lead Vocal", "role": "lead_vocal", "gainDb": -2, "pan": 0,
+        "audio": { "durationSeconds": 210, "channels": 1, "sampleRate": 48000, "peakDb": -4, "rmsDb": -22, "lufs": -25, "spectralCentroidHz": 1200, "bandEnergy": { "low": 0.48, "mid": 0.42, "high": 0.10 }, "silencePercent": 30, "dynamicRangeDb": 15 }
+      },
+      {
+        "id": "tk1", "name": "Drums", "role": "drums", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 210, "channels": 2, "sampleRate": 48000, "peakDb": -2, "rmsDb": -16, "lufs": -19, "spectralCentroidHz": 1800, "bandEnergy": { "low": 0.50, "mid": 0.35, "high": 0.15 }, "silencePercent": 16, "dynamicRangeDb": 13 }
+      },
+      {
+        "id": "tk2", "name": "Bass", "role": "bass", "gainDb": 0, "pan": 0,
+        "audio": { "durationSeconds": 210, "channels": 1, "sampleRate": 48000, "peakDb": -3, "rmsDb": -14, "lufs": -17, "spectralCentroidHz": 170, "bandEnergy": { "low": 0.85, "mid": 0.12, "high": 0.03 }, "silencePercent": 5, "dynamicRangeDb": 7 }
+      },
+      {
+        "id": "tk3", "name": "Lead Guitar", "role": "lead_guitar", "gainDb": 0, "pan": 0.3,
+        "audio": { "durationSeconds": 210, "channels": 2, "sampleRate": 48000, "peakDb": -2, "rmsDb": -15, "lufs": -18, "spectralCentroidHz": 1400, "bandEnergy": { "low": 0.40, "mid": 0.45, "high": 0.15 }, "silencePercent": 15, "dynamicRangeDb": 9 }
+      }
+    ],
+    "regions": []
+  }
+}

@@ -15,13 +15,13 @@ export type TrackAnalysis = {
 export type SourceFile = {
   id: Id;
   originalName: string;
-  storedName: string;
-  mimeType: string;
-  sizeBytes: number;
-  durationSamples?: number;
-  sampleRate?: number;
-  channels?: number;
-  analysis?: TrackAnalysis;
+  cachePath: string;
+  peakPath: string;
+  durationSamples: number;
+  sampleRate: number;
+  channels: number;
+  analysis: TrackAnalysis;
+  peakPreview: number[];
 };
 
 export type EqBand = {
@@ -126,6 +126,12 @@ export type MasterChannel = {
   };
 };
 
+export type Bus = {
+  id: Id;
+  name: string;
+  gainDb: number;
+};
+
 export type MixSession = {
   id: Id;
   name: string;
@@ -133,6 +139,7 @@ export type MixSession = {
   bpm?: number;
   sourceFiles: SourceFile[];
   tracks: Track[];
+  buses: Bus[];
   regions: Region[];
   markers: Marker[];
   master: MasterChannel;
@@ -161,6 +168,7 @@ export type MixProject = {
 
 export type MixAction =
   | { tool: "create_region"; name: string; startSample: number; endSample: number; trackIds?: Id[] }
+  | { tool: "delete_track"; trackId: Id }
   | { tool: "set_track_gain"; trackId: Id; gainDb: number }
   | { tool: "adjust_track_gain"; trackId: Id; deltaDb: number }
   | { tool: "set_track_pan"; trackId: Id; pan: number }
@@ -231,6 +239,8 @@ export type AssistantRequest = {
   selectedTrackIds: Id[];
   selectedRegionIds: Id[];
   selectedTimeRange?: { startSample: number; endSample: number };
+  ollamaBaseUrl?: string;
+  ollamaModel?: string;
 };
 
 export type AssistantResponse =
@@ -242,6 +252,8 @@ export type AssistantResponse =
       selectedSkills: string[];
       session: MixSession;
       history: HistoryEntry[];
+      rationale?: string;
+      perActionNotes?: string[];
     }
   | { status: "clarification"; question: string; reason: string }
   | { status: "err"; kind: string; message: string; rawModelOutput?: string };
