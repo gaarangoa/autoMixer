@@ -1,6 +1,8 @@
 pub mod actions;
 pub mod assistant;
 pub mod audio;
+pub mod audio_service;
+pub mod auto_mix;
 pub mod capabilities;
 pub mod commands;
 pub mod config;
@@ -10,8 +12,9 @@ pub mod model;
 pub mod store;
 pub mod web;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use audio_service::AudioService;
 use config::Config;
 use engine::AudioEngine;
 use store::SessionStore;
@@ -20,6 +23,7 @@ pub struct AppState {
     pub config: Config,
     pub store: Mutex<SessionStore>,
     pub audio: Mutex<AudioEngine>,
+    pub audio_service: Arc<AudioService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -30,6 +34,7 @@ pub fn run() {
 
     let engine = AudioEngine::new(block_size);
     let shared = engine.shared();
+    let audio_service = Arc::new(AudioService::spawn());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -37,6 +42,7 @@ pub fn run() {
             config,
             store: Mutex::new(store),
             audio: Mutex::new(engine),
+            audio_service,
         })
         .setup(move |app| {
             engine::telemetry::spawn_telemetry(app.handle().clone(), shared.clone());
@@ -60,6 +66,17 @@ pub fn run() {
             commands::transport_pause,
             commands::transport_stop,
             commands::transport_seek,
+            commands::set_master_bypass,
+            commands::set_master_gain,
+            commands::list_mixer_profiles,
+            commands::set_mixer_profile,
+            commands::save_chat_messages,
+            commands::rename_session,
+            commands::delete_session,
+            commands::export_project_bundle,
+            commands::import_project_bundle,
+            commands::start_auto_mix,
+            commands::analyze_master_structure,
             commands::render_mix,
         ])
         .run(tauri::generate_context!())

@@ -21,7 +21,8 @@ cpal = "0.15"
 crossbeam-channel = "0.5"
 dirs = "6"
 hound = "3"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
 realfft = "3"
 rtrb = "0.3"
 rubato = "0.16"
@@ -37,6 +38,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [profile.dev]
 opt-level = 1
+codegen-units = 1
 
 [profile.dev.package."*"]
 opt-level = 3

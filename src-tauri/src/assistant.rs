@@ -3,7 +3,7 @@ use serde_json::json;
 use tokio::time::{timeout, Duration};
 
 use crate::{
-    actions::{apply_actions, redo, undo, validate_actions},
+    actions::{apply_actions, clamp_actions, redo, undo, validate_actions},
     capabilities::skill_catalog,
     config::Config,
     model::{AssistantRequest, AssistantResponse, HistorySource, MixAction, MixProject, MixSession},
@@ -17,7 +17,10 @@ pub async fn handle_assistant(
     config: Config,
     mut project: MixProject,
     request: AssistantRequest,
+    observer_inner: std::sync::Arc<dyn LlmObserver>,
 ) -> Result<(AssistantResponse, MixProject), String> {
+    let accumulator = std::sync::Arc::new(AccumulatingObserver::new(observer_inner.clone()));
+    let observer: std::sync::Arc<dyn LlmObserver> = accumulator.clone();
     let base_url = effective_base_url(&config, &request);
     let model = effective_model(&config, &request);
 
@@ -32,7 +35,7 @@ pub async fn handle_assistant(
         ));
     }
 
-    let selected_skills = match model_select_skills(&base_url, &model, &request, &project.session).await {
+    let selected_skills = match model_select_skills(&base_url, &model, &request, &project.session, observer.as_ref()).await {
         Some(s) if !s.is_empty() => s,
         _ => {
             return Ok((
@@ -70,6 +73,7 @@ pub async fn handle_assistant(
                 history: project.history.clone(),
                 rationale: None,
                 per_action_notes: None,
+                tokens: None,
             },
             project,
         ));
@@ -97,13 +101,14 @@ pub async fn handle_assistant(
                 history: project.history.clone(),
                 rationale: None,
                 per_action_notes: None,
+                tokens: None,
             },
             project,
         ));
     }
 
     if selected_skills.iter().any(|s| s == "critique") {
-        return match try_model_critique(&base_url, &model, &request, &project.session, &selected_skills).await {
+        return match try_model_critique(&base_url, &model, &request, &project.session, &selected_skills, observer.as_ref()).await {
             Ok(critique) => Ok((AssistantResponse::Critique { critique, selected_skills }, project)),
             Err(detail) => Ok((
                 AssistantResponse::Err {
@@ -117,7 +122,7 @@ pub async fn handle_assistant(
     }
 
     let attempt =
-        try_model_actions(&base_url, &model, &request, &project.session, &selected_skills).await;
+        try_model_actions(&base_url, &model, &request, &project.session, &selected_skills, observer.as_ref()).await;
 
     let (actions, rationale, per_action_notes) = match attempt.turn {
         Some(turn) if !turn.actions.is_empty() => (turn.actions, turn.rationale, turn.per_action_notes),
@@ -156,6 +161,8 @@ pub async fn handle_assistant(
         ));
     }
 
+    let mut actions = actions;
+    let warnings = clamp_actions(&mut actions);
     if let Err(message) = validate_actions(&project.session, &actions) {
         return Ok((
             AssistantResponse::Err { kind: "InvalidActions".into(), message, raw_model_output: None },
@@ -172,16 +179,22 @@ pub async fn handle_assistant(
         Some(explanation.clone()),
     )?;
 
+    let stats = accumulator.snapshot();
     Ok((
         AssistantResponse::Ok {
             explanation,
             actions,
-            warnings: Vec::new(),
+            warnings,
             selected_skills,
             session: project.session.clone(),
             history: project.history.clone(),
             rationale,
             per_action_notes,
+            tokens: Some(crate::model::TurnTokens {
+                prompt: stats.prompt_tokens,
+                response: stats.response_tokens,
+                elapsed_ms: stats.elapsed_ms,
+            }),
         },
         project,
     ))
@@ -206,9 +219,15 @@ fn effective_model(config: &Config, request: &AssistantRequest) -> String {
         .to_string()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct GenerateResponse {
     response: String,
+    #[serde(default)]
+    prompt_eval_count: Option<u32>,
+    #[serde(default)]
+    eval_count: Option<u32>,
+    #[serde(default)]
+    done: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -218,17 +237,67 @@ struct GenerateRequest<'a> {
     stream: bool,
 }
 
-/// Extract a JSON object from a free-form model response. Some models wrap
-/// output in ```json fences or prose preamble; some omit anything visible
-/// (gpt-oss with format:json). Try the raw string first, then look for the
-/// first `{` and matching last `}`.
-fn extract_json_object(raw: &str) -> Option<String> {
+#[derive(Debug, Default, Clone)]
+pub struct LlmCallStats {
+    pub prompt_tokens: u32,
+    pub response_tokens: u32,
+    pub elapsed_ms: u32,
+}
+
+pub struct LlmCall {
+    pub response: String,
+    pub stats: LlmCallStats,
+}
+
+/// Callback invoked for each streamed chunk and on completion. `phase` is one
+/// of "skill", "action", "repair", "critique"; `kind` is "chunk", "stats".
+pub trait LlmObserver: Send + Sync {
+    fn chunk(&self, phase: &str, text: &str);
+    fn stats(&self, phase: &str, stats: &LlmCallStats);
+}
+
+pub struct NoopObserver;
+impl LlmObserver for NoopObserver {
+    fn chunk(&self, _phase: &str, _text: &str) {}
+    fn stats(&self, _phase: &str, _stats: &LlmCallStats) {}
+}
+
+/// Aggregates token + time stats across multiple LLM calls in one turn,
+/// while forwarding to an inner observer (typically Tauri-emitting).
+pub struct AccumulatingObserver {
+    inner: std::sync::Arc<dyn LlmObserver>,
+    pub totals: std::sync::Mutex<LlmCallStats>,
+}
+
+impl AccumulatingObserver {
+    pub fn new(inner: std::sync::Arc<dyn LlmObserver>) -> Self {
+        Self { inner, totals: std::sync::Mutex::new(LlmCallStats::default()) }
+    }
+    pub fn snapshot(&self) -> LlmCallStats {
+        self.totals.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+impl LlmObserver for AccumulatingObserver {
+    fn chunk(&self, phase: &str, text: &str) {
+        self.inner.chunk(phase, text);
+    }
+    fn stats(&self, phase: &str, stats: &LlmCallStats) {
+        if let Ok(mut t) = self.totals.lock() {
+            t.prompt_tokens += stats.prompt_tokens;
+            t.response_tokens += stats.response_tokens;
+            t.elapsed_ms += stats.elapsed_ms;
+        }
+        self.inner.stats(phase, stats);
+    }
+}
+
+/// Extract the first complete JSON object from a free-form model response.
+/// Some models wrap output in fences/prose, and some emit multiple objects.
+pub fn extract_json_object(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
-    }
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        return Some(trimmed.to_string());
     }
     let stripped = trimmed
         .trim_start_matches("```json")
@@ -236,33 +305,68 @@ fn extract_json_object(raw: &str) -> Option<String> {
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    if stripped.starts_with('{') && stripped.ends_with('}') {
-        return Some(stripped.to_string());
+
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in stripped.char_indices() {
+        if start.is_none() {
+            if ch == '{' {
+                start = Some(idx);
+                depth = 1;
+            }
+            continue;
+        }
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                let begin = start?;
+                return Some(stripped[begin..=idx].to_string());
+            }
+        }
     }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end > start {
-        Some(trimmed[start..=end].to_string())
-    } else {
-        None
-    }
+    None
 }
 
-async fn ollama_generate(
+pub async fn ollama_generate(
     base_url: &str,
     model: &str,
     prompt: &str,
     timeout_ms: u64,
-) -> Option<String> {
+    phase: &str,
+    observer: &dyn LlmObserver,
+) -> Option<LlmCall> {
+    use futures_util::StreamExt;
     if base_url.is_empty() || model.is_empty() {
         return None;
     }
+    let started = std::time::Instant::now();
     let client = reqwest::Client::new();
     let resp = timeout(
         Duration::from_millis(timeout_ms),
         client
             .post(format!("{base_url}/api/generate"))
-            .json(&GenerateRequest { model, prompt, stream: false })
+            .json(&GenerateRequest { model, prompt, stream: true })
             .send(),
     )
     .await
@@ -271,8 +375,40 @@ async fn ollama_generate(
     if !resp.status().is_success() {
         return None;
     }
-    let body = resp.json::<GenerateResponse>().await.ok()?;
-    Some(body.response)
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    let mut accumulated = String::new();
+    let mut stats = LlmCallStats::default();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.ok()?;
+        let s = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        buffer.push_str(s);
+        // Ollama streams one JSON object per line.
+        while let Some(newline) = buffer.find('\n') {
+            let line = buffer[..newline].to_string();
+            buffer.drain(..=newline);
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(part) = serde_json::from_str::<GenerateResponse>(trimmed) {
+                if !part.response.is_empty() {
+                    observer.chunk(phase, &part.response);
+                    accumulated.push_str(&part.response);
+                }
+                if part.done {
+                    stats.prompt_tokens = part.prompt_eval_count.unwrap_or(0);
+                    stats.response_tokens = part.eval_count.unwrap_or(0);
+                }
+            }
+        }
+    }
+    stats.elapsed_ms = started.elapsed().as_millis() as u32;
+    observer.stats(phase, &stats);
+    Some(LlmCall { response: accumulated, stats })
 }
 
 async fn model_select_skills(
@@ -280,6 +416,7 @@ async fn model_select_skills(
     model: &str,
     request: &AssistantRequest,
     session: &MixSession,
+    observer: &dyn LlmObserver,
 ) -> Option<Vec<String>> {
     let prompt = format!(
         "You are a mix engineer routing user requests to skills. \
@@ -306,14 +443,15 @@ async fn model_select_skills(
         request.selected_region_ids,
         request.user_text
     );
-    let raw = ollama_generate(base_url, model, &prompt, SKILL_TIMEOUT_MS).await?;
-    eprintln!("[assistant] skill raw response:\n{raw}");
-    let extracted = extract_json_object(&raw)?;
+    let call = ollama_generate(base_url, model, &prompt, SKILL_TIMEOUT_MS, "skill", observer).await?;
+    eprintln!("[assistant] skill raw response:\n{}", call.response);
+    let extracted = extract_json_object(&call.response)?;
     #[derive(Deserialize)]
     struct SkillEnvelope {
         #[serde(rename = "selectedSkillIds", alias = "selected_skill_ids")]
         ids: Vec<String>,
     }
+    let _ = call.stats; // observer already received the stats
     serde_json::from_str::<SkillEnvelope>(&extracted).ok().map(|e| {
         let mut v = e.ids;
         v.sort();
@@ -340,6 +478,7 @@ async fn try_model_actions(
     request: &AssistantRequest,
     session: &MixSession,
     selected_skills: &[String],
+    observer: &dyn LlmObserver,
 ) -> ModelAttempt {
     let track_aliases: Vec<(String, String)> = session
         .tracks
@@ -370,8 +509,11 @@ async fn try_model_actions(
         ),
         None => String::new(),
     };
+    let profile_preamble = profile_block(&session.mixer_profile);
+    let fundamentals = mixing_fundamentals_block();
+    let ai_preservation = ai_stem_preservation_block(session);
     let prompt = format!(
-        "You are an assistant mix engineer. Return ONLY a JSON object with this exact shape:\n\
+        "{profile_preamble}{fundamentals}{ai_preservation}You are an assistant mix engineer. Return ONLY a JSON object with this exact shape:\n\
          {{\n  \"actions\": [ <action>, ... ],\n  \"rationale\": \"...\",\n  \"perActionNotes\": [ \"...\", ... ]\n}}\n\n\
          Each <action> is a flat JSON object — NO wrapper key like `tool_params`. \
          The discriminator is the `tool` field (snake_case). Every other field uses camelCase. \
@@ -390,6 +532,8 @@ async fn try_model_actions(
          - {{\"tool\":\"set_reverb_send\",\"trackId\":\"...\",\"levelDb\":-18}}\n\
          - {{\"tool\":\"set_delay_send\",\"trackId\":\"...\",\"levelDb\":-22}}\n\
          - {{\"tool\":\"set_region_gain\",\"regionId\":\"...\",\"trackId\":\"...\",\"gainDb\":-1.5}}\n\
+         - {{\"tool\":\"set_master_gain\",\"gainDb\":-2.0}}  // sets master fader, applies to whole mix\n\
+         - {{\"tool\":\"adjust_master_gain\",\"deltaDb\":-3.0}}  // relative master move (use this to fix headroom)\n\
          - {{\"tool\":\"undo\"}} | {{\"tool\":\"redo\"}} | {{\"tool\":\"render_mix\"}}\n\n\
          Example of a valid response for \"add presence and tame mud on the vocal\":\n\
          {{\"actions\":[\
@@ -403,14 +547,69 @@ async fn try_model_actions(
          Tracks:\n{}\n\n\
          Selected track ids: {:?}\n\
          Selected region ids: {:?}\n\n\
+         {}\
          Routing guidance: frequency/EQ/low/mid/high/air/presence/bright/dark/harsh/muddy/body \
          requests should use EQ/filter actions, not gain. Vocal upfront/presence/clarity requests usually \
-         combine a subtle level move with presence EQ and light compression.\n\n\
+         combine a subtle level move with presence EQ and light compression. Whole-mix loudness or \
+         headroom problems must use set_master_gain or adjust_master_gain — do NOT solve them by \
+         touching every track gain.\n\n\
          Audio analysis per track is included under track.audio. Use it to ground decisions: \
          spectralCentroidHz < 1500 = dark, > 3500 = bright; bandEnergy.low/mid/high are normalized \
          shares of energy (sum ≈ 1) — high low_energy with low high_energy = muddy; lufs around \
          -23 LUFS is broadcast loudness, lower means quieter; dynamicRangeDb < 6 is heavily \
-         compressed material, > 14 is highly dynamic; peakDb close to 0 indicates limited headroom.\n\n\
+         compressed material, > 14 is highly dynamic; peakDb close to 0 indicates limited headroom. \
+         IMPORTANT: silencePercent > 50 means the track has long silent gaps (intermittent content like \
+         percussion hits or backing vox stabs) — do NOT compress that as if it were dynamic-range \
+         problem; compression of silence does nothing. A high dynamicRangeDb only justifies compression \
+         when silencePercent is also low (< 30).\n\n\
+         Per-role compressor starting points (use these as defaults, then adjust to taste — \
+         do NOT apply identical settings to every track; vary by role):\n\
+         - lead vocal:    threshold -18, ratio 2.5–3, attack 8–15 ms, release 80–120 ms, knee 6, makeup 1\n\
+         - backing vocal: threshold -20, ratio 2,    attack 12 ms,   release 150 ms,    knee 8, makeup 1\n\
+         - kick/snare:    threshold -12, ratio 4,    attack 5–10 ms, release 60 ms,     knee 2, makeup 2\n\
+         - drum bus:      threshold -14, ratio 3,    attack 20 ms,   release 80 ms,     knee 4, makeup 1\n\
+         - bass:          threshold -16, ratio 4,    attack 20 ms,   release 100 ms,    knee 4, makeup 2\n\
+         - electric gtr:  threshold -18, ratio 2.5,  attack 15 ms,   release 80 ms,     knee 6, makeup 1\n\
+         - acoustic gtr:  threshold -22, ratio 2,    attack 20 ms,   release 150 ms,    knee 8, makeup 1\n\
+         - keys/synth:    threshold -22, ratio 2,    attack 25 ms,   release 200 ms,    knee 8, makeup 0\n\
+         - percussion:    threshold -14, ratio 3,    attack 5 ms,    release 60 ms,     knee 4, makeup 1\n\
+         Reverb/delay sends should also vary by role — vocals usually -16 to -20 dB reverb, \
+         drums dry or short room -24 dB, bass usually NO reverb, leads -14 to -18 dB. Don't stamp \
+         identical send levels across all tracks — that flattens the mix.\n\n\
+         Anti-template rule: if you are emitting more than three actions of the same tool type, \
+         each one MUST have parameters that differ in a way the role/audio analysis justifies. \
+         Identical settings copy-pasted across tracks is a bug, not a mix.\n\n\
+         Restraint rules (apply regardless of profile):\n\
+         - If you cannot point to a specific measurement that justifies a move, DO NOT make it.\n\
+         - Prefer the smallest move that solves the problem. A 1 dB cut beats a 4 dB cut when both \
+           address the issue.\n\
+         - Cuts before boosts. To brighten, first cut competing low-mids; only then add high-shelf.\n\
+         - Never compress just because a track exists. Only compress when dynamicRangeDb > 10 \
+           (and silencePercent < 30 for that track). Otherwise leave the compressor untouched.\n\
+         - For the master fader, ±3 dB is a large move. Single moves above 4 dB on master \
+           require explicit measurement justification in the rationale (e.g. headroom < 1 dB).\n\
+         - One coherent turn beats five micro-adjustments. Aim for 3–8 actions total per turn, \
+           each with a clearly stated reason in perActionNotes.\n\n\
+         LUFS target follow-through: if a recent critique exists with a target loudness or \
+         headroom in its recommendedNextSteps, your job is to MOVE TOWARD that target, not just \
+         add unrelated changes. Compare the critique's measured headroom/lufs against its target — \
+         if they differ by more than 2 dB, the move is required, not optional.\n\n\
+         AI-generated stems: tracks where `aiGenerated` is true are NOT clean recordings — they \
+         are produced by a model (e.g. Suno) or extracted by a stem-separator (e.g. demucs). They \
+         carry codec/separation artifacts, residual bleed from other parts, and a steady low-level \
+         noise floor instead of true silence. Treat them differently:\n\
+         - Use BROADER EQ Q (0.5–1.0, never above 2.0). Surgical narrow-Q cuts amplify artifacts.\n\
+         - Use GENTLER compression (ratio ≤ 2:1, slow attack ≥ 20 ms, longer release ≥ 150 ms). \
+           Heavy compression pumps the noise floor.\n\
+         - LOWER reverb sends by ~6 dB versus a clean recording (e.g. -22 to -28 dB instead of \
+           -16 to -20). Reverb adds tail to the noise floor too.\n\
+         - A low-pass around 12–14 kHz is often appropriate to tame codec/AI hiss.\n\
+         - Do NOT trust silencePercent on AI tracks — the noise floor reads as non-silent. Skip \
+           the silence-vs-dynamics check entirely; treat them as continuous content.\n\
+         - Be cautious with high-pass on AI bass — sub-bass artifacts are not the same as recorded \
+           bass, but cutting too high can remove real fundamental.\n\
+         - Tonal centroid extremes on AI stems are often artifacts, not musical content — prefer \
+           gentle shelves over peak EQs.\n\n\
          rationale: 1-3 sentences explaining the musical reason for the chosen moves. \
          perActionNotes: one short note per action in the same order. Both are required.\n\n\
          {}\
@@ -421,22 +620,31 @@ async fn try_model_actions(
             &session
                 .tracks
                 .iter()
-                .map(|t| json!({"id": t.id, "name": t.name, "role": t.role, "gainDb": t.gain_db, "pan": t.pan}))
+                .map(|t| json!({"id": t.id, "name": t.name, "role": t.role, "aiGenerated": t.ai_generated, "gainDb": t.gain_db, "pan": t.pan}))
                 .collect::<Vec<_>>()
         )
         .unwrap_or_else(|_| "[]".into()),
         request.selected_track_ids,
         request.selected_region_ids,
+        sections_block(&session.sections, session.bpm),
         critique_block,
-        request.user_text
+        request.user_text,
+        fundamentals = fundamentals,
+        ai_preservation = ai_preservation,
     );
 
     let prompt = substitute_quoted(&prompt, &track_aliases, true);
     let prompt = substitute_quoted(&prompt, &region_aliases, true);
 
-    let Some(raw_aliased) = ollama_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS).await else {
+    eprintln!(
+        "[assistant] action prompt sections_block:\n{}",
+        sections_block(&session.sections, session.bpm)
+    );
+
+    let Some(call) = ollama_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS, "action", observer).await else {
         return ModelAttempt { turn: None, raw: None, parse_error: Some("Ollama did not respond within the timeout.".into()) };
     };
+    let raw_aliased = call.response;
     eprintln!("[assistant] action raw response:\n{raw_aliased}");
     let raw_real = substitute_quoted(&raw_aliased, &track_aliases, false);
     let raw_real = substitute_quoted(&raw_real, &region_aliases, false);
@@ -473,13 +681,14 @@ async fn try_model_actions(
          Do not include any other text. Original output to repair:\n{}",
         raw_aliased
     );
-    let Some(repaired_aliased) = ollama_generate(base_url, model, &repair_prompt, REPAIR_TIMEOUT_MS).await else {
+    let Some(repair_call) = ollama_generate(base_url, model, &repair_prompt, REPAIR_TIMEOUT_MS, "repair", observer).await else {
         return ModelAttempt {
             turn: None,
             raw: Some(raw_real),
             parse_error: Some(format!("First parse failed ({first_error}); repair pass timed out.")),
         };
     };
+    let repaired_aliased = repair_call.response;
     eprintln!("[assistant] repair raw response:\n{repaired_aliased}");
     let repaired_real = substitute_quoted(&repaired_aliased, &track_aliases, false);
     let repaired_real = substitute_quoted(&repaired_real, &region_aliases, false);
@@ -513,6 +722,7 @@ async fn try_model_critique(
     request: &AssistantRequest,
     session: &MixSession,
     selected_skills: &[String],
+    observer: &dyn LlmObserver,
 ) -> Result<crate::model::MixCritique, CritiqueError> {
     if session.tracks.is_empty() {
         return Err(CritiqueError {
@@ -560,17 +770,49 @@ async fn try_model_critique(
         "headroomDb": round1(headroom_db),
     });
 
+    let profile_preamble = profile_block(&session.mixer_profile);
     let prompt = format!(
-        "You are a senior mix engineer giving a critical assessment. Return ONLY a JSON object with this exact shape:\n\
+        "{profile_preamble}You are a senior mix engineer giving a critical assessment. Return ONLY a JSON object with this exact shape:\n\
          {{\n  \"mixScore\": <0-10>,\n  \"summary\": \"<2-4 sentence overall verdict>\",\n  \"headroomDb\": <number>,\n  \"integratedLufsEstimate\": <number>,\n  \"truePeakDbEstimate\": <number>,\n  \"mixIssues\": [{{\"category\": \"...\", \"severity\": \"low|medium|high\", \"message\": \"...\", \"suggestedSkills\": [\"...\"]}}],\n  \"perTrack\": [{{\"trackId\": \"tk0\", \"trackName\": \"...\", \"rating\": <0-10>, \"issues\": [...], \"strengths\": [\"...\"]}}],\n  \"recommendedNextSteps\": [\"<short action>\", ...]\n}}\n\n\
-         Use ONLY trackId values from the Tracks list (tk0, tk1, ...). Categories should be one of: balance, tonality, dynamics, space, headroom, mono_compatibility. Severity reflects how much it hurts the mix.\n\n\
+         Use ONLY trackId values from the Tracks list (tk0, tk1, ...). Categories should be one of: balance, tonality, dynamics, space, headroom, mono_compatibility, arrangement. Severity reflects how much it hurts the mix. \
+         Every entry in `mixIssues` AND every entry in `perTrack[].issues` MUST be a full object \
+         {{\"category\":\"...\",\"severity\":\"low|medium|high\",\"message\":\"...\"}}. Do NOT emit issues as plain strings.\n\n\
          Use the audio analysis values to ground the critique. Reference the numbers when calling out issues (e.g. \"vocal centroid is 1100 Hz — too dark\"). Don't praise things that aren't there; if a track sounds fine, leave issues empty.\n\n\
-         Suggested skills must come from this set: balance, tonal_eq, dynamics, space_depth, region_automation.\n\n\
+         Suggested skills must come from this set: balance, tonal_eq, dynamics, space_depth, mastering, region_automation. \
+         If headroom or whole-mix loudness is the issue, suggest the `mastering` skill (set_master_gain / adjust_master_gain), not per-track gains.\n\n\
+         Silence vs dynamics: if a track has silencePercent > 50, its high dynamicRangeDb is an \
+         artifact of silent gaps, not loud-vs-quiet musical content — do NOT label it as a dynamics \
+         problem and do NOT recommend compression for it. Only flag dynamics when silencePercent < 30 \
+         AND dynamicRangeDb > 14.\n\n\
+         Concrete next steps: when you mention a target loudness or headroom, give a specific delta. \
+         Example: \"Lower master by 3 dB to reach 4 dB headroom\" instead of \"increase headroom\". \
+         When a previous critique's targets weren't met (compare measured to its prior recommendations \
+         if visible in user_text), say so explicitly.\n\n\
+         Per-section critique: when session.sections has measurements, compare sections \
+         to each other. Flag with severity=high when measured LUFS of a chorus is at or below \
+         the LUFS of adjacent verses (energy inversion). Flag with severity=medium when two \
+         sections sharing a label (e.g. two verses) have nearly identical LUFS AND nearly \
+         identical spectralCentroidHz AND nearly identical bandEnergy (within 5%) — this is a \
+         repeat that lacks variation and should be flagged in the `arrangement` category. \
+         Flag with severity=low when an outro/intro has higher LUFS than the chorus (likely \
+         a measurement-vs-arrangement issue). Always reference the section labels and the \
+         numbers in the message.\n\n\
+         AI-generated stems (track.aiGenerated == true): do NOT critique them as if they were \
+         clean recordings. Their tonal anomalies, broad-band noise, harshness, or unusual dynamic \
+         range are USUALLY stem-separation/AI generation artifacts, not mix problems. Specifically: \
+         do not flag high silencePercent as a balance problem on AI tracks (it's noise floor, not \
+         silence); do not flag bright/dark spectral centroid as a tonal problem unless it is \
+         obviously wrong for the role; do not flag wide dynamic range as a dynamics problem. \
+         Issues you DO call out on AI tracks should focus on what the engineer can actually fix: \
+         level relative to the rest of the mix, gross EQ pockets that clash with other tracks, \
+         and how much reverb to add (less than usual). Mention briefly in the message that the \
+         track is AI-generated when this changes the recommendation.\n\n\
          Master bus analysis:\n{}\n\n\
          Per-track capability snapshot (current parameter values + audio analysis):\n{}\n\n\
          Tracks summary:\n{}\n\n\
          Selected track ids: {:?}\n\
          User request: {}\n\n\
+         {}\
          Audio interpretation guide: spectralCentroidHz < 1500 = dark, > 3500 = bright; bandEnergy.low > 0.6 with high < 0.1 = muddy; lufs around -23 = broadcast loudness; dynamicRangeDb < 6 = squashed, > 14 = highly dynamic; peakDb above -1 = limited headroom; truePeakDbEstimate above 0 dBTP = inter-sample clipping risk on lossy codecs.\n",
         master_block,
         serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into()),
@@ -578,19 +820,21 @@ async fn try_model_critique(
             &session
                 .tracks
                 .iter()
-                .map(|t| json!({"id": t.id, "name": t.name, "role": t.role, "gainDb": t.gain_db, "pan": t.pan}))
+                .map(|t| json!({"id": t.id, "name": t.name, "role": t.role, "aiGenerated": t.ai_generated, "gainDb": t.gain_db, "pan": t.pan}))
                 .collect::<Vec<_>>()
         )
         .unwrap_or_else(|_| "[]".into()),
         request.selected_track_ids,
-        request.user_text
+        request.user_text,
+        sections_block(&session.sections, session.bpm),
     );
 
     let prompt = substitute_quoted(&prompt, &track_aliases, true);
     let _ = selected_skills; // currently unused but kept for future skill-scoped critique
-    let raw_aliased = ollama_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS)
+    let crit_call = ollama_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS, "critique", observer)
         .await
         .ok_or_else(|| CritiqueError { message: "Ollama did not respond within the timeout.".into(), raw: None })?;
+    let raw_aliased = crit_call.response;
     eprintln!("[assistant] critique raw response:\n{raw_aliased}");
 
     let raw_real = substitute_quoted(&raw_aliased, &track_aliases, false);
@@ -630,7 +874,7 @@ fn compute_true_peak_db(samples: &[f32]) -> f32 {
 /// `pairs` is `[(alias, real)]`. When `to_alias` is true, replaces `"real"` with `"alias"`;
 /// otherwise replaces `"alias"` with `"real"`. The surrounding quotes ensure we only
 /// touch full JSON string values, not substrings.
-fn substitute_quoted(text: &str, pairs: &[(String, String)], to_alias: bool) -> String {
+pub fn substitute_quoted(text: &str, pairs: &[(String, String)], to_alias: bool) -> String {
     let mut out = text.to_string();
     for (alias, real) in pairs {
         let (from, to) = if to_alias {
@@ -641,6 +885,168 @@ fn substitute_quoted(text: &str, pairs: &[(String, String)], to_alias: bool) -> 
         out = out.replace(&from, &to);
     }
     out
+}
+
+pub fn profile_block(profile: &crate::model::MixerProfile) -> String {
+    let target_lufs = match profile.loudness_target.as_str() {
+        "broadcast" => "-23 LUFS integrated",
+        "streaming" => "-14 LUFS integrated",
+        "loud" => "-10 LUFS integrated (loudness war level — only when the song's style demands it)",
+        _ => "-14 LUFS integrated",
+    };
+    let aggressiveness_rule = match profile.aggressiveness.as_str() {
+        "subtle" => "Default move size is 0.5–1.5 dB. Never exceed 3 dB in one shot. Prefer the smallest move that solves the problem; if you cannot describe a measurable problem, do not act on that track.",
+        "moderate" => "Default move size is 1–3 dB. Avoid moves larger than 4 dB unless a measurement clearly demands it. Prefer one carefully-chosen action over three small simultaneous ones.",
+        "bold" => "Move size can reach 4–6 dB when the measurements support it, but still justify every move with a number from the analysis.",
+        _ => "Default move size is 1–3 dB.",
+    };
+    let eq_rule = match profile.eq_philosophy.as_str() {
+        "corrective_only" => "EQ: only correct measurable problems (mud at 200–400 Hz with high low_energy, harshness at 2–5 kHz with high mid+high). Prefer cuts to boosts. Use broad Q (0.7–1.0). No tonal shaping for taste.",
+        "tonal_shaping" => "EQ: corrective AND gentle tonal shaping (presence lifts at 2–4 kHz, air at 10–12 kHz, low-mid warmth at 200 Hz). Cuts before boosts. Q between 0.7 and 1.5.",
+        "sculpting" => "EQ: shaping is encouraged where it serves the genre. Narrow surgical cuts (Q 2–4) and broad shaping boosts both allowed. Aggressive moves OK when supported by analysis.",
+        _ => "",
+    };
+    let comp_rule = match profile.compression_philosophy.as_str() {
+        "transparent_glue" => "Compression: only for glue (≤ 2 dB GR) and to control individual peaks. Threshold sits just above the average level. Ratio 2:1, slow attack, medium release.",
+        "character" => "Compression: shape the source as well as control it. Up to 4 dB GR on individual tracks, 1–2 dB on master bus. Vary attack/release by role.",
+        "aggressive" => "Compression: heavy GR (5–8 dB on drums, 3–4 dB on vocals), pumping is acceptable for genre fit. Parallel compression encouraged.",
+        _ => "",
+    };
+    let space_rule = match profile.space.as_str() {
+        "dry" => "Reverb/delay: minimal. Most tracks ≤ -30 dB send. Only the leads get -22 to -26 dB.",
+        "tasteful" => "Reverb/delay: -18 to -24 dB sends on leads and supporting elements. Bass, kick, snare bottoms stay dry.",
+        "lush" => "Reverb/delay: -14 to -22 dB sends, longer tails acceptable. Wide stereo space.",
+        _ => "",
+    };
+    let stereo_rule = match profile.stereo_treatment.as_str() {
+        "narrow" => "Stereo: keep the image centered and focused. Avoid extreme pans (> 0.5).",
+        "natural" => "Stereo: pan to taste with the LCR principle. Most elements between ±0.4; doubled guitars / synths can go wider.",
+        "wide" => "Stereo: full LCR. Doubles fully panned, supporting elements out to ±0.7. Mono compatibility still required.",
+        _ => "",
+    };
+    let mut extras = Vec::new();
+    if let Some(eng) = &profile.reference_engineer {
+        extras.push(format!("Reference engineer: {eng} — channel that style."));
+    }
+    if let Some(genre) = &profile.genre {
+        extras.push(format!("Genre: {genre}. Decisions should suit the genre's conventions."));
+    }
+    if let Some(notes) = &profile.custom_notes {
+        if !notes.trim().is_empty() {
+            extras.push(format!("Producer notes: {notes}"));
+        }
+    }
+    format!(
+        "Mix philosophy for this session (preset `{}`):\n\
+         - Aggressiveness: {aggressiveness_rule}\n\
+         - {eq_rule}\n\
+         - {comp_rule}\n\
+         - {space_rule}\n\
+         - {stereo_rule}\n\
+         - Loudness target: {target_lufs}.\n\
+         {extras}\n\
+         These rules override any default tendency to be aggressive. When in doubt, do less — \
+         a small turn that's verifiably correct is better than a big turn that might be wrong.\n\n",
+        profile.preset_id,
+        extras = if extras.is_empty() { String::new() } else { format!("- {}\n", extras.join("\n- ")) },
+    )
+}
+
+pub fn mixing_fundamentals_block() -> &'static str {
+    "Mixing fundamentals:\n\
+     - Start with balance and musical hierarchy. The listener should understand what is lead, \
+       support, rhythm, low-end foundation, and texture. Do not make every source equally loud.\n\
+     - Preserve the emotional focus of the song. If a move makes the hook, lead vocal, groove, \
+       or main motif less clear, it is probably the wrong move.\n\
+     - Fix level and arrangement masking before reaching for EQ or compression. A 1 dB fader \
+       move or pan change is often better than a processor.\n\
+     - EQ is for separation and tone. Cut masking frequencies before boosting; use boosts only \
+       when they serve a clear role such as presence, air, weight, or excitement.\n\
+     - Carve complementary spaces: do not boost the same range on every track. If vocal presence \
+       needs 3 kHz, avoid adding competing 3 kHz energy to guitars/keys unless there is a reason.\n\
+     - Compression must solve a dynamic problem, add intentional character, or glue a role. Do \
+       not compress tracks just because a stage allows compression.\n\
+     - Transients matter. Preserve punch on drums, consonants on vocals, and articulation on \
+       rhythmic instruments unless the style intentionally wants smoothing.\n\
+     - Depth comes from level, pan, EQ, transient shape, and sends together. Use less reverb/delay \
+       on elements that should stay forward; use darker/wetter treatment for elements that should \
+       sit behind.\n\
+     - Low end is a hierarchy, not a pile-up. Kick, bass, sub, and low pads should have distinct \
+       jobs; avoid adding low-frequency weight to multiple sources at once.\n\
+     - Stereo width should support contrast. Keep anchors centered; use width for doubles, pads, \
+       rooms, and ear candy. Do not widen everything.\n\
+     - Master moves cannot repair a bad balance. Use master gain mainly for headroom/loudness; \
+       fix track-level problems at the track or section level.\n\
+     - Prefer small, reversible moves. A/B mentally against the starting point; if the benefit is \
+       not measurable or musically obvious, leave it alone.\n\n"
+}
+
+pub fn ai_stem_preservation_block(session: &crate::model::MixSession) -> String {
+    if session.tracks.is_empty() {
+        return String::new();
+    }
+    let ai_count = session.tracks.iter().filter(|track| track.ai_generated).count();
+    let all_ai = ai_count == session.tracks.len();
+    let mostly_ai = ai_count * 2 >= session.tracks.len();
+    if !mostly_ai {
+        return String::new();
+    }
+    let scope = if all_ai { "all" } else { "most" };
+    format!(
+        "Already-mixed AI stem preservation rule ({scope} tracks have aiGenerated=true):\n\
+         Assume these are stems from an already mixed source, not raw multitrack recordings. \
+         Preserve the existing musical hierarchy unless the user explicitly asks for a rebalance. \
+         Do NOT force all tracks toward similar peak or LUFS values. Lead vocals may naturally be \
+         much louder than backing vocals; backing vocals, doubles, pads, rooms, effects, and support \
+         layers may be intentionally low. Kick, snare, bass, and lead elements may dominate peaks.\n\
+         For AI-derived stems, prefer tiny changes: usually +/-0.5 to +/-1.5 dB, rarely more than \
+         +/-2 dB unless there is clipping, severe headroom trouble, or an explicit user request. \
+         Gain staging should mostly protect headroom and fix obvious imbalance; it should not \
+         normalize an already mixed arrangement.\n\n"
+    )
+}
+
+pub fn sections_block(sections: &[crate::model::MixSection], bpm: Option<f32>) -> String {
+    if sections.is_empty() {
+        return String::new();
+    }
+    let bpm_str = bpm
+        .filter(|v| *v > 0.0)
+        .map(|v| format!(" (bpm {v:.0})"))
+        .unwrap_or_default();
+    let items: Vec<_> = sections
+        .iter()
+        .map(|s| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("start".into(), json!(round1(s.start)));
+            obj.insert("end".into(), json!(round1(s.end)));
+            obj.insert("label".into(), json!(s.label));
+            if let Some(a) = &s.analysis {
+                obj.insert("lufs".into(), json!(a.lufs));
+                obj.insert("peakDb".into(), json!(a.peak_db));
+                obj.insert("rmsDb".into(), json!(a.rms_db));
+                obj.insert("spectralCentroidHz".into(), json!(a.spectral_centroid_hz));
+                obj.insert(
+                    "bandEnergy".into(),
+                    json!({"low": a.low_energy, "mid": a.mid_energy, "high": a.high_energy}),
+                );
+                obj.insert("dynamicRangeDb".into(), json!(a.dynamic_range_db));
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    format!(
+        "Detected song structure{bpm_str}: {}\n\
+         Each section has its own LUFS / peak / centroid / band-energy when analysis is available. \
+         Reason per-section: compare values across sections (e.g. \"chorus is 1.2 LUFS quieter than \
+         verse — lift master 2 dB in the chorus\"; \"bridge centroid is 4500 Hz vs verse 2100 Hz — \
+         tame the bridge with a high shelf\"). When the user references verse/chorus/bridge/etc., \
+         map to these section boundaries. To scope a move to a section, create a region with \
+         create_region using its start/end (seconds), then use set_region_gain or \
+         apply_section_automation against it. Two sections with the same label are likely repeats \
+         (verse 1 vs verse 2) — flag dramatic differences between repeats as arrangement issues.\n\n",
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
+    )
 }
 
 fn round0(x: f32) -> f32 {
@@ -654,7 +1060,7 @@ fn round2(x: f32) -> f32 {
 }
 
 /// Compact, skill-scoped snapshot of currently relevant processors / parameters.
-fn build_capability_snapshot(session: &MixSession, selected: &[String]) -> serde_json::Value {
+pub fn build_capability_snapshot(session: &MixSession, selected: &[String]) -> serde_json::Value {
     use std::collections::HashMap;
     let by_source: HashMap<&str, &crate::model::SourceFile> =
         session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
@@ -710,6 +1116,7 @@ fn build_capability_snapshot(session: &MixSession, selected: &[String]) -> serde
         track_obj.insert("id".into(), json!(t.id));
         track_obj.insert("name".into(), json!(t.name));
         track_obj.insert("role".into(), json!(t.role));
+        track_obj.insert("aiGenerated".into(), json!(t.ai_generated));
         track_obj.insert("params".into(), json!(params));
         if let Some(src) = by_source.get(t.source_file_id.as_str()) {
             let a = &src.analysis;
@@ -770,7 +1177,7 @@ pub async fn list_ollama_models(base_url: String) -> Result<Vec<String>, String>
     Ok(tags.models.into_iter().filter_map(|model| model.name).collect())
 }
 
-fn expand_skills_from_actions(mut selected: Vec<String>, actions: &[MixAction]) -> Vec<String> {
+pub fn expand_skills_from_actions(mut selected: Vec<String>, actions: &[MixAction]) -> Vec<String> {
     let catalog = crate::capabilities::skill_catalog();
     let mut additions: Vec<String> = Vec::new();
     for action in actions {
@@ -818,6 +1225,7 @@ fn explain_actions(actions: &[MixAction], session: &MixSession) -> String {
                 MixAction::SetTrackPan { .. } => format!("moved {name} in the stereo field"),
                 MixAction::MuteTrack { muted, .. } => format!("{} {name}", if *muted { "muted" } else { "unmuted" }),
                 MixAction::SoloTrack { solo, .. } => format!("{} {name}", if *solo { "soloed" } else { "unsoloed" }),
+                MixAction::SetTrackAiGenerated { ai_generated, .. } => format!("{} {name} as AI-generated", if *ai_generated { "marked" } else { "unmarked" }),
                 MixAction::SetEqBand { .. } => format!("adjusted EQ on {name}"),
                 MixAction::SetHighPass { .. } => format!("cleaned low rumble on {name}"),
                 MixAction::SetLowPass { .. } => format!("softened top end on {name}"),
@@ -825,6 +1233,8 @@ fn explain_actions(actions: &[MixAction], session: &MixSession) -> String {
                 MixAction::SetReverbSend { .. } => format!("changed reverb depth on {name}"),
                 MixAction::SetDelaySend { .. } => format!("changed delay send on {name}"),
                 MixAction::SetRegionGain { .. } | MixAction::ApplySectionAutomation { .. } => format!("created a section-scoped move for {name}"),
+                MixAction::SetMasterGain { gain_db } => format!("set master gain to {gain_db} dB"),
+                MixAction::AdjustMasterGain { delta_db } => format!("{} master by {} dB", if *delta_db > 0.0 { "raised" } else { "lowered" }, delta_db.abs()),
                 MixAction::DeleteTrack { .. } => format!("deleted {name}"),
                 MixAction::RenderMix => "prepared the current mix for render".into(),
                 _ => format!("updated {name}"),
@@ -843,6 +1253,7 @@ fn action_name(action: &MixAction) -> &'static str {
         MixAction::SetTrackPan { .. } => "set_track_pan",
         MixAction::MuteTrack { .. } => "mute_track",
         MixAction::SoloTrack { .. } => "solo_track",
+        MixAction::SetTrackAiGenerated { .. } => "set_track_ai_generated",
         MixAction::SetHighPass { .. } => "set_high_pass",
         MixAction::SetLowPass { .. } => "set_low_pass",
         MixAction::SetEqBand { .. } => "set_eq_band",
@@ -852,6 +1263,8 @@ fn action_name(action: &MixAction) -> &'static str {
         MixAction::SetProcessorParam { .. } => "set_processor_param",
         MixAction::SetRegionGain { .. } => "set_region_gain",
         MixAction::ApplySectionAutomation { .. } => "apply_section_automation",
+        MixAction::SetMasterGain { .. } => "set_master_gain",
+        MixAction::AdjustMasterGain { .. } => "adjust_master_gain",
         MixAction::Undo => "undo",
         MixAction::Redo => "redo",
         MixAction::RenderMix => "render_mix",

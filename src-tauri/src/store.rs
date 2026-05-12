@@ -43,8 +43,10 @@ impl SessionStore {
             master: default_master(),
             regions: Vec::new(),
             markers: Vec::new(),
+            sections: Vec::new(),
+            mixer_profile: crate::model::MixerProfile::default(),
         };
-        let project = MixProject { session, history: Vec::new(), redo_stack: Vec::new() };
+        let project = MixProject { session, history: Vec::new(), redo_stack: Vec::new(), chat_messages: Vec::new() };
         self.save(&project)?;
         Ok(project)
     }
@@ -120,6 +122,95 @@ impl SessionStore {
         let track = make_track(source_id, track_name, project.session.tracks.len());
         project.session.source_files.push(source);
         project.session.tracks.push(track);
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    pub fn rename_session(&self, session_id: &str, new_name: String) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        project.session.name = new_name;
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        let path = self.sessions_dir().join(format!("{session_id}.json"));
+        if path.exists() {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Write a self-contained bundle directory: project.json + audio cache +
+    /// peak files. Source paths inside the bundle are relative so the
+    /// directory can be moved or copied between machines.
+    pub fn export_project_bundle(&self, session_id: &str, bundle_dir: &Path) -> Result<(), String> {
+        let project = self.get_project(session_id)?;
+        fs::create_dir_all(bundle_dir.join("sources")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(bundle_dir.join("peaks")).map_err(|error| error.to_string())?;
+
+        let mut bundled = project.clone();
+        for src in &mut bundled.session.source_files {
+            let cache_src = PathBuf::from(&src.cache_path);
+            let cache_rel = format!("sources/{}.f32cache", src.id);
+            let cache_dst = bundle_dir.join(&cache_rel);
+            fs::copy(&cache_src, &cache_dst)
+                .map_err(|e| format!("copy cache for {}: {e}", src.original_name))?;
+            src.cache_path = cache_rel;
+
+            let peak_src = PathBuf::from(&src.peak_path);
+            let peak_rel = format!("peaks/{}.peaks.json", src.id);
+            let peak_dst = bundle_dir.join(&peak_rel);
+            fs::copy(&peak_src, &peak_dst)
+                .map_err(|e| format!("copy peaks for {}: {e}", src.original_name))?;
+            src.peak_path = peak_rel;
+        }
+
+        let manifest = serde_json::json!({
+            "version": 1,
+            "appName": "AutoMixer",
+            "sessionId": bundled.session.id,
+            "sessionName": bundled.session.name,
+        });
+        fs::write(
+            bundle_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            bundle_dir.join("project.json"),
+            serde_json::to_string_pretty(&bundled).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Import a bundle directory into the app's data directory and register
+    /// the session under a fresh id (so re-imports don't overwrite prior copies).
+    pub fn import_project_bundle(&self, bundle_dir: &Path) -> Result<MixProject, String> {
+        self.init()?;
+        let project_path = bundle_dir.join("project.json");
+        let raw = fs::read_to_string(&project_path).map_err(|e| {
+            format!("Could not read {} (not a project bundle?): {e}", project_path.display())
+        })?;
+        let mut project: MixProject = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+
+        project.session.id = Uuid::new_v4().to_string();
+
+        for src in &mut project.session.source_files {
+            let cache_src = bundle_dir.join(&src.cache_path);
+            let cache_dst = self.sources_dir().join(format!("{}.f32cache", src.id));
+            fs::copy(&cache_src, &cache_dst)
+                .map_err(|e| format!("import cache for {}: {e}", src.original_name))?;
+            src.cache_path = cache_dst.to_string_lossy().to_string();
+
+            let peak_src = bundle_dir.join(&src.peak_path);
+            let peak_dst = self.peaks_dir().join(format!("{}.peaks.json", src.id));
+            fs::copy(&peak_src, &peak_dst)
+                .map_err(|e| format!("import peaks for {}: {e}", src.original_name))?;
+            src.peak_path = peak_dst.to_string_lossy().to_string();
+        }
+
         self.save(&project)?;
         Ok(project)
     }

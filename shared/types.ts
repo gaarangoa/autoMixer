@@ -97,6 +97,7 @@ export type Track = {
   pan: number;
   muted: boolean;
   solo: boolean;
+  aiGenerated?: boolean;
   color: string;
   chain: TrackChain;
   sends: Sends;
@@ -143,6 +144,34 @@ export type MixSession = {
   regions: Region[];
   markers: Marker[];
   master: MasterChannel;
+  sections?: MixSection[];
+  mixerProfile?: MixerProfile;
+};
+
+export type MixerProfile = {
+  presetId: string;
+  aggressiveness: "subtle" | "moderate" | "bold";
+  eqPhilosophy: "corrective_only" | "tonal_shaping" | "sculpting";
+  compressionPhilosophy: "transparent_glue" | "character" | "aggressive";
+  stereoTreatment: "narrow" | "natural" | "wide";
+  space: "dry" | "tasteful" | "lush";
+  loudnessTarget: "broadcast" | "streaming" | "loud";
+  genre?: string;
+  referenceEngineer?: string;
+  customNotes?: string;
+};
+
+export type ProfilePreset = {
+  id: string;
+  displayName: string;
+  summary: string;
+  profile: MixerProfile;
+};
+
+export type MixSection = {
+  start: number;
+  end: number;
+  label: string;
 };
 
 export type JsonPatch = {
@@ -164,6 +193,7 @@ export type MixProject = {
   session: MixSession;
   history: HistoryEntry[];
   redoStack: HistoryEntry[];
+  chatMessages?: unknown[];
 };
 
 export type MixAction =
@@ -174,12 +204,15 @@ export type MixAction =
   | { tool: "set_track_pan"; trackId: Id; pan: number }
   | { tool: "mute_track"; trackId: Id; muted: boolean }
   | { tool: "solo_track"; trackId: Id; solo: boolean }
+  | { tool: "set_track_ai_generated"; trackId: Id; aiGenerated: boolean }
   | { tool: "set_high_pass"; trackId: Id; frequencyHz: number; slopeDbOct: 12 | 24 }
   | { tool: "set_low_pass"; trackId: Id; frequencyHz: number; slopeDbOct: 12 | 24 }
   | { tool: "set_eq_band"; trackId: Id; band: number; frequencyHz: number; gainDb: number; q: number }
   | { tool: "set_compressor"; trackId: Id; thresholdDb: number; ratio: number; attackMs: number; releaseMs: number; kneeDb: number; makeupDb: number }
   | { tool: "set_reverb_send"; trackId: Id; levelDb: number }
   | { tool: "set_delay_send"; trackId: Id; levelDb: number }
+  | { tool: "set_master_gain"; gainDb: number }
+  | { tool: "adjust_master_gain"; deltaDb: number }
   | { tool: "set_processor_param"; targetId: Id; processorId: string; paramId: string; value: number }
   | { tool: "set_region_gain"; regionId: Id; trackId: Id; gainDb: number }
   | { tool: "apply_section_automation"; regionId: Id; trackId: Id; param: AutomatableParam; value: number }

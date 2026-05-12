@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixProject, MixSession, SkillCatalog } from "../../shared/types";
+import type { AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog } from "../../shared/types";
 
 function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {
@@ -11,6 +11,9 @@ function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
 
 export type PlayheadEvent = { sample: number; running: boolean };
 export type MetersEvent = { masterPeak: number; trackPeaks: number[] };
+export type AudioProgressEvent = { stage: string; message: string; elapsedSeconds: number };
+export type LlmChunkEvent = { phase: string; text: string };
+export type LlmStatsEvent = { phase: string; promptTokens: number; responseTokens: number; elapsedMs: number };
 
 export const api = {
   config: () => tauriInvoke<{ ollamaBaseUrl: string; ollamaModel: string }>("get_config"),
@@ -32,7 +35,31 @@ export const api = {
   pause: () => tauriInvoke<void>("transport_pause"),
   stop: () => tauriInvoke<void>("transport_stop"),
   seek: (sample: number) => tauriInvoke<void>("transport_seek", { sample }),
+  setMasterBypass: (enabled: boolean) => tauriInvoke<void>("set_master_bypass", { enabled }),
+  setMasterGain: (sessionId: string, gainDb: number) => tauriInvoke<MixProject>("set_master_gain", { sessionId, gainDb }),
+  renameSession: (sessionId: string, name: string) => tauriInvoke<MixProject>("rename_session", { sessionId, name }),
+  deleteSession: (sessionId: string) => tauriInvoke<void>("delete_session", { sessionId }),
+  exportProjectBundle: (sessionId: string, bundleDir: string) => tauriInvoke<void>("export_project_bundle", { sessionId, bundleDir }),
+  importProjectBundle: (bundleDir: string) => tauriInvoke<MixProject>("import_project_bundle", { bundleDir }),
+  saveChatMessages: (sessionId: string, messages: unknown[]) => tauriInvoke<void>("save_chat_messages", { sessionId, messages }),
+  listMixerProfiles: () => tauriInvoke<ProfilePreset[]>("list_mixer_profiles"),
+  setMixerProfile: (sessionId: string, profile: MixerProfile) => tauriInvoke<MixProject>("set_mixer_profile", { sessionId, profile }),
+  startAutoMix: (sessionId: string, stages: string[], ollamaBaseUrl: string, ollamaModel: string) =>
+    tauriInvoke<void>("start_auto_mix", { sessionId, options: { stages, ollamaBaseUrl, ollamaModel } }),
+  onAutoMixEvent: (kind: "start" | "stage-start" | "stage-done" | "complete", cb: (payload: unknown) => void): Promise<UnlistenFn> =>
+    listen(`auto-mix:${kind}`, (e) => cb(e.payload)),
   renderMix: (sessionId: string, outputPath: string) => tauriInvoke<{ path: string }>("render_mix", { sessionId, outputPath }),
+  analyzeMasterStructure: (sessionId: string) => tauriInvoke<MixProject>("analyze_master_structure", { sessionId }),
+  onAudioProgress: (cb: (event: AudioProgressEvent) => void): Promise<UnlistenFn> =>
+    listen<AudioProgressEvent>("audio:progress", e => cb(e.payload)),
+  onLlmChunk: (cb: (event: LlmChunkEvent) => void): Promise<UnlistenFn> =>
+    listen<LlmChunkEvent>("llm:chunk", e => cb(e.payload)),
+  onLlmStats: (cb: (event: LlmStatsEvent) => void): Promise<UnlistenFn> =>
+    listen<LlmStatsEvent>("llm:stats", e => cb(e.payload)),
+  onLlmTurnStart: (cb: () => void): Promise<UnlistenFn> =>
+    listen("llm:turn-start", () => cb()),
+  onLlmTurnEnd: (cb: () => void): Promise<UnlistenFn> =>
+    listen("llm:turn-end", () => cb()),
   onPlayhead: (cb: (event: PlayheadEvent) => void): Promise<UnlistenFn> =>
     listen<PlayheadEvent>("engine:playhead", e => cb(e.payload)),
   onMeters: (cb: (event: MetersEvent) => void): Promise<UnlistenFn> =>

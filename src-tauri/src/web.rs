@@ -211,7 +211,8 @@ async fn assistant_request(State(state): State<WebState>, Json(request): Json<As
         let store = state.store.lock().map_err(|item| error(item.to_string()))?;
         store.get_project(&request.session_id).map_err(error)?
     };
-    let (response, project) = assistant::handle_assistant(state.config.clone(), project, request).await.map_err(error)?;
+    let observer: std::sync::Arc<dyn assistant::LlmObserver> = std::sync::Arc::new(assistant::NoopObserver);
+    let (response, project) = assistant::handle_assistant(state.config.clone(), project, request, observer).await.map_err(error)?;
     {
         let store = state.store.lock().map_err(|item| error(item.to_string()))?;
         store.save(&project).map_err(error)?;

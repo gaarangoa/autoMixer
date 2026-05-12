@@ -49,4 +49,5 @@ pub enum EngineCommand {
     Stop,
     Seek { sample: u64 },
     SetSessionRate { rate: u32 },
+    SetMasterBypass { enabled: bool },
 }

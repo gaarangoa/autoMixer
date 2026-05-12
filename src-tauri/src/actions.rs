@@ -79,6 +79,77 @@ pub fn record_patch(
     Ok(entry)
 }
 
+/// Clamp out-of-range numeric parameters into their safe envelopes and emit
+/// human-readable warnings. The model occasionally proposes moves that exceed
+/// our guardrails (e.g. +15 dB gain); rather than rejecting the whole turn,
+/// we apply the clamped value and surface the adjustment to the user.
+pub fn clamp_actions(actions: &mut [MixAction]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for action in actions.iter_mut() {
+        match action {
+            MixAction::SetTrackGain { gain_db, .. } => {
+                clamp_field(gain_db, -24.0, 24.0, "gainDb", &mut warnings);
+            }
+            MixAction::AdjustTrackGain { delta_db, .. } => {
+                clamp_field(delta_db, -12.0, 12.0, "deltaDb", &mut warnings);
+            }
+            MixAction::SetTrackPan { pan, .. } => {
+                clamp_field(pan, -1.0, 1.0, "pan", &mut warnings);
+            }
+            MixAction::SetHighPass { frequency_hz, .. }
+            | MixAction::SetLowPass { frequency_hz, .. } => {
+                clamp_field(frequency_hz, 20.0, 20000.0, "frequencyHz", &mut warnings);
+            }
+            MixAction::SetEqBand { frequency_hz, gain_db, q, .. } => {
+                clamp_field(frequency_hz, 20.0, 20000.0, "frequencyHz", &mut warnings);
+                clamp_field(gain_db, -12.0, 12.0, "gainDb", &mut warnings);
+                clamp_field(q, 0.2, 10.0, "q", &mut warnings);
+            }
+            MixAction::SetCompressor { threshold_db, ratio, attack_ms, release_ms, knee_db, makeup_db, .. } => {
+                clamp_field(threshold_db, -60.0, 0.0, "thresholdDb", &mut warnings);
+                clamp_field(ratio, 1.0, 20.0, "ratio", &mut warnings);
+                clamp_field(attack_ms, 1.0, 200.0, "attackMs", &mut warnings);
+                clamp_field(release_ms, 20.0, 1000.0, "releaseMs", &mut warnings);
+                clamp_field(knee_db, 0.0, 24.0, "kneeDb", &mut warnings);
+                clamp_field(makeup_db, -12.0, 12.0, "makeupDb", &mut warnings);
+            }
+            MixAction::SetReverbSend { level_db, .. }
+            | MixAction::SetDelaySend { level_db, .. } => {
+                clamp_field(level_db, -60.0, 0.0, "levelDb", &mut warnings);
+            }
+            MixAction::SetRegionGain { gain_db, .. } => {
+                clamp_field(gain_db, -24.0, 24.0, "gainDb", &mut warnings);
+            }
+            MixAction::SetMasterGain { gain_db } => {
+                clamp_field(gain_db, -24.0, 12.0, "gainDb", &mut warnings);
+            }
+            MixAction::AdjustMasterGain { delta_db } => {
+                clamp_field(delta_db, -12.0, 12.0, "deltaDb", &mut warnings);
+            }
+            MixAction::ApplySectionAutomation { value, .. } => {
+                clamp_field(value, -60.0, 20000.0, "value", &mut warnings);
+            }
+            _ => {}
+        }
+    }
+    warnings
+}
+
+fn clamp_field(value: &mut f32, min: f32, max: f32, label: &str, warnings: &mut Vec<String>) {
+    if !value.is_finite() {
+        warnings.push(format!("{label} was not finite — reset to 0"));
+        *value = 0.0;
+        return;
+    }
+    if *value < min {
+        warnings.push(format!("{label} {:.2} clamped to {:.2}", *value, min));
+        *value = min;
+    } else if *value > max {
+        warnings.push(format!("{label} {:.2} clamped to {:.2}", *value, max));
+        *value = max;
+    }
+}
+
 pub fn validate_actions(session: &MixSession, actions: &[MixAction]) -> Result<(), String> {
     for action in actions {
         match action {
@@ -91,66 +162,39 @@ pub fn validate_actions(session: &MixSession, actions: &[MixAction]) -> Result<(
             | MixAction::SetTrackPan { track_id, .. }
             | MixAction::MuteTrack { track_id, .. }
             | MixAction::SoloTrack { track_id, .. }
+            | MixAction::SetTrackAiGenerated { track_id, .. }
             | MixAction::SetReverbSend { track_id, .. }
-            | MixAction::SetDelaySend { track_id, .. } => {
+            | MixAction::SetDelaySend { track_id, .. }
+            | MixAction::SetTrackGain { track_id, .. }
+            | MixAction::AdjustTrackGain { track_id, .. }
+            | MixAction::SetCompressor { track_id, .. } => {
                 require_track(session, track_id)?;
             }
-            MixAction::SetTrackGain { track_id, gain_db } => {
+            MixAction::SetHighPass { track_id, slope_db_oct, .. }
+            | MixAction::SetLowPass { track_id, slope_db_oct, .. } => {
                 require_track(session, track_id)?;
-                range(*gain_db, -24.0, 24.0, "gainDb")?;
-            }
-            MixAction::AdjustTrackGain { track_id, delta_db } => {
-                require_track(session, track_id)?;
-                range(*delta_db, -12.0, 12.0, "deltaDb")?;
-            }
-            MixAction::SetHighPass { track_id, frequency_hz, slope_db_oct }
-            | MixAction::SetLowPass { track_id, frequency_hz, slope_db_oct } => {
-                require_track(session, track_id)?;
-                range(*frequency_hz, 20.0, 20000.0, "frequencyHz")?;
                 if ![12, 24].contains(slope_db_oct) {
                     return Err("slopeDbOct must be 12 or 24".into());
                 }
             }
-            MixAction::SetEqBand { track_id, band, frequency_hz, gain_db, q } => {
+            MixAction::SetEqBand { track_id, band, .. } => {
                 require_track(session, track_id)?;
                 if *band > 3 {
                     return Err("band must be 0 through 3".into());
                 }
-                range(*frequency_hz, 20.0, 20000.0, "frequencyHz")?;
-                range(*gain_db, -12.0, 12.0, "gainDb")?;
-                range(*q, 0.2, 10.0, "q")?;
             }
-            MixAction::SetCompressor {
-                track_id,
-                threshold_db,
-                ratio,
-                attack_ms,
-                release_ms,
-                knee_db,
-                makeup_db,
-            } => {
-                require_track(session, track_id)?;
-                range(*threshold_db, -60.0, 0.0, "thresholdDb")?;
-                range(*ratio, 1.0, 20.0, "ratio")?;
-                range(*attack_ms, 1.0, 200.0, "attackMs")?;
-                range(*release_ms, 20.0, 1000.0, "releaseMs")?;
-                range(*knee_db, 0.0, 24.0, "kneeDb")?;
-                range(*makeup_db, -12.0, 12.0, "makeupDb")?;
-            }
-            MixAction::SetProcessorParam { target_id, value, .. } => {
+            MixAction::SetProcessorParam { target_id, .. } => {
                 require_track(session, target_id)?;
-                range(*value, -100000.0, 100000.0, "value")?;
             }
-            MixAction::SetRegionGain { region_id, track_id, gain_db } => {
+            MixAction::SetRegionGain { region_id, track_id, .. } => {
                 require_track(session, track_id)?;
                 require_region(session, region_id)?;
-                range(*gain_db, -24.0, 24.0, "gainDb")?;
             }
-            MixAction::ApplySectionAutomation { region_id, track_id, value, .. } => {
+            MixAction::ApplySectionAutomation { region_id, track_id, .. } => {
                 require_track(session, track_id)?;
                 require_region(session, region_id)?;
-                range(*value, -60.0, 20000.0, "value")?;
             }
+            MixAction::SetMasterGain { .. } | MixAction::AdjustMasterGain { .. } => {}
             MixAction::Undo | MixAction::Redo | MixAction::RenderMix => {}
         }
     }
@@ -191,6 +235,7 @@ fn apply_action(
         MixAction::SetTrackPan { track_id, pan } => replace(session, forward, inverse, &track_path(session, track_id, "pan")?, json!(pan))?,
         MixAction::MuteTrack { track_id, muted } => replace(session, forward, inverse, &track_path(session, track_id, "muted")?, json!(muted))?,
         MixAction::SoloTrack { track_id, solo } => replace(session, forward, inverse, &track_path(session, track_id, "solo")?, json!(solo))?,
+        MixAction::SetTrackAiGenerated { track_id, ai_generated } => replace(session, forward, inverse, &track_path(session, track_id, "aiGenerated")?, json!(ai_generated))?,
         MixAction::SetHighPass { track_id, frequency_hz, slope_db_oct } => {
             let base = track_path(session, track_id, "chain/highPass")?;
             replace(session, forward, inverse, &format!("{base}/enabled"), json!(true))?;
@@ -224,6 +269,11 @@ fn apply_action(
         MixAction::SetProcessorParam { target_id, processor_id, param_id, value } => {
             let path = processor_param_path(session, target_id, processor_id, param_id)?;
             replace(session, forward, inverse, &path, json!(value))?;
+        }
+        MixAction::SetMasterGain { gain_db } => replace(session, forward, inverse, "/master/gainDb", json!(gain_db))?,
+        MixAction::AdjustMasterGain { delta_db } => {
+            let next = (session.master.gain_db + delta_db).clamp(-24.0, 12.0);
+            replace(session, forward, inverse, "/master/gainDb", json!(next))?;
         }
         MixAction::SetRegionGain { region_id, track_id, gain_db } => add_automation(session, forward, inverse, track_id, region_id, AutomatableParam::GainDb, *gain_db)?,
         MixAction::ApplySectionAutomation { region_id, track_id, param, value } => add_automation(session, forward, inverse, track_id, region_id, param.clone(), *value)?,
@@ -368,14 +418,6 @@ fn track_index(session: &MixSession, track_id: &str) -> Result<usize, String> {
     session.tracks.iter().position(|track| track.id == track_id).ok_or_else(|| format!("Unknown track {track_id}"))
 }
 
-fn range(value: f32, min: f32, max: f32, label: &str) -> Result<(), String> {
-    if value.is_finite() && value >= min && value <= max {
-        Ok(())
-    } else {
-        Err(format!("{label} must be between {min} and {max}"))
-    }
-}
-
 fn pointer<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
     root.pointer(path).ok_or_else(|| format!("Invalid patch path {path}"))
 }
@@ -408,6 +450,8 @@ mod tests {
             master: default_master(),
             regions: Vec::new(),
             markers: Vec::new(),
+            sections: Vec::new(),
+            mixer_profile: Default::default(),
         };
         s.tracks.push(make_track("src1".into(), "Vocal".into(), 0));
         s.tracks.push(make_track("src2".into(), "Bass".into(), 1));
@@ -415,15 +459,19 @@ mod tests {
     }
 
     fn project(session: MixSession) -> MixProject {
-        MixProject { session, history: Vec::new(), redo_stack: Vec::new() }
+        MixProject { session, history: Vec::new(), redo_stack: Vec::new(), chat_messages: Vec::new() }
     }
 
     #[test]
-    fn validate_rejects_out_of_range_gain() {
-        let session = fresh_session();
-        let id = session.tracks[0].id.clone();
-        let bad = vec![MixAction::SetTrackGain { track_id: id, gain_db: 99.0 }];
-        assert!(validate_actions(&session, &bad).is_err());
+    fn clamp_brings_out_of_range_gain_into_envelope() {
+        let mut actions = vec![MixAction::SetTrackGain { track_id: "x".into(), gain_db: 99.0 }];
+        let warnings = clamp_actions(&mut actions);
+        assert_eq!(warnings.len(), 1);
+        if let MixAction::SetTrackGain { gain_db, .. } = &actions[0] {
+            assert!((*gain_db - 24.0).abs() < 1e-6);
+        } else {
+            panic!("expected SetTrackGain");
+        }
     }
 
     #[test]

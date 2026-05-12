@@ -32,6 +32,13 @@ pub fn skill_catalog() -> SkillCatalog {
                 &["set_reverb_send", "set_delay_send"],
             ),
             card(
+                "mastering",
+                "Mastering",
+                "Use for whole-mix loudness, headroom, and master-bus level moves.",
+                &["louder mix", "quieter mix", "master", "loudness", "headroom", "lufs", "ceiling", "whole mix"],
+                &["set_master_gain", "adjust_master_gain"],
+            ),
+            card(
                 "region_automation",
                 "Region Automation",
                 "Use for section-scoped moves on selected regions.",

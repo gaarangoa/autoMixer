@@ -81,6 +81,7 @@ pub struct Mixer {
     pub playing: bool,
     pub playhead: f64,
     pub session_rate: u32,
+    pub master_bypass: bool,
     pub reverb: Reverb,
     pub delay: StereoDelay,
     pub limiter: Limiter,
@@ -110,6 +111,7 @@ impl Mixer {
             playing: false,
             playhead: 0.0,
             session_rate: sample_rate as u32,
+            master_bypass: false,
             reverb: Reverb::new(sample_rate),
             delay: StereoDelay::new(sample_rate),
             limiter: Limiter::new(sample_rate),
@@ -221,6 +223,9 @@ impl Mixer {
                 if rate > 0 {
                     self.session_rate = rate;
                 }
+            }
+            EngineCommand::SetMasterBypass { enabled } => {
+                self.master_bypass = enabled;
             }
         }
     }
@@ -351,34 +356,42 @@ impl Mixer {
                     (l0, r0)
                 };
 
-                // HP -> LP -> EQ -> Compressor -> Pan -> Gain
-                let (hl, hr) = track.high_pass.process_stereo(l, r);
-                l = hl;
-                r = hr;
-                let (ll, lr) = track.low_pass.process_stereo(l, r);
-                l = ll;
-                r = lr;
-                let (el, er) = track.eq.process_stereo(l, r);
-                l = el;
-                r = er;
-                let comp = track.compressor.process_link(l, r);
-                l *= comp;
-                r *= comp;
+                let (lc, rc) = if self.master_bypass {
+                    // A/B compare: source samples pass through with no DSP, no gain,
+                    // no pan offset, no sends. Mute/solo are still respected above.
+                    let _ = (g_db, pan, rvb, dly);
+                    (l, r)
+                } else {
+                    // HP -> LP -> EQ -> Compressor -> Pan -> Gain
+                    let (hl, hr) = track.high_pass.process_stereo(l, r);
+                    l = hl;
+                    r = hr;
+                    let (ll, lr) = track.low_pass.process_stereo(l, r);
+                    l = ll;
+                    r = lr;
+                    let (el, er) = track.eq.process_stereo(l, r);
+                    l = el;
+                    r = er;
+                    let comp = track.compressor.process_link(l, r);
+                    l *= comp;
+                    r *= comp;
 
-                let gain = db_to_gain(g_db);
-                let l_pan = if pan <= 0.0 { 1.0 } else { 1.0 - pan };
-                let r_pan = if pan >= 0.0 { 1.0 } else { 1.0 + pan };
-                let lc = l * gain * l_pan;
-                let rc = r * gain * r_pan;
+                    let gain = db_to_gain(g_db);
+                    let l_pan = if pan <= 0.0 { 1.0 } else { 1.0 - pan };
+                    let r_pan = if pan >= 0.0 { 1.0 } else { 1.0 + pan };
+                    let lc = l * gain * l_pan;
+                    let rc = r * gain * r_pan;
+
+                    let rvb_g = db_to_gain(rvb);
+                    let dly_g = db_to_gain(dly);
+                    send_reverb_l += lc * rvb_g;
+                    send_reverb_r += rc * rvb_g;
+                    send_delay_l += lc * dly_g;
+                    send_delay_r += rc * dly_g;
+                    (lc, rc)
+                };
                 left += lc;
                 right += rc;
-
-                let rvb_g = db_to_gain(rvb);
-                let dly_g = db_to_gain(dly);
-                send_reverb_l += lc * rvb_g;
-                send_reverb_r += rc * rvb_g;
-                send_delay_l += lc * dly_g;
-                send_delay_r += rc * dly_g;
 
                 let p = lc.abs().max(rc.abs());
                 if p > track_peak[i] {
@@ -386,23 +399,29 @@ impl Mixer {
                 }
             }
 
-            // Run send buses through global processors and add wet to master.
-            let (rvb_l, rvb_r) = self.reverb.pull_wet(send_reverb_l, send_reverb_r);
-            let (dly_l, dly_r) = self.delay.pull_wet(send_delay_l, send_delay_r);
-            left += rvb_l + dly_l;
-            right += rvb_r + dly_r;
-
-            let master_gain = db_to_gain(self.master_gain_db.next());
+            // Smooth the master params even in bypass to avoid clicks on toggle.
+            let master_gain_db_next = self.master_gain_db.next();
             let _ = self.master_ceiling_db.next();
-            let mut pre_l = left * master_gain;
-            let mut pre_r = right * master_gain;
-            if !pre_l.is_finite() {
-                pre_l = 0.0;
-            }
-            if !pre_r.is_finite() {
-                pre_r = 0.0;
-            }
-            let (mut l_out, mut r_out) = self.limiter.process(pre_l, pre_r);
+
+            let (mut l_out, mut r_out) = if self.master_bypass {
+                (left, right)
+            } else {
+                let (rvb_l, rvb_r) = self.reverb.pull_wet(send_reverb_l, send_reverb_r);
+                let (dly_l, dly_r) = self.delay.pull_wet(send_delay_l, send_delay_r);
+                left += rvb_l + dly_l;
+                right += rvb_r + dly_r;
+
+                let master_gain = db_to_gain(master_gain_db_next);
+                let mut pre_l = left * master_gain;
+                let mut pre_r = right * master_gain;
+                if !pre_l.is_finite() {
+                    pre_l = 0.0;
+                }
+                if !pre_r.is_finite() {
+                    pre_r = 0.0;
+                }
+                self.limiter.process(pre_l, pre_r)
+            };
             if !l_out.is_finite() {
                 l_out = 0.0;
             }

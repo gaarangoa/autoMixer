@@ -1,0 +1,22 @@
+[project]
+name = "automixer-audio-service"
+version = "0.1.0"
+description = "Local audio-analysis sidecar for AutoMixer (structure detection via all-in-one)."
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "allin1>=1.1.0",
+    "madmom @ git+https://github.com/CPJKU/madmom.git@main",
+    "torch>=2.0,<2.4",
+    "torchaudio>=2.0,<2.4",
+    "natten<0.17",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.extra-build-dependencies]
+madmom = ["Cython", "numpy", "setuptools", "wheel"]
+natten = ["torch>=2.0,<2.4", "setuptools", "wheel", "cmake", "ninja"]

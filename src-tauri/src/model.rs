@@ -146,6 +146,8 @@ pub struct Track {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+    #[serde(default)]
+    pub ai_generated: bool,
     pub color: String,
     pub chain: TrackChain,
     pub sends: Sends,
@@ -195,6 +197,51 @@ pub struct Bus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MixerProfile {
+    /// Free-form id for known presets; "custom" if user edited fields directly.
+    pub preset_id: String,
+    /// Subtle (≤1 dB moves preferred) / moderate / bold.
+    pub aggressiveness: String,
+    /// corrective_only / tonal_shaping / sculpting
+    pub eq_philosophy: String,
+    /// transparent_glue / character / aggressive
+    pub compression_philosophy: String,
+    /// narrow / natural / wide
+    pub stereo_treatment: String,
+    /// dry / tasteful / lush
+    pub space: String,
+    /// broadcast / streaming / loud — drives target LUFS.
+    pub loudness_target: String,
+    /// Optional genre tag (rock / electronic / acoustic / hip-hop / pop / cinematic / …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+    /// Optional reference engineer flavor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_engineer: Option<String>,
+    /// Free-form user notes appended to the preamble.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_notes: Option<String>,
+}
+
+impl Default for MixerProfile {
+    fn default() -> Self {
+        Self {
+            preset_id: "balanced".into(),
+            aggressiveness: "moderate".into(),
+            eq_philosophy: "tonal_shaping".into(),
+            compression_philosophy: "transparent_glue".into(),
+            stereo_treatment: "natural".into(),
+            space: "tasteful".into(),
+            loudness_target: "streaming".into(),
+            genre: None,
+            reference_engineer: None,
+            custom_notes: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MixSession {
     pub id: Id,
     pub name: String,
@@ -206,6 +253,33 @@ pub struct MixSession {
     pub master: MasterChannel,
     pub regions: Vec<Region>,
     pub markers: Vec<Marker>,
+    #[serde(default)]
+    pub sections: Vec<MixSection>,
+    #[serde(default)]
+    pub mixer_profile: MixerProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixSection {
+    pub start: f32,
+    pub end: f32,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<SectionAnalysis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionAnalysis {
+    pub peak_db: f32,
+    pub rms_db: f32,
+    pub lufs: f32,
+    pub spectral_centroid_hz: f32,
+    pub low_energy: f32,
+    pub mid_energy: f32,
+    pub high_energy: f32,
+    pub dynamic_range_db: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +315,8 @@ pub struct MixProject {
     pub session: MixSession,
     pub history: Vec<HistoryEntry>,
     pub redo_stack: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub chat_messages: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,9 +329,54 @@ pub enum MixAction {
     SetTrackPan { track_id: Id, pan: f32 },
     MuteTrack { track_id: Id, muted: bool },
     SoloTrack { track_id: Id, solo: bool },
-    SetHighPass { track_id: Id, frequency_hz: f32, slope_db_oct: u16 },
-    SetLowPass { track_id: Id, frequency_hz: f32, slope_db_oct: u16 },
-    SetEqBand { track_id: Id, band: usize, frequency_hz: f32, gain_db: f32, q: f32 },
+    SetTrackAiGenerated { track_id: Id, ai_generated: bool },
+    SetHighPass {
+        track_id: Id,
+        #[serde(
+            alias = "frequency",
+            alias = "frequency_hz",
+            alias = "frequencyHZ",
+            alias = "freqHz",
+            alias = "freq_hz",
+            alias = "freq",
+            alias = "hz"
+        )]
+        frequency_hz: f32,
+        #[serde(alias = "slope", alias = "slope_db_oct", alias = "slopeDbPerOctave", alias = "slopeDbOctave")]
+        slope_db_oct: u16,
+    },
+    SetLowPass {
+        track_id: Id,
+        #[serde(
+            alias = "frequency",
+            alias = "frequency_hz",
+            alias = "frequencyHZ",
+            alias = "freqHz",
+            alias = "freq_hz",
+            alias = "freq",
+            alias = "hz"
+        )]
+        frequency_hz: f32,
+        #[serde(alias = "slope", alias = "slope_db_oct", alias = "slopeDbPerOctave", alias = "slopeDbOctave")]
+        slope_db_oct: u16,
+    },
+    SetEqBand {
+        track_id: Id,
+        band: usize,
+        #[serde(
+            alias = "frequency",
+            alias = "frequency_hz",
+            alias = "frequencyHZ",
+            alias = "freqHz",
+            alias = "freq_hz",
+            alias = "freq",
+            alias = "hz"
+        )]
+        frequency_hz: f32,
+        #[serde(alias = "gain", alias = "gain_db", alias = "db")]
+        gain_db: f32,
+        q: f32,
+    },
     SetCompressor {
         track_id: Id,
         threshold_db: f32,
@@ -267,6 +388,8 @@ pub enum MixAction {
     },
     SetReverbSend { track_id: Id, level_db: f32 },
     SetDelaySend { track_id: Id, level_db: f32 },
+    SetMasterGain { gain_db: f32 },
+    AdjustMasterGain { delta_db: f32 },
     SetProcessorParam { target_id: Id, processor_id: String, param_id: String, value: f32 },
     SetRegionGain { region_id: Id, track_id: Id, gain_db: f32 },
     ApplySectionAutomation { region_id: Id, track_id: Id, param: AutomatableParam, value: f32 },
@@ -329,9 +452,56 @@ pub struct TrackCritique {
     pub track_id: Id,
     pub track_name: String,
     pub rating: f32,
+    #[serde(deserialize_with = "deserialize_issues")]
     pub issues: Vec<CritiqueIssue>,
     #[serde(default)]
     pub strengths: Vec<String>,
+}
+
+/// Accept either `[{category, severity, message, ...}]` or a shorthand
+/// `["text", ...]` from the model — the latter gets wrapped as a generic
+/// medium-severity issue so the critique survives.
+fn deserialize_issues<'de, D>(de: D) -> Result<Vec<CritiqueIssue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct IssuesVisitor;
+
+    impl<'de> Visitor<'de> for IssuesVisitor {
+        type Value = Vec<CritiqueIssue>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a list of CritiqueIssue objects or strings")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(value) = seq.next_element::<Value>()? {
+                match value {
+                    Value::String(s) => out.push(CritiqueIssue {
+                        category: "general".into(),
+                        severity: CritiqueSeverity::Medium,
+                        message: s,
+                        suggested_skills: None,
+                    }),
+                    other => {
+                        let issue: CritiqueIssue =
+                            serde_json::from_value(other).map_err(de::Error::custom)?;
+                        out.push(issue);
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    de.deserialize_seq(IssuesVisitor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,10 +512,19 @@ pub struct MixCritique {
     pub headroom_db: f32,
     pub integrated_lufs_estimate: f32,
     pub true_peak_db_estimate: f32,
+    #[serde(deserialize_with = "deserialize_issues")]
     pub mix_issues: Vec<CritiqueIssue>,
     pub per_track: Vec<TrackCritique>,
     #[serde(default)]
     pub recommended_next_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnTokens {
+    pub prompt: u32,
+    pub response: u32,
+    pub elapsed_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +542,8 @@ pub enum AssistantResponse {
         rationale: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         per_action_notes: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens: Option<TurnTokens>,
     },
     #[serde(rename_all = "camelCase")]
     Clarification {
