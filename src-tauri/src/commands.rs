@@ -198,6 +198,10 @@ pub async fn assistant_request(
         let store = state.store.lock().map_err(|error| error.to_string())?;
         store.save(&project)?;
     }
+    if let Ok(mut audio) = state.audio.lock() {
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
     let _ = app.emit("llm:turn-end", serde_json::json!({}));
     Ok(response)
 }
@@ -432,13 +436,21 @@ pub async fn start_auto_mix(
         .stages
         .iter()
         .filter_map(|s| match s.as_str() {
-            "gain_staging" => Some(AutoMixStage::GainStaging),
+            "prep_intent" => Some(AutoMixStage::PrepIntent),
+            "static_balance" => Some(AutoMixStage::StaticBalance),
             "cleanup_filters" => Some(AutoMixStage::CleanupFilters),
-            "corrective_eq" => Some(AutoMixStage::CorrectiveEq),
+            "subtractive_eq" => Some(AutoMixStage::SubtractiveEq),
             "dynamics" => Some(AutoMixStage::Dynamics),
-            "tonal_shaping" => Some(AutoMixStage::TonalShaping),
-            "space_glue" => Some(AutoMixStage::SpaceGlue),
-            "master_balance" => Some(AutoMixStage::MasterBalance),
+            "tonal_enhancement" => Some(AutoMixStage::TonalEnhancement),
+            "depth_space" => Some(AutoMixStage::DepthSpace),
+            "section_automation" => Some(AutoMixStage::SectionAutomation),
+            "mix_bus_loudness" => Some(AutoMixStage::MixBusLoudness),
+            // Legacy IDs kept so older frontend sessions/buttons do not break during reloads.
+            "gain_staging" => Some(AutoMixStage::StaticBalance),
+            "corrective_eq" => Some(AutoMixStage::SubtractiveEq),
+            "tonal_shaping" => Some(AutoMixStage::TonalEnhancement),
+            "space_glue" => Some(AutoMixStage::DepthSpace),
+            "master_balance" => Some(AutoMixStage::MixBusLoudness),
             _ => None,
         })
         .collect();
@@ -473,6 +485,7 @@ pub async fn start_auto_mix(
             match report {
                 Ok(r) => {
                     let _ = app_clone.emit("auto-mix:stage-done", serde_json::json!(r));
+                    let _ = sync_audio_from_app(&app_clone, &session_id_clone);
                     if r.status == "error" { break; }
                 }
                 Err(e) => {
@@ -492,6 +505,7 @@ pub async fn start_auto_mix(
         }
         // Reload the project once everything's done so the UI sees the final state.
         if let Ok(p) = state_get_project(&app_clone, &session_id_clone) {
+            let _ = sync_audio_from_app(&app_clone, &session_id_clone);
             let _ = app_clone.emit("auto-mix:complete", serde_json::json!({ "project": p }));
         } else {
             let _ = app_clone.emit("auto-mix:complete", serde_json::json!({}));
@@ -512,6 +526,19 @@ fn state_get_project(app: &tauri::AppHandle, session_id: &str) -> Result<MixProj
     let state = app.state::<AppState>();
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.get_project(session_id)
+}
+
+fn sync_audio_from_app(app: &tauri::AppHandle, session_id: &str) -> Result<(), String> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let project = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store.get_project(session_id)?
+    };
+    let mut audio = state.audio.lock().map_err(|e| e.to_string())?;
+    sync_session_to_engine(&mut audio, &project.session);
+    audio.publish_automation(&project.session);
+    Ok(())
 }
 
 #[tauri::command]

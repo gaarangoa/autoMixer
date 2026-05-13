@@ -1349,13 +1349,15 @@ function MasterBar({ gainDb, onChange }: { gainDb: number; onChange: (gainDb: nu
 }
 
 const AUTO_MIX_STAGES = [
-  { id: "gain_staging", label: "Gain staging" },
+  { id: "prep_intent", label: "Prep / intent" },
+  { id: "static_balance", label: "Static balance" },
   { id: "cleanup_filters", label: "Cleanup HP/LP" },
-  { id: "corrective_eq", label: "Corrective EQ" },
-  { id: "dynamics", label: "Dynamics" },
-  { id: "tonal_shaping", label: "Tonal shaping" },
-  { id: "space_glue", label: "Space & glue" },
-  { id: "master_balance", label: "Master & balance" },
+  { id: "subtractive_eq", label: "Subtractive EQ" },
+  { id: "dynamics", label: "Dynamics control" },
+  { id: "tonal_enhancement", label: "Tonal enhancement" },
+  { id: "depth_space", label: "Depth & space" },
+  { id: "section_automation", label: "Section automation" },
+  { id: "mix_bus_loudness", label: "Mix bus / loudness" },
 ];
 
 function AutoMixView({

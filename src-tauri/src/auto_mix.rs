@@ -26,122 +26,145 @@ use crate::assistant::{
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoMixStage {
-    GainStaging,
+    PrepIntent,
+    StaticBalance,
     CleanupFilters,
-    CorrectiveEq,
+    SubtractiveEq,
     Dynamics,
-    TonalShaping,
-    SpaceGlue,
-    MasterBalance,
+    TonalEnhancement,
+    DepthSpace,
+    SectionAutomation,
+    MixBusLoudness,
 }
 
 impl AutoMixStage {
     pub fn id(&self) -> &'static str {
         match self {
-            Self::GainStaging => "gain_staging",
+            Self::PrepIntent => "prep_intent",
+            Self::StaticBalance => "static_balance",
             Self::CleanupFilters => "cleanup_filters",
-            Self::CorrectiveEq => "corrective_eq",
+            Self::SubtractiveEq => "subtractive_eq",
             Self::Dynamics => "dynamics",
-            Self::TonalShaping => "tonal_shaping",
-            Self::SpaceGlue => "space_glue",
-            Self::MasterBalance => "master_balance",
+            Self::TonalEnhancement => "tonal_enhancement",
+            Self::DepthSpace => "depth_space",
+            Self::SectionAutomation => "section_automation",
+            Self::MixBusLoudness => "mix_bus_loudness",
         }
     }
     pub fn display_name(&self) -> &'static str {
         match self {
-            Self::GainStaging => "Gain staging",
+            Self::PrepIntent => "Prep / intent",
+            Self::StaticBalance => "Static balance",
             Self::CleanupFilters => "Cleanup filters",
-            Self::CorrectiveEq => "Corrective EQ",
-            Self::Dynamics => "Dynamics",
-            Self::TonalShaping => "Tonal shaping",
-            Self::SpaceGlue => "Space & glue",
-            Self::MasterBalance => "Master & balance",
+            Self::SubtractiveEq => "Subtractive EQ",
+            Self::Dynamics => "Dynamics control",
+            Self::TonalEnhancement => "Tonal enhancement",
+            Self::DepthSpace => "Depth & space",
+            Self::SectionAutomation => "Section automation",
+            Self::MixBusLoudness => "Mix bus / loudness",
         }
     }
     fn skills(&self) -> &'static [&'static str] {
         match self {
-            Self::GainStaging => &["balance"],
+            Self::PrepIntent => &["balance", "tonal_eq", "dynamics", "space_depth", "mastering"],
+            Self::StaticBalance => &["balance"],
             Self::CleanupFilters => &["tonal_eq"],
-            Self::CorrectiveEq => &["tonal_eq"],
+            Self::SubtractiveEq => &["tonal_eq"],
             Self::Dynamics => &["dynamics"],
-            Self::TonalShaping => &["tonal_eq"],
-            Self::SpaceGlue => &["space_depth", "balance"],
-            Self::MasterBalance => &["mastering", "balance"],
+            Self::TonalEnhancement => &["tonal_eq"],
+            Self::DepthSpace => &["space_depth", "balance"],
+            Self::SectionAutomation => &["region_automation", "balance"],
+            Self::MixBusLoudness => &["mastering", "balance"],
         }
     }
     fn instructions(&self) -> &'static str {
         match self {
-            Self::GainStaging => {
-                "Stage 1 — GAIN STAGING. \
-                 Adjust every track's `gainDb` so its measured `peakDb` lands roughly between -18 and -12 dBFS \
-                 and its `lufs` is in a balanced relationship with other tracks of similar role. \
-                 IMPORTANT: if the AI-derived stem preservation rule is active, do NOT force every stem into this \
-                 peak/LUFS range. Preserve the already-mixed hierarchy and make only small headroom/safety moves \
-                 unless the user explicitly asked to rebalance. \
-                 Use set_track_gain (absolute) — NOT adjust_track_gain. Also set sensible LCR pan defaults by role \
-                 (kick/snare/bass/lead vocal = 0; doubled guitars or BVs to ±0.3 to ±0.6; overheads/room slightly wider). \
-                 DO NOT use any EQ, compression, send, or filter actions in this stage. \
-                 Touch every track that needs it. No cap on action count for this stage."
+            Self::PrepIntent => {
+                "Stage 1 — PREP / INTENT. \
+                 Identify the musical hierarchy from names, roles, and audio analysis: lead elements, groove, low-end foundation, support layers, and texture. \
+                 This stage is mostly observational. Emit no actions unless something is objectively unsafe, such as a clearly clipping track that needs a small gain reduction. \
+                 Do NOT rebalance, EQ, compress, add sends, or master. If the session is already-mixed AI stems, preserve that hierarchy."
+            }
+            Self::StaticBalance => {
+                "Stage 2 — STATIC BALANCE. \
+                 Use faders and pan only to establish musical hierarchy: lead/hook, groove, low-end foundation, support layers, and texture. \
+                 Use set_track_gain (absolute) and set_track_pan only. Do NOT target equal loudness across tracks. \
+                 For already-mixed AI stems, make only tiny moves (usually +/-0.5 to +/-1.5 dB, never more than +/-2 dB unless clipping/headroom demands it). \
+                 Backing vocals, doubles, pads, rooms, and effects may intentionally sit far below lead vocals. \
+                 DO NOT use EQ, compression, sends, filters, automation, or master actions in this stage."
             }
             Self::CleanupFilters => {
-                "Stage 2 — CLEANUP. \
-                 Apply high-pass filters at 60–120 Hz to every non-bass, non-kick, non-sub track to clean low rumble. \
+                "Stage 3 — CLEANUP FILTERS. \
+                 Apply high-pass filters only where rumble or low-frequency masking is likely. Do not filter every non-bass stem automatically when the source is already mixed. \
+                 Typical high-pass range is 60–120 Hz for non-bass, non-kick, non-sub tracks. \
                  Apply a low-pass at 16–18 kHz to harsh top-end sources only when their `spectralCentroidHz` > 5000 and `bandEnergy.high` > 0.35. \
                  Pick slopeDbOct = 12 unless the track is obviously rumbly (then 24). \
                  Use set_high_pass and set_low_pass. \
                  DO NOT use EQ band, compression, sends, gain, or pan actions in this stage."
             }
-            Self::CorrectiveEq => {
-                "Stage 3 — CORRECTIVE EQ. \
+            Self::SubtractiveEq => {
+                "Stage 4 — SUBTRACTIVE EQ / MASKING. \
                  For each track with a measurable problem, apply ONE narrow EQ cut: \
                  - mud at 200-400 Hz when bandEnergy.low > 0.55 AND bandEnergy.mid < 0.3 \
                  - boxiness at 400-700 Hz when bandEnergy.mid > 0.6 \
                  - harshness at 2-5 kHz when spectralCentroidHz > 3500 AND the track is not a cymbal or hi-hat \
-                 No boosts in this stage. Cuts only. Use set_eq_band with negative gainDb."
+                 Use cuts to create separation between competing sources. No boosts in this stage. Use set_eq_band with negative gainDb."
             }
             Self::Dynamics => {
-                "Stage 4 — DYNAMICS. \
+                "Stage 5 — DYNAMICS CONTROL. \
                  Apply set_compressor ONLY to tracks where dynamicRangeDb > 10 AND silencePercent < 30. \
-                 Use the per-role compressor presets in the philosophy block. Skip everything else. \
+                 Use compression to solve uneven dynamics, preserve transients, or add intentional glue/character. Use the per-role compressor presets in the philosophy block. Skip everything else. \
                  No EQ, no sends, no gain in this stage."
             }
-            Self::TonalShaping => {
-                "Stage 5 — TONAL SHAPING. \
+            Self::TonalEnhancement => {
+                "Stage 6 — TONAL ENHANCEMENT. \
                  Gentle boosts only: presence on vocals (set_eq_band at 2.5-4 kHz +1 to +2 dB), \
                  air on cymbals/strings/synths (high shelf at 10-12 kHz), \
                  weight on bass (low shelf at 80-100 Hz). \
-                 No cuts in this stage. No new actions on tracks that already got tonal moves earlier."
+                 Do not boost the same range on many tracks. No cuts in this stage. No new actions on tracks that already got tonal moves earlier."
             }
-            Self::SpaceGlue => {
-                "Stage 6 — SPACE & GLUE. \
-                 Set reverb/delay sends per the profile's space rule. Vary by role: \
-                 leads get more, bass/kick stay dry, overheads only get small short reverb. \
+            Self::DepthSpace => {
+                "Stage 7 — DEPTH & SPACE. \
+                 Use reverb/delay sends to place sources front-to-back, not just to add effects. Vary by role: \
+                 leads get enough space without losing focus, bass/kick stay dry, overheads/rooms only get small short reverb. \
                  Use set_reverb_send and set_delay_send. Don't touch anything else."
             }
-            Self::MasterBalance => {
-                "Stage 7 — MASTER & BALANCE. \
-                 Use the master analysis. If headroom < 3 dB → adjust_master_gain by a negative delta. \
-                 If integrated LUFS is more than 2 dB off the profile target → adjust_master_gain to move toward it. \
-                 If sections were detected and a chorus measures quieter than an adjacent verse, create_region for the chorus and apply_section_automation on its scope to lift gain. \
+            Self::SectionAutomation => {
+                "Stage 8 — SECTION AUTOMATION. \
+                 Only act when sections were detected. Use create_region and apply_section_automation to fix section-level energy problems, such as a chorus that is unintentionally quieter than an adjacent verse. \
+                 Preserve intentional arrangement contrast. Keep rides subtle: usually +/-0.5 to +/-2 dB, rarely more than +/-3 dB. \
+                 Do not use EQ, compression, sends, filters, or master actions in this stage."
+            }
+            Self::MixBusLoudness => {
+                "Stage 9 — MIX BUS / LOUDNESS. \
+                 Use master/headroom analysis. If headroom < 3 dB → adjust_master_gain by a negative delta. \
+                 If integrated LUFS is more than 2 dB off the profile target and headroom allows it → adjust_master_gain to move toward it. \
+                 Do not use master gain to fix track-level balance problems. \
                  Cap any single move at ±4 dB."
             }
         }
     }
     fn max_actions(&self) -> usize {
         match self {
-            Self::GainStaging => 200,
+            Self::PrepIntent => 10,
+            Self::StaticBalance => 200,
             Self::CleanupFilters => 200,
-            Self::CorrectiveEq => 60,
+            Self::SubtractiveEq => 60,
             Self::Dynamics => 50,
-            Self::TonalShaping => 40,
-            Self::SpaceGlue => 80,
-            Self::MasterBalance => 20,
+            Self::TonalEnhancement => 40,
+            Self::DepthSpace => 80,
+            Self::SectionAutomation => 40,
+            Self::MixBusLoudness => 20,
         }
     }
 
     fn action_schema(&self) -> &'static str {
         match self {
-            Self::GainStaging => {
+            Self::PrepIntent => {
+                r#"Allowed action objects for this stage:
+- {"tool":"set_track_gain","trackId":"tk0","gainDb":-2.0}"#
+            }
+            Self::StaticBalance => {
                 r#"Allowed action objects for this stage:
 - {"tool":"set_track_gain","trackId":"tk0","gainDb":-7.0}
 - {"tool":"set_track_pan","trackId":"tk0","pan":0.0}"#
@@ -151,7 +174,7 @@ impl AutoMixStage {
 - {"tool":"set_high_pass","trackId":"tk0","frequencyHz":80,"slopeDbOct":12}
 - {"tool":"set_low_pass","trackId":"tk0","frequencyHz":18000,"slopeDbOct":12}"#
             }
-            Self::CorrectiveEq | Self::TonalShaping => {
+            Self::SubtractiveEq | Self::TonalEnhancement => {
                 r#"Allowed action objects for this stage:
 - {"tool":"set_eq_band","trackId":"tk0","band":1,"frequencyHz":400,"gainDb":-2.0,"q":1.0}"#
             }
@@ -159,17 +182,20 @@ impl AutoMixStage {
                 r#"Allowed action objects for this stage:
 - {"tool":"set_compressor","trackId":"tk0","thresholdDb":-18.0,"ratio":2.0,"attackMs":20.0,"releaseMs":160.0,"kneeDb":6.0,"makeupDb":0.0}"#
             }
-            Self::SpaceGlue => {
+            Self::DepthSpace => {
                 r#"Allowed action objects for this stage:
 - {"tool":"set_reverb_send","trackId":"tk0","levelDb":-22.0}
 - {"tool":"set_delay_send","trackId":"tk0","levelDb":-24.0}"#
             }
-            Self::MasterBalance => {
+            Self::SectionAutomation => {
+                r#"Allowed action objects for this stage:
+- {"tool":"create_region","name":"Chorus 1","startSample":0,"endSample":480000,"trackIds":["tk0"]}
+- {"tool":"apply_section_automation","regionId":"rg0","targetTrackId":"tk0","param":"gainDb","value":1.0}"#
+            }
+            Self::MixBusLoudness => {
                 r#"Allowed action objects for this stage:
 - {"tool":"adjust_master_gain","deltaDb":-2.0}
-- {"tool":"set_master_gain","gainDb":-2.0}
-- {"tool":"create_region","name":"Chorus 1","startSample":0,"endSample":480000,"trackIds":["tk0"]}
-- {"tool":"apply_section_automation","regionId":"rg0","targetTrackId":"tk0","param":"gainDb","points":[{"sample":0,"value":1.0}],"curve":"linear"}"#
+- {"tool":"set_master_gain","gainDb":-2.0}"#
             }
         }
     }
@@ -446,11 +472,12 @@ fn allowed_ai_gain_reduction(session: &MixSession, track: &crate::model::Track) 
 }
 
 fn parse_stage_envelope(session: &MixSession, raw: &str) -> Result<StageEnvelope, String> {
-    let mut value: Value = match serde_json::from_str(raw) {
+    let normalized_raw = normalize_json_quotes(raw);
+    let mut value: Value = match serde_json::from_str(&normalized_raw) {
         Ok(value) => value,
         Err(first_error) => {
-            let repaired = strip_invalid_numeric_closing_quotes(raw);
-            if repaired == raw {
+            let repaired = strip_invalid_numeric_closing_quotes(&normalized_raw);
+            if repaired == normalized_raw {
                 return Err(first_error.to_string());
             }
             serde_json::from_str(&repaired).map_err(|_| first_error.to_string())?
@@ -461,6 +488,10 @@ fn parse_stage_envelope(session: &MixSession, raw: &str) -> Result<StageEnvelope
     }
     normalize_stage_value(session, &mut value);
     serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
+fn normalize_json_quotes(raw: &str) -> String {
+    raw.replace(['“', '”'], "\"")
 }
 
 fn strip_invalid_numeric_closing_quotes(raw: &str) -> String {
@@ -906,6 +937,13 @@ mod tests {
     }
 
     #[test]
+    fn repairs_smart_json_quotes() {
+        let raw = "{\"actions\":[{\"tool\":\"set_track_gain\",\"trackId\":\"track-a\",\"gainDb\":0.5}],\"rationale\":\"small move.”}";
+        let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
+        assert!(matches!(&env.actions[0], MixAction::SetTrackGain { gain_db, .. } if *gain_db == 0.5));
+    }
+
+    #[test]
     fn normalizes_prefixed_tool_and_id_field() {
         let raw = r#"{"actions":[{"tool":"balance.set_track_gain","id":"track-a","gainDb":-7.0},{"tool":"balance.set_pan","id":"track-a","pan":0.4}],"rationale":"balance"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
@@ -1015,13 +1053,15 @@ mod tests {
             .collect();
 
         for stage in [
-            AutoMixStage::GainStaging,
+            AutoMixStage::PrepIntent,
+            AutoMixStage::StaticBalance,
             AutoMixStage::CleanupFilters,
-            AutoMixStage::CorrectiveEq,
+            AutoMixStage::SubtractiveEq,
             AutoMixStage::Dynamics,
-            AutoMixStage::TonalShaping,
-            AutoMixStage::SpaceGlue,
-            AutoMixStage::MasterBalance,
+            AutoMixStage::TonalEnhancement,
+            AutoMixStage::DepthSpace,
+            AutoMixStage::SectionAutomation,
+            AutoMixStage::MixBusLoudness,
         ] {
             let prompt = substitute_quoted(&build_stage_prompt(&session, stage), &track_aliases, true);
             let observer = TestObserver::new();
