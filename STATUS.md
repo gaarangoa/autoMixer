@@ -24,7 +24,6 @@ A chat-driven mix-engineer app. Tauri 2 desktop shell, React frontend, Rust audi
   client/            React + TS frontend (Vite)
   shared/types.ts    TS types mirroring Rust model
   audio-service/     Python sidecar (allin1 wrapper) managed via uv
-  benchmark/         100-case prompt eval grid (run with run.mjs)
   STATUS.md          this file
 ```
 
@@ -166,10 +165,6 @@ Each stage is its own LLM call with its own narrow prompt and its own action cap
 4. **No live recording** — design proposed (cpal input stream + WAV writer + convert-to-track), not implemented.
 5. **macOS rustc linker bug** — recurs after some incremental builds (`_anon.<hash>` symbol mismatches). Fix: `cargo clean -p automixer`. The `codegen-units=1` profile setting reduces frequency.
 6. **Webview prompt/confirm** — `window.prompt` is silently disabled in Tauri 2; replaced with inline forms (rename) but `window.confirm` is still used for delete (works in current builds; may need replacement).
-
-## Benchmark
-
-`/benchmark/` has 100 cases covering simple/moderate/complex/advanced prompts, plus a runner (`run.mjs`) that mirrors the app pipeline (alias substitution, lenient JSON extraction, tolerance grading). Model grid runner skips medical/vision models. Results saved as `results-<model>.json`; aggregator produces a markdown summary table.
 
 ## Roadmap (immediate priorities)
 
