@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 arc-swap = "1"
 axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 cpal = "0.15"
 crossbeam-channel = "0.5"

@@ -129,8 +129,14 @@ pub struct AutomationLane {
 #[serde(rename_all = "camelCase")]
 pub struct ClipRegion {
     pub id: Id,
+    #[serde(default)]
+    pub source_file_id: Option<Id>,
+    #[serde(default)]
+    pub name: Option<String>,
     pub start_sample: u64,
     pub end_sample: u64,
+    #[serde(default)]
+    pub source_offset_sample: u64,
     pub gain_db: f32,
 }
 
@@ -324,6 +330,8 @@ pub struct MixProject {
 pub enum MixAction {
     CreateRegion { name: String, start_sample: u64, end_sample: u64, track_ids: Option<Vec<Id>> },
     DeleteTrack { track_id: Id },
+    RenameTrack { track_id: Id, name: String },
+    SetTrackRole { track_id: Id, role: Option<String> },
     SetTrackGain { track_id: Id, gain_db: f32 },
     AdjustTrackGain { track_id: Id, delta_db: f32 },
     SetTrackPan { track_id: Id, pan: f32 },

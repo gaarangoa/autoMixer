@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog } from "../../shared/types";
+import type { AbJudgeResponse, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog } from "../../shared/types";
 
 function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {
@@ -18,11 +18,13 @@ export type LlmStatsEvent = { phase: string; promptTokens: number; responseToken
 export const api = {
   config: () => tauriInvoke<{ ollamaBaseUrl: string; ollamaModel: string }>("get_config"),
   ollamaModels: (baseUrl: string) => tauriInvoke<{ models: string[] }>("list_ollama_models", { baseUrl }),
+  inputDevices: () => tauriInvoke<{ devices: string[] }>("list_input_devices"),
   skills: () => tauriInvoke<SkillCatalog>("get_skill_catalog"),
   sessions: () => tauriInvoke<MixSession[]>("list_sessions"),
   createSession: (name: string) => tauriInvoke<MixProject>("create_session", { name }),
   getSession: (id: string) => tauriInvoke<MixProject>("get_project", { sessionId: id }),
   importFiles: (sessionId: string, paths: string[]) => tauriInvoke<MixProject>("import_audio_files", { sessionId, paths }),
+  createRecordingTrack: (sessionId: string) => tauriInvoke<MixProject>("create_recording_track", { sessionId }),
   applyActions: (sessionId: string, actions: MixAction[], explanation?: string) =>
     tauriInvoke<MixProject>("apply_mix_actions", { sessionId, actions, explanation }),
   undo: (sessionId: string) => tauriInvoke<MixProject>("undo_mix_action", { sessionId }),
@@ -35,6 +37,14 @@ export const api = {
   pause: () => tauriInvoke<void>("transport_pause"),
   stop: () => tauriInvoke<void>("transport_stop"),
   seek: (sample: number) => tauriInvoke<void>("transport_seek", { sample }),
+  startRecording: (sessionId: string, startSample: number, targetTrackId?: string, inputDevice?: string) =>
+    tauriInvoke<void>("start_recording", { sessionId, startSample, targetTrackId, inputDevice }),
+  recordingMeters: () => tauriInvoke<{ peaks: number[] }>("poll_recording_meters"),
+  stopRecording: (sessionId: string) => tauriInvoke<MixProject>("stop_recording", { sessionId }),
+  deleteClip: (sessionId: string, trackId: string, clipId: string) =>
+    tauriInvoke<MixProject>("delete_clip", { sessionId, trackId, clipId }),
+  deleteClipRange: (sessionId: string, trackId: string, startSample: number, endSample: number) =>
+    tauriInvoke<MixProject>("delete_clip_range", { sessionId, trackId, startSample, endSample }),
   setMasterBypass: (enabled: boolean) => tauriInvoke<void>("set_master_bypass", { enabled }),
   setMasterGain: (sessionId: string, gainDb: number) => tauriInvoke<MixProject>("set_master_gain", { sessionId, gainDb }),
   renameSession: (sessionId: string, name: string) => tauriInvoke<MixProject>("rename_session", { sessionId, name }),
@@ -48,7 +58,15 @@ export const api = {
     tauriInvoke<void>("start_auto_mix", { sessionId, options: { stages, ollamaBaseUrl, ollamaModel } }),
   onAutoMixEvent: (kind: "start" | "stage-start" | "stage-done" | "complete", cb: (payload: unknown) => void): Promise<UnlistenFn> =>
     listen(`auto-mix:${kind}`, (e) => cb(e.payload)),
+  onMenuDetectStructure: (cb: () => void): Promise<UnlistenFn> =>
+    listen("menu:detect-structure", () => cb()),
+  onMenuLevelSections: (cb: () => void): Promise<UnlistenFn> =>
+    listen("menu:level-sections", () => cb()),
   renderMix: (sessionId: string, outputPath: string) => tauriInvoke<{ path: string }>("render_mix", { sessionId, outputPath }),
+  judgeMixAb: (sessionId: string, apiKey: string, model = "gemini-flash-latest") =>
+    tauriInvoke<AbJudgeResponse>("judge_mix_ab", { sessionId, options: { provider: "gemini", model, apiKey } }),
+  judgeMixAbLocal: (sessionId: string) =>
+    tauriInvoke<AbJudgeResponse>("judge_mix_ab", { sessionId, options: { provider: "local", model: "local-qc-v1" } }),
   analyzeMasterStructure: (sessionId: string) => tauriInvoke<MixProject>("analyze_master_structure", { sessionId }),
   onAudioProgress: (cb: (event: AudioProgressEvent) => void): Promise<UnlistenFn> =>
     listen<AudioProgressEvent>("audio:progress", e => cb(e.payload)),

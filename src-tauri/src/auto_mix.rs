@@ -26,6 +26,7 @@ use crate::assistant::{
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoMixStage {
+    RawSessionPrep,
     PrepIntent,
     StaticBalance,
     CleanupFilters,
@@ -40,6 +41,7 @@ pub enum AutoMixStage {
 impl AutoMixStage {
     pub fn id(&self) -> &'static str {
         match self {
+            Self::RawSessionPrep => "raw_session_prep",
             Self::PrepIntent => "prep_intent",
             Self::StaticBalance => "static_balance",
             Self::CleanupFilters => "cleanup_filters",
@@ -53,6 +55,7 @@ impl AutoMixStage {
     }
     pub fn display_name(&self) -> &'static str {
         match self {
+            Self::RawSessionPrep => "Raw session prep",
             Self::PrepIntent => "Prep / intent",
             Self::StaticBalance => "Static balance",
             Self::CleanupFilters => "Cleanup filters",
@@ -66,6 +69,7 @@ impl AutoMixStage {
     }
     fn skills(&self) -> &'static [&'static str] {
         match self {
+            Self::RawSessionPrep => &["session_prep", "balance", "tonal_eq", "dynamics", "space_depth"],
             Self::PrepIntent => &["balance", "tonal_eq", "dynamics", "space_depth", "mastering"],
             Self::StaticBalance => &["balance"],
             Self::CleanupFilters => &["tonal_eq"],
@@ -79,6 +83,16 @@ impl AutoMixStage {
     }
     fn instructions(&self) -> &'static str {
         match self {
+            Self::RawSessionPrep => {
+                "Stage 0 — RAW SESSION PREP. \
+                 Treat this as a real raw multitrack session that may contain 30-80 tracks, alternates, doubles, room mics, overdubs, noisy takes, and repeated instruments. \
+                 First organize, then create a practical rough-mix starting point. Use rename_track and set_track_role to classify tracks using concise names such as Kick In, Snare Top, OH L, Room, Bass DI, Lead Vocal, BV L, Guitar L. \
+                 Mute only obvious junk/empty/duplicate alternate tracks when silencePercent is very high or the name clearly indicates an alternate that should not play. \
+                 Use set_track_pan for a sensible layout: kick/snare/bass/lead vocal center; overheads/rooms/stereo pairs wide; backing vocals and guitars spread; keep low-end centered. \
+                 Use conservative set_track_gain to establish a rough hierarchy; do not simply raise/lower everything equally. \
+                 Add only basic safety processing where obvious: high-pass rumble on non-kick/non-bass tracks, light compression on uneven vocals/bass/drums, modest reverb/delay sends for vocals/rooms/support. \
+                 This stage may emit many actions, but each must be purposeful and reversible. Do not delete tracks."
+            }
             Self::PrepIntent => {
                 "Stage 1 — PREP / INTENT. \
                  Identify the musical hierarchy from names, roles, and audio analysis: lead elements, groove, low-end foundation, support layers, and texture. \
@@ -146,6 +160,7 @@ impl AutoMixStage {
     }
     fn max_actions(&self) -> usize {
         match self {
+            Self::RawSessionPrep => 250,
             Self::PrepIntent => 10,
             Self::StaticBalance => 200,
             Self::CleanupFilters => 200,
@@ -160,6 +175,18 @@ impl AutoMixStage {
 
     fn action_schema(&self) -> &'static str {
         match self {
+            Self::RawSessionPrep => {
+                r#"Allowed action objects for this stage:
+- {"tool":"rename_track","trackId":"tk0","name":"Lead Vocal"}
+- {"tool":"set_track_role","trackId":"tk0","role":"lead_vocal"}
+- {"tool":"mute_track","trackId":"tk0","muted":true}
+- {"tool":"set_track_gain","trackId":"tk0","gainDb":-7.0}
+- {"tool":"set_track_pan","trackId":"tk0","pan":0.0}
+- {"tool":"set_high_pass","trackId":"tk0","frequencyHz":80,"slopeDbOct":12}
+- {"tool":"set_compressor","trackId":"tk0","thresholdDb":-18,"ratio":2.5,"attackMs":20,"releaseMs":160,"kneeDb":6,"makeupDb":0}
+- {"tool":"set_reverb_send","trackId":"tk0","levelDb":-24}
+- {"tool":"set_delay_send","trackId":"tk0","levelDb":-28}"#
+            }
             Self::PrepIntent => {
                 r#"Allowed action objects for this stage:
 - {"tool":"set_track_gain","trackId":"tk0","gainDb":-2.0}"#

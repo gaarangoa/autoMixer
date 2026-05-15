@@ -82,8 +82,11 @@ export type AutomationLane = {
 
 export type ClipRegion = {
   id: Id;
+  sourceFileId?: Id;
+  name?: string;
   startSample: number;
   endSample: number;
+  sourceOffsetSample?: number;
   gainDb: number;
 };
 
@@ -172,6 +175,18 @@ export type MixSection = {
   start: number;
   end: number;
   label: string;
+  analysis?: SectionAnalysis;
+};
+
+export type SectionAnalysis = {
+  peakDb: number;
+  rmsDb: number;
+  lufs: number;
+  spectralCentroidHz: number;
+  lowEnergy: number;
+  midEnergy: number;
+  highEnergy: number;
+  dynamicRangeDb: number;
 };
 
 export type JsonPatch = {
@@ -199,6 +214,8 @@ export type MixProject = {
 export type MixAction =
   | { tool: "create_region"; name: string; startSample: number; endSample: number; trackIds?: Id[] }
   | { tool: "delete_track"; trackId: Id }
+  | { tool: "rename_track"; trackId: Id; name: string }
+  | { tool: "set_track_role"; trackId: Id; role?: string }
   | { tool: "set_track_gain"; trackId: Id; gainDb: number }
   | { tool: "adjust_track_gain"; trackId: Id; deltaDb: number }
   | { tool: "set_track_pan"; trackId: Id; pan: number }
@@ -303,6 +320,29 @@ export type MixCritique = {
   mixIssues: CritiqueIssue[];
   perTrack: TrackCritique[];
   recommendedNextSteps: string[];
+};
+
+export type AbJudgeIssue = {
+  category: string;
+  severity: CritiqueSeverity;
+  message: string;
+};
+
+export type AbJudgeResponse = {
+  provider: string;
+  model: string;
+  winner: "before" | "after" | "tie";
+  confidence: number;
+  summary: string;
+  improvements: string[];
+  regressions: string[];
+  mixIssuesBefore: AbJudgeIssue[];
+  mixIssuesAfter: AbJudgeIssue[];
+  recommendedNextMoves: string[];
+  clipStart: number;
+  clipDuration: number;
+  promptTokens?: number;
+  outputTokens?: number;
 };
 
 export type AssistantResponse =

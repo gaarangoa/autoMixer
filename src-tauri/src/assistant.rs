@@ -520,6 +520,8 @@ async fn try_model_actions(
          Track ids are short tokens like `tk0`, `tk1` (and region ids like `rg0`); use them \
          exactly as they appear in the Tracks list. Never invent or modify them.\n\n\
          Allowed `tool` values and their exact field shapes (use these tool names; do NOT use skill names like \"tonal_eq\" or \"dynamics\"):\n\
+         - {{\"tool\":\"rename_track\",\"trackId\":\"...\",\"name\":\"Lead Vocal 1\"}}\n\
+         - {{\"tool\":\"set_track_role\",\"trackId\":\"...\",\"role\":\"lead_vocal\"}}\n\
          - {{\"tool\":\"set_track_gain\",\"trackId\":\"...\",\"gainDb\":-3.0}}\n\
          - {{\"tool\":\"adjust_track_gain\",\"trackId\":\"...\",\"deltaDb\":1.5}}\n\
          - {{\"tool\":\"set_track_pan\",\"trackId\":\"...\",\"pan\":-0.3}}\n\
@@ -1201,6 +1203,8 @@ fn explain_actions(actions: &[MixAction], session: &MixSession) -> String {
             let track_id = match action {
                 MixAction::SetTrackGain { track_id, .. }
                 | MixAction::AdjustTrackGain { track_id, .. }
+                | MixAction::RenameTrack { track_id, .. }
+                | MixAction::SetTrackRole { track_id, .. }
                 | MixAction::SetTrackPan { track_id, .. }
                 | MixAction::MuteTrack { track_id, .. }
                 | MixAction::SoloTrack { track_id, .. }
@@ -1220,6 +1224,8 @@ fn explain_actions(actions: &[MixAction], session: &MixSession) -> String {
                 .map(|track| track.name.as_str())
                 .unwrap_or("the mix");
             match action {
+                MixAction::RenameTrack { name, .. } => format!("renamed {name}"),
+                MixAction::SetTrackRole { role, .. } => format!("classified {name} as {}", role.as_deref().unwrap_or("unassigned")),
                 MixAction::AdjustTrackGain { delta_db, .. } => format!("{} {name} by {} dB", if *delta_db > 0.0 { "raised" } else { "lowered" }, delta_db.abs()),
                 MixAction::SetTrackGain { gain_db, .. } => format!("set {name} to {gain_db} dB"),
                 MixAction::SetTrackPan { .. } => format!("moved {name} in the stereo field"),
@@ -1248,6 +1254,8 @@ fn action_name(action: &MixAction) -> &'static str {
     match action {
         MixAction::CreateRegion { .. } => "create_region",
         MixAction::DeleteTrack { .. } => "delete_track",
+        MixAction::RenameTrack { .. } => "rename_track",
+        MixAction::SetTrackRole { .. } => "set_track_role",
         MixAction::SetTrackGain { .. } => "set_track_gain",
         MixAction::AdjustTrackGain { .. } => "adjust_track_gain",
         MixAction::SetTrackPan { .. } => "set_track_pan",

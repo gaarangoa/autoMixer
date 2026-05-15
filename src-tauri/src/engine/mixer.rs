@@ -325,36 +325,49 @@ impl Mixer {
                 if !track.active || track.muted || (any_solo && !track.solo) {
                     continue;
                 }
-                let Some(source) = sources[i].as_ref() else {
+                let Some(track_source) = sources[i].as_ref() else {
                     continue;
                 };
                 let session_pos = self.playhead + frame as f64 * session_per_output;
-                let start_f = source.start_sample as f64;
-                if session_pos < start_f {
+                let mut l = 0.0_f32;
+                let mut r = 0.0_f32;
+                let mut has_clip = false;
+                for source in &track_source.clips {
+                    let start_f = source.start_sample as f64;
+                    if session_pos < start_f {
+                        continue;
+                    }
+                    let frame_in_track_f = session_pos - start_f;
+                    if frame_in_track_f >= source.duration_samples as f64 {
+                        continue;
+                    }
+                    let i_floor = frame_in_track_f as u64;
+                    let source_frame = source.source_offset_sample.saturating_add(i_floor);
+                    let frac = (frame_in_track_f - i_floor as f64) as f32;
+                    let ch = source.channels as usize;
+                    let buf = &source.buffer;
+                    let idx0 = source_frame as usize * ch;
+                    if idx0 + ch > buf.len() {
+                        continue;
+                    }
+                    let l0 = buf[idx0];
+                    let r0 = if source.channels >= 2 { buf[idx0 + 1] } else { l0 };
+                    let (clip_l, clip_r) = if i_floor + 1 < source.duration_samples && idx0 + 2 * ch <= buf.len() {
+                        let idx1 = idx0 + ch;
+                        let l1 = buf[idx1];
+                        let r1 = if source.channels >= 2 { buf[idx1 + 1] } else { l1 };
+                        (l0 + frac * (l1 - l0), r0 + frac * (r1 - r0))
+                    } else {
+                        (l0, r0)
+                    };
+                    let clip_gain = db_to_gain(source.gain_db);
+                    l += clip_l * clip_gain;
+                    r += clip_r * clip_gain;
+                    has_clip = true;
+                }
+                if !has_clip {
                     continue;
                 }
-                let frame_in_track_f = session_pos - start_f;
-                if frame_in_track_f >= source.duration_samples as f64 {
-                    continue;
-                }
-                let i_floor = frame_in_track_f as u64;
-                let frac = (frame_in_track_f - i_floor as f64) as f32;
-                let ch = source.channels as usize;
-                let buf = &source.buffer;
-                let idx0 = i_floor as usize * ch;
-                if idx0 + ch > buf.len() {
-                    continue;
-                }
-                let l0 = buf[idx0];
-                let r0 = if source.channels >= 2 { buf[idx0 + 1] } else { l0 };
-                let (mut l, mut r) = if i_floor + 1 < source.duration_samples && idx0 + 2 * ch <= buf.len() {
-                    let idx1 = idx0 + ch;
-                    let l1 = buf[idx1];
-                    let r1 = if source.channels >= 2 { buf[idx1 + 1] } else { l1 };
-                    (l0 + frac * (l1 - l0), r0 + frac * (r1 - r0))
-                } else {
-                    (l0, r0)
-                };
 
                 let (lc, rc) = if self.master_bypass {
                     // A/B compare: source samples pass through with no DSP, no gain,

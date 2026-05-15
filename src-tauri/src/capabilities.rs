@@ -4,6 +4,13 @@ pub fn skill_catalog() -> SkillCatalog {
     SkillCatalog {
         skills: vec![
             card(
+                "session_prep",
+                "Session Prep",
+                "Use for raw multitrack organization: rename tracks, assign roles, mute unusable alternates, and prepare a rough layout.",
+                &["organize", "prep", "raw", "multitrack", "tracks", "takes", "roles", "rename"],
+                &["rename_track", "set_track_role", "mute_track", "set_track_gain", "set_track_pan"],
+            ),
+            card(
                 "balance",
                 "Balance",
                 "Use for level, mute, solo, and pan moves.",
@@ -75,6 +82,9 @@ pub fn select_skills(text: &str) -> Vec<String> {
     let mut skills = Vec::new();
     if has_any(&lower, &["undo", "redo", "revert"]) {
         skills.push("safety_undo".into());
+    }
+    if has_any(&lower, &["organize", "prep", "raw", "multitrack", "tracks", "takes", "roles", "rename"]) {
+        skills.push("session_prep".into());
     }
     if has_any(&lower, &["eq", "bright", "dark", "warm", "mud", "harsh", "presence", "rumble", "air", "low", "mid", "high"]) {
         skills.push("tonal_eq".into());

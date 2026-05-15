@@ -22,7 +22,7 @@ use rtrb::{Producer, RingBuffer};
 
 use commands::EngineCommand;
 use events::EngineEvent;
-use shared::{EngineShared, TrackSource};
+use shared::{EngineShared, TrackClipSource, TrackSource};
 use source::cache::read_cache_all;
 use thread::{AudioThreadConfig, AudioThreadDeps, AudioThreadHandle};
 
@@ -124,19 +124,45 @@ impl AudioEngine {
             if i >= self.shared.source_slots.len() {
                 break;
             }
-            let Some(src) = by_id.get(track.source_file_id.as_str()) else {
+            let mut clips = Vec::new();
+            if track.clips.is_empty() {
+                if let Some(src) = by_id.get(track.source_file_id.as_str()) {
+                    let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
+                    clips.push(TrackClipSource {
+                        start_sample: track.start_sample,
+                        duration_samples: header.frames,
+                        source_offset_sample: 0,
+                        gain_db: 0.0,
+                        channels: header.channels,
+                        sample_rate: header.sample_rate,
+                        buffer: samples,
+                    });
+                }
+            } else {
+                for clip in &track.clips {
+                    let source_id = clip.source_file_id.as_deref().unwrap_or(track.source_file_id.as_str());
+                    let Some(src) = by_id.get(source_id) else {
+                        continue;
+                    };
+                    let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
+                    clips.push(TrackClipSource {
+                        start_sample: clip.start_sample,
+                        duration_samples: header.frames
+                            .saturating_sub(clip.source_offset_sample)
+                            .min(clip.end_sample.saturating_sub(clip.start_sample)),
+                        source_offset_sample: clip.source_offset_sample,
+                        gain_db: clip.gain_db,
+                        channels: header.channels,
+                        sample_rate: header.sample_rate,
+                        buffer: samples,
+                    });
+                }
+            }
+            if clips.is_empty() {
                 self.shared.source_slots[i].store(None);
-                continue;
-            };
-            let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
-            let track_source = Arc::new(TrackSource {
-                start_sample: track.start_sample,
-                duration_samples: header.frames,
-                channels: header.channels,
-                sample_rate: header.sample_rate,
-                buffer: samples,
-            });
-            self.shared.source_slots[i].store(Some(track_source));
+            } else {
+                self.shared.source_slots[i].store(Some(Arc::new(TrackSource { clips })));
+            }
         }
         self.send(EngineCommand::SetSessionRate { rate: session.sample_rate });
         for i in session.tracks.len()..self.shared.source_slots.len() {

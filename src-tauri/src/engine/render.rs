@@ -20,7 +20,7 @@ use super::{
     automation::build_snapshot,
     commands::EngineCommand,
     mixer::{Mixer, MAX_TRACKS},
-    shared::{EngineShared, TrackSource},
+    shared::{EngineShared, TrackClipSource, TrackSource},
     source::cache::read_cache_all,
 };
 
@@ -40,7 +40,15 @@ pub struct RenderedMix {
 /// Run the offline mixer and return interleaved stereo f32 PCM in memory.
 /// Used by the assistant for analysis (e.g. critique) without writing a WAV.
 pub fn render_session_to_buffer(session: &MixSession) -> Result<RenderedMix, String> {
-    let (mut mixer, total_with_tail, channels, sample_rate) = build_render_mixer(session)?;
+    render_session_to_buffer_with_bypass(session, false)
+}
+
+/// Render using the same source-only bypass path as the live MIX/ORIG toggle.
+pub fn render_session_to_buffer_with_bypass(
+    session: &MixSession,
+    master_bypass: bool,
+) -> Result<RenderedMix, String> {
+    let (mut mixer, total_with_tail, channels, _sample_rate) = build_render_mixer(session, master_bypass)?;
     let mut block = vec![0.0_f32; RENDER_BLOCK * channels as usize];
     let mut produced: u64 = 0;
     let mut out: Vec<f32> = Vec::with_capacity((total_with_tail as usize) * channels as usize);
@@ -54,7 +62,7 @@ pub fn render_session_to_buffer(session: &MixSession) -> Result<RenderedMix, Str
     Ok(RenderedMix { samples: out, channels, sample_rate: session.sample_rate })
 }
 
-fn build_render_mixer(session: &MixSession) -> Result<(Mixer, u64, u16, f32), String> {
+fn build_render_mixer(session: &MixSession, master_bypass: bool) -> Result<(Mixer, u64, u16, f32), String> {
     // Load all source caches up front.
     let by_id: HashMap<&str, &SourceFile> =
         session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
@@ -65,22 +73,47 @@ fn build_render_mixer(session: &MixSession) -> Result<(Mixer, u64, u16, f32), St
         if i >= MAX_TRACKS {
             break;
         }
-        let Some(src) = by_id.get(track.source_file_id.as_str()) else {
-            continue;
-        };
-        let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
-        let end = track.start_sample + header.frames;
-        if end > total_frames {
-            total_frames = end;
+        let mut clips = Vec::new();
+        if track.clips.is_empty() {
+            if let Some(src) = by_id.get(track.source_file_id.as_str()) {
+                let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
+                let end = track.start_sample + header.frames;
+                total_frames = total_frames.max(end);
+                clips.push(TrackClipSource {
+                    start_sample: track.start_sample,
+                    duration_samples: header.frames,
+                    source_offset_sample: 0,
+                    gain_db: 0.0,
+                    channels: header.channels,
+                    sample_rate: header.sample_rate,
+                    buffer: samples,
+                });
+            }
+        } else {
+            for clip in &track.clips {
+                let source_id = clip.source_file_id.as_deref().unwrap_or(track.source_file_id.as_str());
+                let Some(src) = by_id.get(source_id) else {
+                    continue;
+                };
+                let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
+                let duration = header.frames
+                    .saturating_sub(clip.source_offset_sample)
+                    .min(clip.end_sample.saturating_sub(clip.start_sample));
+                total_frames = total_frames.max(clip.start_sample + duration);
+                clips.push(TrackClipSource {
+                    start_sample: clip.start_sample,
+                    duration_samples: duration,
+                    source_offset_sample: clip.source_offset_sample,
+                    gain_db: clip.gain_db,
+                    channels: header.channels,
+                    sample_rate: header.sample_rate,
+                    buffer: samples,
+                });
+            }
         }
-        let track_source = Arc::new(TrackSource {
-            start_sample: track.start_sample,
-            duration_samples: header.frames,
-            channels: header.channels,
-            sample_rate: header.sample_rate,
-            buffer: samples,
-        });
-        shared.source_slots[i].store(Some(track_source));
+        if !clips.is_empty() {
+            shared.source_slots[i].store(Some(Arc::new(TrackSource { clips })));
+        }
     }
     if total_frames == 0 {
         total_frames = session.sample_rate as u64;
@@ -92,11 +125,12 @@ fn build_render_mixer(session: &MixSession) -> Result<(Mixer, u64, u16, f32), St
     let (events_tx, _events_rx) = unbounded();
     let sample_rate = session.sample_rate as f32;
     let channels: u16 = 2;
-    let mut mixer = Mixer::new(sample_rate, channels, consumer, events_tx, shared.clone());
+    let mixer = Mixer::new(sample_rate, channels, consumer, events_tx, shared.clone());
 
     // Push session state.
     let _ = producer.push(EngineCommand::SetMasterGainDb(session.master.gain_db));
     let _ = producer.push(EngineCommand::SetMasterCeilingDb(session.master.limiter.ceiling_db));
+    let _ = producer.push(EngineCommand::SetMasterBypass { enabled: master_bypass });
     for (i, track) in session.tracks.iter().enumerate() {
         if i >= MAX_TRACKS {
             break;
@@ -162,7 +196,7 @@ pub fn render_session(session: &MixSession, output_path: &Path) -> Result<PathBu
     } else {
         output_path.with_extension("wav")
     };
-    let (mut mixer, total_with_tail, channels, _sample_rate) = build_render_mixer(session)?;
+    let (mut mixer, total_with_tail, channels, _sample_rate) = build_render_mixer(session, false)?;
     let spec = WavSpec {
         channels,
         sample_rate: session.sample_rate,

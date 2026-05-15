@@ -1,9 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::Serialize;
 use tauri::{Emitter, State};
 
 use crate::{
+    ab_judge::{AbJudgeOptions, AbJudgeResponse},
     actions::{apply_actions, record_patch, redo, undo},
     assistant,
     audio,
@@ -24,6 +28,18 @@ pub struct UiConfig {
 #[derive(Serialize)]
 pub struct ModelsResponse {
     models: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputDevicesResponse {
+    devices: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingMetersResponse {
+    peaks: Vec<f32>,
 }
 
 #[derive(Serialize)]
@@ -50,6 +66,11 @@ pub async fn list_ollama_models(base_url: String) -> Result<ModelsResponse, Stri
 }
 
 #[tauri::command]
+pub fn list_input_devices() -> Result<InputDevicesResponse, String> {
+    Ok(InputDevicesResponse { devices: crate::recorder::input_devices()? })
+}
+
+#[tauri::command]
 pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<MixSession>, String> {
     state.store.lock().map_err(|error| error.to_string())?.list_sessions()
 }
@@ -72,6 +93,21 @@ pub fn import_audio_files(state: State<'_, AppState>, session_id: String, paths:
         latest = Some(store.add_source_file(&session_id, Path::new(&path))?);
     }
     latest.map_or_else(|| store.get_project(&session_id), Ok)
+}
+
+#[tauri::command]
+pub fn create_recording_track(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .create_recording_track(&session_id)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
 }
 
 #[tauri::command]
@@ -233,6 +269,114 @@ pub fn transport_stop(state: State<'_, AppState>) -> Result<(), String> {
 pub fn transport_seek(state: State<'_, AppState>, sample: u64) -> Result<(), String> {
     state.audio.lock().map_err(|error| error.to_string())?.seek(sample);
     Ok(())
+}
+
+#[tauri::command]
+pub fn start_recording(
+    state: State<'_, AppState>,
+    session_id: String,
+    start_sample: u64,
+    target_track_id: Option<String>,
+    input_device: Option<String>,
+) -> Result<(), String> {
+    let session = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?
+        .session;
+    let safe_start = start_sample.min(session_duration_samples(&session));
+    let mut recorder = state.recorder.lock().map_err(|error| error.to_string())?;
+    if recorder.is_some() {
+        return Err("Recording is already active.".into());
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    let path = state
+        .config
+        .data_dir
+        .join("recordings")
+        .join(format!("recording-{stamp}.wav"));
+    if let Some(track_id) = target_track_id.as_deref() {
+        if !session.tracks.iter().any(|track| track.id == track_id) {
+            return Err(format!("Unknown target track {track_id}"));
+        }
+    }
+    let handle = crate::recorder::start_recording(path, safe_start, target_track_id, input_device)?;
+    *recorder = Some(handle);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn poll_recording_meters(state: State<'_, AppState>) -> Result<RecordingMetersResponse, String> {
+    let recorder = state.recorder.lock().map_err(|error| error.to_string())?;
+    let peaks = recorder
+        .as_ref()
+        .map(|handle| handle.drain_meters().into_iter().map(|meter| meter.peak).collect())
+        .unwrap_or_default();
+    Ok(RecordingMetersResponse { peaks })
+}
+
+#[tauri::command]
+pub fn stop_recording(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+    let handle = state
+        .recorder
+        .lock()
+        .map_err(|error| error.to_string())?
+        .take()
+        .ok_or_else(|| "No recording is active.".to_string())?;
+    let start_sample = handle.start_sample;
+    let target_track_id = handle.target_track_id.clone();
+    let path = handle.stop()?;
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    let project = if let Some(track_id) = target_track_id {
+        store.add_recording_clip(&session_id, &track_id, &path, start_sample)?
+    } else {
+        store.add_source_file_at(&session_id, &path, start_sample)?
+    };
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn delete_clip(
+    state: State<'_, AppState>,
+    session_id: String,
+    track_id: String,
+    clip_id: String,
+) -> Result<MixProject, String> {
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    let project = store.delete_clip(&session_id, &track_id, &clip_id)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn delete_clip_range(
+    state: State<'_, AppState>,
+    session_id: String,
+    track_id: String,
+    start_sample: u64,
+    end_sample: u64,
+) -> Result<MixProject, String> {
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    let project = store.delete_clip_range(&session_id, &track_id, start_sample, end_sample)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
 }
 
 #[tauri::command]
@@ -436,6 +580,7 @@ pub async fn start_auto_mix(
         .stages
         .iter()
         .filter_map(|s| match s.as_str() {
+            "raw_session_prep" => Some(AutoMixStage::RawSessionPrep),
             "prep_intent" => Some(AutoMixStage::PrepIntent),
             "static_balance" => Some(AutoMixStage::StaticBalance),
             "cleanup_filters" => Some(AutoMixStage::CleanupFilters),
@@ -673,6 +818,20 @@ pub fn render_mix(state: State<'_, AppState>, session_id: String, output_path: S
     Ok(RenderResponse { path: path.to_string_lossy().to_string() })
 }
 
+#[tauri::command]
+pub async fn judge_mix_ab(
+    state: State<'_, AppState>,
+    session_id: String,
+    options: AbJudgeOptions,
+) -> Result<AbJudgeResponse, String> {
+    let project = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        store.get_project(&session_id)?
+    };
+    let temp_dir = state.config.data_dir.join("ab-judge");
+    crate::ab_judge::judge_session(&project.session, &temp_dir, options).await
+}
+
 fn analyze_section_window(
     render: &crate::engine::render::RenderedMix,
     start_seconds: f32,
@@ -716,6 +875,21 @@ fn normalize_wav_path(path: PathBuf) -> PathBuf {
 
 fn track_slot(session: &MixSession, track_id: &str) -> Option<u32> {
     session.tracks.iter().position(|t| t.id == track_id).map(|i| i as u32)
+}
+
+fn session_duration_samples(session: &MixSession) -> u64 {
+    let by_id: std::collections::HashMap<&str, &crate::model::SourceFile> =
+        session.source_files.iter().map(|source| (source.id.as_str(), source)).collect();
+    session.tracks.iter().map(|track| {
+        if track.clips.is_empty() {
+            by_id
+                .get(track.source_file_id.as_str())
+                .map(|source| track.start_sample + source.duration_samples)
+                .unwrap_or(0)
+        } else {
+            track.clips.iter().map(|clip| clip.end_sample).max().unwrap_or(0)
+        }
+    }).max().unwrap_or(0)
 }
 
 fn push_engine_commands(state: &State<'_, AppState>, session: &MixSession, actions: &[MixAction]) {

@@ -6,9 +6,10 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
+    actions::record_patch,
     defaults::{default_master, make_track},
     engine::source::{import_to_session_rate, write_to_cache, ImportedAudio},
-    model::{MixProject, MixSession, SourceFile, TrackAnalysis},
+    model::{ClipRegion, HistorySource, JsonPatchOp, MixProject, MixSession, SourceFile, TrackAnalysis},
 };
 
 pub struct SessionStore {
@@ -82,8 +83,268 @@ impl SessionStore {
     }
 
     pub fn add_source_file(&self, session_id: &str, source_path: &Path) -> Result<MixProject, String> {
+        self.add_source_file_at(session_id, source_path, 0)
+    }
+
+    pub fn add_source_file_at(&self, session_id: &str, source_path: &Path, start_sample: u64) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
         let session_rate = project.session.sample_rate;
+        let (source, _imported) = self.import_source(source_path, session_rate)?;
+        let source_id = source.id.clone();
+
+        let track_name = strip_extension(&source.original_name);
+        let mut track = make_track(source_id, track_name, project.session.tracks.len());
+        track.start_sample = start_sample;
+        project.session.source_files.push(source);
+        project.session.tracks.push(track);
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    pub fn create_recording_track(&self, session_id: &str) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let source_id = Uuid::new_v4().to_string();
+        let frames = project.session.sample_rate as u64;
+        let channels = 1_u16;
+        let samples = vec![0.0_f32; frames as usize * channels as usize];
+        let cache_path = self.sources_dir().join(format!("{source_id}.f32cache"));
+        crate::engine::source::cache::write_cache(
+            &cache_path,
+            &crate::engine::source::cache::CacheHeader {
+                channels,
+                sample_rate: project.session.sample_rate,
+                frames,
+            },
+            &samples,
+        )?;
+        let peaks = crate::engine::source::peaks::build_peaks(&samples, channels, project.session.sample_rate);
+        let peak_path = self.peaks_dir().join(format!("{source_id}.peaks.json"));
+        fs::write(
+            &peak_path,
+            serde_json::to_string(&peaks).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let source = SourceFile {
+            id: source_id.clone(),
+            original_name: "Recording".into(),
+            cache_path: cache_path.to_string_lossy().to_string(),
+            peak_path: peak_path.to_string_lossy().to_string(),
+            duration_samples: frames,
+            sample_rate: project.session.sample_rate,
+            channels,
+            analysis: analyze_samples(&samples, channels, project.session.sample_rate),
+            peak_preview: peaks.preview,
+        };
+        let track = make_track(source_id, format!("Recording {}", project.session.tracks.len() + 1), project.session.tracks.len());
+        project.session.source_files.push(source);
+        project.session.tracks.push(track);
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    pub fn replace_track_audio(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        source_path: &Path,
+        start_sample: u64,
+    ) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let session_rate = project.session.sample_rate;
+        let (source, _imported) = self.import_source(source_path, session_rate)?;
+        let source_id = source.id.clone();
+        let track = project
+            .session
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        track.source_file_id = source_id;
+        track.start_sample = start_sample;
+        track.name = strip_extension(&source.original_name);
+        project.session.source_files.push(source);
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    pub fn add_recording_clip(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        source_path: &Path,
+        start_sample: u64,
+    ) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let session_rate = project.session.sample_rate;
+        let (source, _imported) = self.import_source(source_path, session_rate)?;
+        let source_id = source.id.clone();
+        let duration = source.duration_samples;
+        let clip_name = strip_extension(&source.original_name);
+        let existing_source = project
+            .session
+            .source_files
+            .iter()
+            .find(|source| source.id == project.session.tracks.iter().find(|track| track.id == track_id).map(|track| track.source_file_id.as_str()).unwrap_or(""))
+            .cloned();
+        let track = project
+            .session
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        if track.clips.is_empty() {
+            if let Some(existing) = existing_source.as_ref().filter(|source| source.original_name != "Recording") {
+                track.clips.push(ClipRegion {
+                    id: Uuid::new_v4().to_string(),
+                    source_file_id: Some(existing.id.clone()),
+                    name: Some(strip_extension(&existing.original_name)),
+                    start_sample: track.start_sample,
+                    end_sample: track.start_sample + existing.duration_samples,
+                    source_offset_sample: 0,
+                    gain_db: 0.0,
+                });
+            }
+        }
+        track.clips.push(ClipRegion {
+            id: Uuid::new_v4().to_string(),
+            source_file_id: Some(source_id.clone()),
+            name: Some(clip_name),
+            start_sample,
+            end_sample: start_sample + duration,
+            source_offset_sample: 0,
+            gain_db: 0.0,
+        });
+        project.session.source_files.push(source);
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    pub fn delete_clip(&self, session_id: &str, track_id: &str, clip_id: &str) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let track_index = project
+            .session
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        let track = &mut project.session.tracks[track_index];
+        let before_clips = track.clips.clone();
+        let before = track.clips.len();
+        track.clips.retain(|clip| clip.id != clip_id);
+        if track.clips.len() == before {
+            return Err(format!("Unknown clip {clip_id}"));
+        }
+        let after_clips = track.clips.clone();
+        project.session.tracks[track_index].clips = before_clips.clone();
+        record_patch(
+            &mut project,
+            vec![JsonPatchOp {
+                op: "replace".into(),
+                path: format!("/tracks/{track_index}/clips"),
+                value: Some(serde_json::json!(after_clips)),
+            }],
+            vec![JsonPatchOp {
+                op: "replace".into(),
+                path: format!("/tracks/{track_index}/clips"),
+                value: Some(serde_json::json!(before_clips)),
+            }],
+            HistorySource::User,
+            Some("Deleted recording clip".into()),
+        )?;
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    pub fn delete_clip_range(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        start_sample: u64,
+        end_sample: u64,
+    ) -> Result<MixProject, String> {
+        if end_sample <= start_sample {
+            return Err("Selection end must be after selection start.".to_string());
+        }
+        let mut project = self.get_project(session_id)?;
+        let track_index = project
+            .session
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        if project.session.tracks[track_index].clips.is_empty() {
+            let source_id = project.session.tracks[track_index].source_file_id.clone();
+            let source = project
+                .session
+                .source_files
+                .iter()
+                .find(|source| source.id == source_id)
+                .ok_or_else(|| format!("Unknown source {source_id}"))?;
+            let track = &mut project.session.tracks[track_index];
+            track.clips.push(ClipRegion {
+                id: Uuid::new_v4().to_string(),
+                source_file_id: Some(source.id.clone()),
+                name: Some(track.name.clone()),
+                start_sample: track.start_sample,
+                end_sample: track.start_sample + source.duration_samples,
+                source_offset_sample: 0,
+                gain_db: 0.0,
+            });
+        }
+        let track = &mut project.session.tracks[track_index];
+        let before_clips = track.clips.clone();
+        let mut changed = false;
+        let mut next = Vec::with_capacity(track.clips.len());
+        for clip in track.clips.drain(..) {
+            let clip_start = clip.start_sample;
+            let clip_end = clip.end_sample;
+            if end_sample <= clip_start || start_sample >= clip_end {
+                next.push(clip);
+                continue;
+            }
+            changed = true;
+            if start_sample > clip_start {
+                let mut left = clip.clone();
+                left.end_sample = start_sample.min(clip_end);
+                next.push(left);
+            }
+            if end_sample < clip_end {
+                let mut right = clip;
+                right.id = Uuid::new_v4().to_string();
+                right.start_sample = end_sample;
+                right.source_offset_sample = right
+                    .source_offset_sample
+                    .saturating_add(end_sample.saturating_sub(clip_start));
+                next.push(right);
+            }
+        }
+        if !changed {
+            return Err("No recorded clip audio in selected range.".to_string());
+        }
+        next.sort_by_key(|clip| (clip.start_sample, clip.end_sample));
+        track.clips = next;
+        let after_clips = track.clips.clone();
+        project.session.tracks[track_index].clips = before_clips.clone();
+        record_patch(
+            &mut project,
+            vec![JsonPatchOp {
+                op: "replace".into(),
+                path: format!("/tracks/{track_index}/clips"),
+                value: Some(serde_json::json!(after_clips)),
+            }],
+            vec![JsonPatchOp {
+                op: "replace".into(),
+                path: format!("/tracks/{track_index}/clips"),
+                value: Some(serde_json::json!(before_clips)),
+            }],
+            HistorySource::User,
+            Some("Deleted selected track range".into()),
+        )?;
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    fn import_source(&self, source_path: &Path, session_rate: u32) -> Result<(SourceFile, ImportedAudio), String> {
         let source_id = Uuid::new_v4().to_string();
         let original_name = source_path
             .file_name()
@@ -117,13 +378,7 @@ impl SessionStore {
             analysis,
             peak_preview,
         };
-
-        let track_name = strip_extension(&original_name);
-        let track = make_track(source_id, track_name, project.session.tracks.len());
-        project.session.source_files.push(source);
-        project.session.tracks.push(track);
-        self.save(&project)?;
-        Ok(project)
+        Ok((source, imported))
     }
 
     pub fn rename_session(&self, session_id: &str, new_name: String) -> Result<MixProject, String> {
@@ -233,10 +488,14 @@ impl SessionStore {
 }
 
 fn analyze_imported(imported: &ImportedAudio) -> TrackAnalysis {
+    analyze_samples(&imported.samples, imported.channels, imported.sample_rate)
+}
+
+fn analyze_samples(samples: &[f32], channels: u16, sample_rate: u32) -> TrackAnalysis {
     let a = crate::engine::source::analysis::analyze(
-        &imported.samples,
-        imported.channels,
-        imported.sample_rate,
+        samples,
+        channels,
+        sample_rate,
     );
     TrackAnalysis {
         peak_db: a.peak_db,

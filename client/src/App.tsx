@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Download, Eye, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Music2, Pause, Pencil, Play, Power, RefreshCw, RotateCcw, RotateCw, Save, Scale, Settings, Square, Trash2, Upload } from "lucide-react";
-import type { AssistantResponse, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track } from "../../shared/types";
+import { ChevronDown, ChevronRight, Circle, Download, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Settings, Square, Trash2, Upload } from "lucide-react";
+import type { AbJudgeResponse, AssistantResponse, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
 
@@ -10,17 +10,23 @@ const DEFAULT_OLLAMA_MODEL = "gpt-oss:20b";
 export function App() {
   const initialOllamaUrlRef = useRef(localStorage.getItem("autoMixer.ollamaUrl"));
   const initialOllamaModelRef = useRef(localStorage.getItem("autoMixer.ollamaModel"));
+  const initialGeminiKeyRef = useRef(localStorage.getItem("autoMixer.geminiApiKey"));
   const playStartedAtRef = useRef(0);
   const pausedAtRef = useRef(0);
   const [project, setProject] = useState<MixProject>();
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
   const [selectedRegionIds, setSelectedRegionIds] = useState<string[]>([]);
+  const [selectedClip, setSelectedClip] = useState<{ trackId: string; clipId: string } | undefined>();
+  const [selectedRange, setSelectedRange] = useState<{ trackId: string; start: number; end: number } | undefined>();
   const [chatText, setChatText] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [startupError, setStartupError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [playing, setPlaying] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [recordingTrackId, setRecordingTrackId] = useState<string | undefined>();
+  const [armedTrackId, setArmedTrackId] = useState<string | undefined>();
   const [playhead, setPlayhead] = useState(0);
   const [bypass, setBypass] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -40,9 +46,13 @@ export function App() {
   const [autoMixRunning, setAutoMixRunning] = useState(false);
   const [ollamaUrl, setOllamaUrl] = useState(() => initialOllamaUrlRef.current ?? DEFAULT_OLLAMA_URL);
   const [ollamaModel, setOllamaModel] = useState(() => initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
+  const [geminiApiKey, setGeminiApiKey] = useState(() => initialGeminiKeyRef.current ?? "");
   const [modelOptions, setModelOptions] = useState<string[]>(() => [initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL]);
   const [modelStatus, setModelStatus] = useState("Not checked");
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [inputDevices, setInputDevices] = useState<string[]>([]);
+  const [trackInputDevices, setTrackInputDevices] = useState<Record<string, string>>({});
+  const [liveRecordingPeaks, setLiveRecordingPeaks] = useState<number[]>([]);
 
   const session = project?.session;
   const chatLogRef = useRef<HTMLDivElement>(null);
@@ -60,6 +70,7 @@ export function App() {
     lastLoadedSessionRef.current = session.id;
     const stored = (project?.chatMessages ?? []) as ChatMessage[];
     setMessages(stored);
+    setArmedTrackId(undefined);
   }, [session?.id, project?.chatMessages]);
 
   useEffect(() => {
@@ -77,6 +88,7 @@ export function App() {
 
   useEffect(() => {
     void api.listMixerProfiles().then(setProfilePresets).catch(() => undefined);
+    void api.inputDevices().then((result) => setInputDevices(result.devices)).catch(() => undefined);
   }, []);
 
   async function applyProfilePreset(preset: ProfilePreset) {
@@ -180,12 +192,85 @@ export function App() {
     setModelOptions((items) => items.includes(ollamaModel) ? items : [...items, ollamaModel]);
   }, [ollamaModel]);
 
+  useEffect(() => {
+    localStorage.setItem("autoMixer.geminiApiKey", geminiApiKey);
+  }, [geminiApiKey]);
+
+  useEffect(() => {
+    if (!session) return;
+    const raw = localStorage.getItem(`autoMixer.trackInputDevices.${session.id}`);
+    if (!raw) {
+      setTrackInputDevices({});
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      setTrackInputDevices(parsed.devices ?? parsed);
+    } catch {
+      setTrackInputDevices({});
+    }
+  }, [session?.id]);
+
+  useEffect(() => {
+    if (!session) return;
+    localStorage.setItem(
+      `autoMixer.trackInputDevices.${session.id}`,
+      JSON.stringify({ devices: trackInputDevices })
+    );
+  }, [trackInputDevices, session?.id]);
+
+  useEffect(() => {
+    if (!recording) {
+      setLiveRecordingPeaks([]);
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const result = await api.recordingMeters();
+        if (!cancelled && result.peaks.length > 0) {
+          setLiveRecordingPeaks((items) => [...items, ...result.peaks].slice(-512));
+        }
+      } catch {
+        // Metering is cosmetic; recording errors surface through stop/start.
+      }
+      if (!cancelled) window.setTimeout(tick, 80);
+    };
+    void tick();
+    return () => { cancelled = true; };
+  }, [recording]);
+
+  useEffect(() => {
+    if (!session || !armedTrackId) return;
+    if (!session.tracks.some((track) => track.id === armedTrackId)) {
+      setArmedTrackId(undefined);
+    }
+  }, [session, armedTrackId]);
+
+  useEffect(() => {
+    if (!session || !selectedClip) return;
+    const track = session.tracks.find((item) => item.id === selectedClip.trackId);
+    if (!track || !track.clips.some((clip) => clip.id === selectedClip.clipId)) {
+      setSelectedClip(undefined);
+    }
+  }, [session, selectedClip]);
+
+  useEffect(() => {
+    if (!session || !selectedRange) return;
+    if (!session.tracks.some((track) => track.id === selectedRange.trackId)) {
+      setSelectedRange(undefined);
+    }
+  }, [session, selectedRange]);
+
   const duration = useMemo(() => {
     if (!session) return 0;
     const sources = new Map(session.sourceFiles.map((source) => [source.id, source]));
     return Math.max(0, ...session.tracks.map((track) => {
+      if (track.clips.length > 0) {
+        return Math.max(0, ...track.clips.map((clip) => clip.endSample / session.sampleRate));
+      }
       const source = sources.get(track.sourceFileId);
-      return ((track.startSample + (source?.durationSamples ?? 0)) / session.sampleRate);
+      return (track.startSample + (source?.durationSamples ?? 0)) / session.sampleRate;
     }));
   }, [session]);
 
@@ -230,6 +315,46 @@ export function App() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [playing, session?.id]);
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) return;
+      if (!session || busy) return;
+      if (selectedRange) {
+        event.preventDefault();
+        void deleteClipRange(selectedRange);
+        return;
+      }
+      if (selectedClip) {
+        event.preventDefault();
+        void deleteClip(selectedClip.trackId, selectedClip.clipId);
+        return;
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [session, selectedClip, selectedRange, busy, recording, recordingTrackId]);
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) return;
+      const mod = event.metaKey || event.ctrlKey;
+      if (!mod || busy || recording) return;
+      const key = event.key.toLowerCase();
+      if (key === "z" && !event.shiftKey) {
+        event.preventDefault();
+        void doUndo();
+      } else if ((key === "z" && event.shiftKey) || key === "y") {
+        event.preventDefault();
+        void doRedo();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [session, busy, recording]);
 
   async function flushChat() {
     if (!session) return;
@@ -414,6 +539,21 @@ export function App() {
     }
   }
 
+  async function addRecordingTrack() {
+    if (!session) return;
+    try {
+      const updated = await api.createRecordingTrack(session.id);
+      setProject(updated);
+      const added = updated.session.tracks[updated.session.tracks.length - 1];
+      if (added) {
+        setSelectedTrackIds([added.id]);
+        setArmedTrackId(added.id);
+      }
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
   async function updateTrack(track: Track, patch: Partial<Track>) {
     if (!session) return;
     const actions = [];
@@ -429,6 +569,10 @@ export function App() {
 
   async function deleteTrack(track: Track) {
     if (!session) return;
+    if (recording && recordingTrackId === track.id) {
+      pushSystem("Stop recording before deleting the recording track.");
+      return;
+    }
     const confirmed = window.confirm(`Delete track "${track.name}"?`);
     if (!confirmed) return;
     setBusy(true);
@@ -436,6 +580,55 @@ export function App() {
       const updated = await api.applyActions(session.id, [{ tool: "delete_track", trackId: track.id }], `Deleted ${track.name}`);
       setProject(updated);
       setSelectedTrackIds((ids) => ids.filter((id) => id !== track.id));
+      setArmedTrackId((id) => id === track.id ? undefined : id);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteClip(trackId: string, clipId: string) {
+    if (!session) return;
+    const track = session.tracks.find((item) => item.id === trackId);
+    const clip = track?.clips.find((item) => item.id === clipId);
+    if (!track || !clip) return;
+    if (recording && recordingTrackId === trackId) {
+      pushSystem("Stop recording before deleting clips on the recording track.");
+      return;
+    }
+    const confirmed = window.confirm(`Delete recording "${clip.name ?? track.name}"?`);
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      const updated = await api.deleteClip(session.id, trackId, clipId);
+      setProject(updated);
+      setSelectedClip(undefined);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteClipRange(range: { trackId: string; start: number; end: number }) {
+    if (!session) return;
+    const track = session.tracks.find((item) => item.id === range.trackId);
+    if (!track) return;
+    const start = Math.max(0, Math.min(range.start, range.end));
+    const end = Math.max(0, Math.max(range.start, range.end));
+    if (end - start < 0.01) return;
+    if (recording && recordingTrackId === range.trackId) {
+      pushSystem("Stop recording before deleting audio on the recording track.");
+      return;
+    }
+    const startSample = Math.round(start * session.sampleRate);
+    const endSample = Math.round(end * session.sampleRate);
+    setBusy(true);
+    try {
+      const updated = await api.deleteClipRange(session.id, range.trackId, startSample, endSample);
+      setProject(updated);
+      setSelectedClip(undefined);
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -512,14 +705,28 @@ export function App() {
 
   async function doUndo() {
     if (!session) return;
-    const updated = await api.undo(session.id);
-    setProject(updated);
+    setBusy(true);
+    try {
+      const updated = await api.undo(session.id);
+      setProject(updated);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function doRedo() {
     if (!session) return;
-    const updated = await api.redo(session.id);
-    setProject(updated);
+    setBusy(true);
+    try {
+      const updated = await api.redo(session.id);
+      setProject(updated);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function toggleTurn(messageIndex: number) {
@@ -557,6 +764,54 @@ export function App() {
     }
   }
 
+  async function toggleRecording() {
+    if (!session) return;
+    if (recording) {
+      try {
+        const trackId = recordingTrackId;
+        const updated = await api.stopRecording(session.id);
+        setProject(updated);
+        if (trackId) {
+          const track = updated.session.tracks.find((item) => item.id === trackId);
+          const clip = track?.clips[track.clips.length - 1];
+          if (clip) {
+            setSelectedTrackIds([trackId]);
+            setSelectedClip({ trackId, clipId: clip.id });
+          }
+        }
+        setRecording(false);
+        setRecordingTrackId(undefined);
+      } catch (error) {
+        pushSystem(error);
+      }
+      return;
+    }
+    try {
+      if (!armedTrackId) {
+        pushSystem("Arm one track with R before recording.");
+        return;
+      }
+      if (!session.tracks.some((track) => track.id === armedTrackId)) {
+        pushSystem("The armed track is no longer available. Arm a track again.");
+        setArmedTrackId(undefined);
+        return;
+      }
+      const targetTrackId = armedTrackId;
+      const startSeconds = selectedRange?.trackId === targetTrackId ? Math.min(selectedRange.start, selectedRange.end) : playhead;
+      const startSample = Math.round(Math.max(0, startSeconds) * session.sampleRate);
+      const inputDevice = trackInputDevices[targetTrackId];
+      setLiveRecordingPeaks([]);
+      if (selectedRange?.trackId === targetTrackId) {
+        await seekTo(Math.max(0, startSeconds));
+      }
+      await api.startRecording(session.id, startSample, targetTrackId, inputDevice);
+      setRecording(true);
+      setRecordingTrackId(targetTrackId);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
   async function toggleBypass() {
     const next = !bypass;
     setBypass(next);
@@ -580,6 +835,16 @@ export function App() {
   }
 
   async function stop() {
+    if (recording && session) {
+      try {
+        const updated = await api.stopRecording(session.id);
+        setProject(updated);
+        setRecording(false);
+        setRecordingTrackId(undefined);
+      } catch (error) {
+        pushSystem(error);
+      }
+    }
     await api.stop();
     pausedAtRef.current = 0;
     setPlayhead(0);
@@ -620,6 +885,36 @@ export function App() {
         `Choose a target loudness (median of chorus sections is a reasonable default), then for each section that differs by more than 1.5 dB from the target, create a region with create_region using its start/end (seconds) and use apply_section_automation on the master gainDb (or per-track if needed) to nudge it toward the target. Cap any individual move at +/-3 dB.`
     );
   }
+
+  async function judgeCurrentMixAb() {
+    if (!session) return;
+    setBusy(true);
+    try {
+      const result = geminiApiKey.trim()
+        ? await api.judgeMixAb(session.id, geminiApiKey.trim())
+        : await api.judgeMixAbLocal(session.id);
+      setMessages((items) => [...items, { role: "ab-judge", result }]);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners: (() => void)[] = [];
+    const reg = (p: Promise<() => void>) => {
+      void p.then((fn) => { if (cancelled) fn(); else unlisteners.push(fn); });
+    };
+    reg(api.onMenuDetectStructure(() => {
+      void analyzeStructure();
+    }));
+    reg(api.onMenuLevelSections(() => {
+      void balanceSongLevels();
+    }));
+    return () => { cancelled = true; unlisteners.forEach((fn) => fn()); };
+  }, [session, busy]);
 
   async function analyzeStructure() {
     if (!session) return;
@@ -806,6 +1101,18 @@ export function App() {
           </div>
           <div className="transport">
             <button onClick={() => void togglePlay()} title={playing ? "Pause" : "Play"}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
+            <button
+              className={`record-toggle ${recording ? "active" : ""}`}
+              onClick={() => void toggleRecording()}
+              disabled={busy}
+              title={recording ? "Stop recording" : "Record into the R-armed track"}
+              aria-pressed={recording}
+            >
+              <Circle size={18} />
+            </button>
+            <button onClick={() => void addRecordingTrack()} disabled={busy} title="Add recording track">
+              <Plus size={18} />
+            </button>
             <button onClick={() => void stop()} title="Stop"><Square size={18} /></button>
             <button
               className={`bypass-toggle ${bypass ? "bypass-active" : ""}`}
@@ -827,18 +1134,12 @@ export function App() {
               All AI
             </button>
             <button
-              onClick={() => void analyzeStructure()}
+              onClick={() => void judgeCurrentMixAb()}
               disabled={busy || session.tracks.length === 0}
-              title="Detect song structure (sections + BPM) so the agent can reason per-section"
+              title="Use Gemini Flash to judge ORIG versus MIX on a short representative clip"
             >
-              <Music2 size={18} />
-            </button>
-            <button
-              onClick={() => void balanceSongLevels()}
-              disabled={busy || !(session.sections && session.sections.length > 1)}
-              title="Ask the agent to level the song section-by-section toward a unified loudness"
-            >
-              <Scale size={18} />
+              <GitCompareArrows size={18} />
+              <span>A/B</span>
             </button>
             <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={18} /></button>
             <button className="upload" onClick={() => void importFiles()} title="Import audio">
@@ -861,68 +1162,102 @@ export function App() {
         ) : null}
 
         <div className="timeline">
-          {session.sections && session.sections.length > 0 && duration > 0 ? (
-            <SectionRibbon
-              sections={session.sections}
-              duration={duration}
-              playhead={playhead}
-              scopedIndex={scopedSection?.index ?? null}
-              loopRange={loopSection}
-              onSeek={seekTo}
-              onScope={(index) => {
-                const s = session.sections?.[index];
-                if (!s) return;
-                setScopedSection((current) =>
-                  current?.index === index
-                    ? null
-                    : { index, start: s.start, end: s.end, label: s.label }
-                );
-              }}
-              onLoop={(index) => {
-                const s = session.sections?.[index];
-                if (!s) return;
-                setLoopSection((current) =>
-                  current && Math.abs(current.start - s.start) < 0.01 && Math.abs(current.end - s.end) < 0.01
-                    ? null
-                    : { start: s.start, end: s.end }
-                );
-              }}
+          <div className="daw-workspace">
+            <TrackInspector
+              track={selectedTrackIds.length === 1 ? session.tracks.find((track) => track.id === selectedTrackIds[0]) : undefined}
+              source={selectedTrackIds.length === 1 ? session.sourceFiles.find((source) => source.id === session.tracks.find((track) => track.id === selectedTrackIds[0])?.sourceFileId) : undefined}
+              sampleRate={session.sampleRate}
+              inputDevices={inputDevices}
+              inputDevice={selectedTrackIds.length === 1 ? trackInputDevices[selectedTrackIds[0]] ?? "" : ""}
+              selectionCount={selectedTrackIds.length}
+              onChange={(track, patch) => void updateTrack(track, patch)}
+              onInputDeviceChange={(trackId, device) => setTrackInputDevices((current) => ({ ...current, [trackId]: device }))}
+              onRefreshInputDevices={() => void api.inputDevices().then((result) => setInputDevices(result.devices)).catch(pushSystem)}
+              onDelete={(track) => void deleteTrack(track)}
             />
-          ) : null}
-          {session.tracks.length === 0 ? (
-            <div className="empty">
-              <Upload size={28} />
-              <span>Import stems to start mixing.</span>
-            </div>
-          ) : (
-            session.tracks.map((track) => {
-              const source = session.sourceFiles.find((item) => item.id === track.sourceFileId);
-              const startSeconds = track.startSample / session.sampleRate;
-              const sourceSeconds = (source?.durationSamples ?? 0) / session.sampleRate;
-              return (
-                <TrackRow
-                  key={track.id}
-                  track={track}
-                  selected={selectedTrackIds.includes(track.id)}
-                  playhead={playhead}
+            <div className="track-lanes">
+              {session.sections && session.sections.length > 0 && duration > 0 ? (
+                <SectionRibbon
+                  sections={session.sections}
                   duration={duration}
-                  startSeconds={startSeconds}
-                  sourceSeconds={sourceSeconds}
-                  peaks={source?.peakPreview}
-                  onToggleSelected={() =>
-                    setSelectedTrackIds((current) =>
-                      current.includes(track.id)
-                        ? current.filter((id) => id !== track.id)
-                        : [...current, track.id]
-                    )
-                  }
-                  onSeek={(seconds) => seekTo(seconds)}
-                  onChange={(patch) => void updateTrack(track, patch)}
-                  onDelete={() => void deleteTrack(track)}
+                  playhead={playhead}
+                  scopedIndex={scopedSection?.index ?? null}
+                  loopRange={loopSection}
+                  onSeek={seekTo}
+                  onScope={(index) => {
+                    const s = session.sections?.[index];
+                    if (!s) return;
+                    setScopedSection((current) =>
+                      current?.index === index
+                        ? null
+                        : { index, start: s.start, end: s.end, label: s.label }
+                    );
+                  }}
+                  onLoop={(index) => {
+                    const s = session.sections?.[index];
+                    if (!s) return;
+                    setLoopSection((current) =>
+                      current && Math.abs(current.start - s.start) < 0.01 && Math.abs(current.end - s.end) < 0.01
+                        ? null
+                        : { start: s.start, end: s.end }
+                    );
+                  }}
                 />
-              );
-            })
-          )}
+              ) : null}
+              {session.tracks.length === 0 ? (
+                <div className="empty">
+                  <Upload size={28} />
+                  <span>Import stems to start mixing.</span>
+                </div>
+              ) : (
+                session.tracks.map((track) => {
+                  const sourceById = new Map(session.sourceFiles.map((item) => [item.id, item]));
+                  const source = sourceById.get(track.sourceFileId);
+                  const clips = track.clips.length > 0
+                    ? track.clips.map((clip) => ({
+                        id: clip.id,
+                        name: clip.name ?? "Recording",
+                        startSeconds: clip.startSample / session.sampleRate,
+                        sourceSeconds: Math.max(0, (clip.endSample - clip.startSample) / session.sampleRate),
+                        peaks: sourceById.get(clip.sourceFileId ?? track.sourceFileId)?.peakPreview,
+                      }))
+                    : [{
+                        id: `legacy-${track.id}`,
+                        name: track.name,
+                        startSeconds: track.startSample / session.sampleRate,
+                        sourceSeconds: (source?.durationSamples ?? 0) / session.sampleRate,
+                        peaks: source?.peakPreview,
+                      }];
+                  return (
+                    <TrackRow
+                      key={track.id}
+                      track={track}
+                      selected={selectedTrackIds.includes(track.id)}
+                      armed={armedTrackId === track.id}
+                      playhead={playhead}
+                      duration={duration}
+                      clips={clips}
+                      selectedClipId={selectedClip?.trackId === track.id ? selectedClip.clipId : undefined}
+                      selectedRange={selectedRange?.trackId === track.id ? selectedRange : undefined}
+                      recording={recordingTrackId === track.id}
+                      livePeaks={recordingTrackId === track.id ? liveRecordingPeaks : undefined}
+                      onSelect={() => { setSelectedTrackIds([track.id]); setSelectedClip(undefined); setSelectedRange(undefined); }}
+                      onClipSelect={(clipId) => { setSelectedTrackIds([track.id]); setSelectedRange(undefined); setSelectedClip({ trackId: track.id, clipId }); }}
+                      onRangeSelect={(start, end) => {
+                        setSelectedTrackIds([track.id]);
+                        setSelectedClip(undefined);
+                        setSelectedRange({ trackId: track.id, start: Math.min(start, end), end: Math.max(start, end) });
+                      }}
+                      onRangeClear={() => setSelectedRange(undefined)}
+                      onArm={() => setArmedTrackId((current) => current === track.id ? undefined : track.id)}
+                      onSeek={(seconds) => seekTo(seconds)}
+                      onChange={(patch) => void updateTrack(track, patch)}
+                    />
+                  );
+                })
+              )}
+            </div>
+          </div>
         </div>
 
         <MasterBar
@@ -944,13 +1279,6 @@ export function App() {
               <button className={mode === "auto" ? "active" : ""} onClick={() => setMode("auto")}>Auto-mix</button>
             </div>
           </div>
-          <button
-            onClick={() => setReasoningOpen((open) => !open)}
-            title="Verbose mode — see live model reasoning + token counts"
-            className={reasoningOpen ? "active" : ""}
-          >
-            <Eye size={18} />
-          </button>
           <button onClick={() => setSettingsOpen((open) => !open)} title="LLM settings">
             <Settings size={18} />
           </button>
@@ -966,6 +1294,15 @@ export function App() {
               <select value={ollamaModel} onChange={(event) => setOllamaModel(event.target.value)}>
                 {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
               </select>
+            </label>
+            <label>
+              Gemini API key
+              <input
+                value={geminiApiKey}
+                onChange={(event) => setGeminiApiKey(event.target.value)}
+                type="password"
+                placeholder="Used for A/B audio judge"
+              />
             </label>
             <div className="llm-actions">
               <button onClick={() => void loadOllamaModels()} disabled={modelsLoading} title="Refresh models">
@@ -993,29 +1330,23 @@ export function App() {
             })()}
           </div>
         ) : null}
-        {mode === "auto" ? (
-          <AutoMixView
-            stages={autoMixStages}
-            running={autoMixRunning}
-            disabled={busy || !session.tracks.length}
-            onStart={(stageIds) => {
-              setAutoMixStages([]);
-              void api.startAutoMix(session.id, stageIds, ollamaUrl, ollamaModel);
-            }}
-          />
-        ) : null}
-        {reasoningOpen ? (
-          <div className="reasoning-panel">
-            <div className="reasoning-head">
-              <strong>Agent reasoning</strong>
-              <span>
-                {turnTokenTotal.prompt > 0
-                  ? `${turnTokenTotal.prompt.toLocaleString()} prompt · ${turnTokenTotal.response.toLocaleString()} response tokens · ${(turnTokenTotal.elapsedMs / 1000).toFixed(1)}s`
-                  : busy
-                    ? "waiting for first chunk…"
-                    : "no recent turn"}
-              </span>
-            </div>
+        <div className={`reasoning-panel ${reasoningOpen ? "open" : ""}`}>
+          <button
+            type="button"
+            className="reasoning-head"
+            onClick={() => setReasoningOpen((open) => !open)}
+            title="Show or hide live model output and token counts"
+          >
+            <strong>Agent reasoning</strong>
+            <span>
+              {turnTokenTotal.prompt > 0
+                ? `${turnTokenTotal.prompt.toLocaleString()} prompt · ${turnTokenTotal.response.toLocaleString()} response tokens · ${(turnTokenTotal.elapsedMs / 1000).toFixed(1)}s`
+                : busy
+                  ? "waiting for first chunk…"
+                  : "click to inspect"}
+            </span>
+          </button>
+          {reasoningOpen ? (
             <div className="reasoning-body">
               {reasoning.length === 0 ? (
                 <div className="reasoning-empty">
@@ -1039,87 +1370,109 @@ export function App() {
                 ))
               )}
             </div>
-          </div>
-        ) : null}
-        <div className="chat-log" ref={chatLogRef}>
-          {messages.length === 0 ? (
-            <div className="hint">Select a track and ask for a mix change.</div>
-          ) : (
-            messages.map((message, index) => {
-              if (message.role === "critique") {
-                const isLatestCritique = findLatestCritique(messages) === message.critique;
-                return (
-                  <CritiqueCard
-                    key={index}
-                    critique={message.critique}
-                    skills={message.skills}
-                    session={session}
-                    onApply={isLatestCritique && !busy ? () => {
-                      const steps = message.critique.recommendedNextSteps;
-                      const text = steps.length > 0
-                        ? `Apply your recommended next steps: ${steps.map((s, i) => `(${i + 1}) ${s}`).join(" ")}`
-                        : "Apply the fixes from your critique above.";
-                      void sendChat(text);
-                    } : undefined}
-                  />
-                );
-              }
-              if (message.role === "assistant-turn") {
-                const canToggle = message.forwardPatch.length > 0;
-                return (
-                  <AssistantTurn
-                    key={index}
-                    message={message}
-                    session={session}
-                    toggleState={canToggle ? (message.applied ? "on" : "off") : "locked"}
-                    toggleDisabled={busy}
-                    onToggle={() => void toggleTurn(index)}
-                  />
-                );
-              }
-              return <div key={index} className={`message ${message.role}`}>{message.text}</div>;
-            })
-          )}
-          {streamingTurn ? (
-            <div className="message streaming">
-              <div className="streaming-head">
-                <div className="streaming-dot" />
-                <span>agent is {streamingTurn.phase === "critique" ? "writing the critique" : "drafting actions"}…</span>
-              </div>
-              <pre className="streaming-text">{streamingTurn.text || "…"}</pre>
-            </div>
           ) : null}
         </div>
-        <div className="selected">
-          {selectedTrackIds.length === 0 ? (
-            <>Scope: <strong>all tracks</strong> (toggle <code>SEL</code> on a track to narrow)</>
-          ) : (
-            <>Scope: {selectedTrackIds.map((id) => session.tracks.find((track) => track.id === id)?.name).filter(Boolean).join(", ")}</>
-          )}
-        </div>
-        {mode === "interactive" && scopedSection ? (
-          <div className="chat-scope">
-            <span>scope: <strong>{scopedSection.label}</strong> {formatTime(scopedSection.start)}–{formatTime(scopedSection.end)}</span>
-            <button type="button" onClick={() => setScopedSection(null)}>×</button>
-          </div>
-        ) : null}
-        {mode === "interactive" ? (
-          <form
-            className="chat-input"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void sendChat();
+        {mode === "auto" ? (
+          <AutoMixView
+            stages={autoMixStages}
+            running={autoMixRunning}
+            disabled={busy || !session.tracks.length}
+            onStart={(stageIds) => {
+              setAutoMixStages([]);
+              void api.startAutoMix(session.id, stageIds, ollamaUrl, ollamaModel);
             }}
-          >
-            <textarea
-              value={chatText}
-              onChange={(event) => setChatText(event.target.value)}
-              placeholder="Make the vocal more upfront..."
-              disabled={busy}
-            />
-            <button disabled={busy || !chatText.trim()}>{busy ? "Working" : "Send"}</button>
-          </form>
-        ) : null}
+          />
+        ) : (
+          <>
+            <div className="chat-log" ref={chatLogRef}>
+              {messages.length === 0 ? (
+                <div className="hint">Select a track and ask for a mix change.</div>
+              ) : (
+                messages.map((message, index) => {
+                  if (message.role === "critique") {
+                    const isLatestCritique = findLatestCritique(messages) === message.critique;
+                    return (
+                      <CritiqueCard
+                        key={index}
+                        critique={message.critique}
+                        skills={message.skills}
+                        session={session}
+                        onApply={isLatestCritique && !busy ? () => {
+                          const steps = message.critique.recommendedNextSteps;
+                          const text = steps.length > 0
+                            ? `Apply your recommended next steps: ${steps.map((s, i) => `(${i + 1}) ${s}`).join(" ")}`
+                            : "Apply the fixes from your critique above.";
+                          void sendChat(text);
+                        } : undefined}
+                      />
+                    );
+                  }
+                  if (message.role === "ab-judge") {
+                    const isLatestAbJudge = findLatestAbJudge(messages) === message.result;
+                    return (
+                      <AbJudgeCard
+                        key={index}
+                        result={message.result}
+                        onApply={isLatestAbJudge && !busy ? () => void sendChat(buildAbJudgeFixPrompt(message.result)) : undefined}
+                      />
+                    );
+                  }
+                  if (message.role === "assistant-turn") {
+                    const canToggle = message.forwardPatch.length > 0;
+                    return (
+                      <AssistantTurn
+                        key={index}
+                        message={message}
+                        session={session}
+                        toggleState={canToggle ? (message.applied ? "on" : "off") : "locked"}
+                        toggleDisabled={busy}
+                        onToggle={() => void toggleTurn(index)}
+                      />
+                    );
+                  }
+                  return <div key={index} className={`message ${message.role}`}>{message.text}</div>;
+                })
+              )}
+              {streamingTurn ? (
+                <div className="message streaming">
+                  <div className="streaming-head">
+                    <div className="streaming-dot" />
+                    <span>agent is {streamingTurn.phase === "critique" ? "writing the critique" : "drafting actions"}…</span>
+                  </div>
+                  <pre className="streaming-text">{streamingTurn.text || "…"}</pre>
+                </div>
+              ) : null}
+            </div>
+            <div className="chat-selected">
+              {selectedTrackIds.length === 0 ? (
+                <>Scope: <strong>all tracks</strong> (click a track to narrow and arm recording)</>
+              ) : (
+                <>Scope: {selectedTrackIds.map((id) => session.tracks.find((track) => track.id === id)?.name).filter(Boolean).join(", ")}</>
+              )}
+            </div>
+            {scopedSection ? (
+              <div className="chat-scope">
+                <span>scope: <strong>{scopedSection.label}</strong> {formatTime(scopedSection.start)}–{formatTime(scopedSection.end)}</span>
+                <button type="button" onClick={() => setScopedSection(null)}>×</button>
+              </div>
+            ) : null}
+            <form
+              className="chat-input"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void sendChat();
+              }}
+            >
+              <textarea
+                value={chatText}
+                onChange={(event) => setChatText(event.target.value)}
+                placeholder="Make the vocal more upfront..."
+                disabled={busy}
+              />
+              <button disabled={busy || !chatText.trim()}>{busy ? "Working" : "Send"}</button>
+            </form>
+          </>
+        )}
       </aside>
     </main>
   );
@@ -1202,70 +1555,238 @@ function sectionClass(label: string): string {
   return "section-other";
 }
 
+function TrackInspector({
+  track,
+  source,
+  sampleRate,
+  inputDevices,
+  inputDevice,
+  selectionCount,
+  onChange,
+  onInputDeviceChange,
+  onRefreshInputDevices,
+  onDelete
+}: {
+  track?: Track;
+  source?: MixSession["sourceFiles"][number];
+  sampleRate: number;
+  inputDevices: string[];
+  inputDevice: string;
+  selectionCount: number;
+  onChange: (track: Track, patch: Partial<Track>) => void;
+  onInputDeviceChange: (trackId: string, device: string) => void;
+  onRefreshInputDevices: () => void;
+  onDelete: (track: Track) => void;
+}) {
+  if (!track) {
+    return (
+      <aside className="track-inspector">
+        <div className="inspector-tabs">
+          <button className="active">Inspector</button>
+          <button>Visibility</button>
+        </div>
+        <div className="inspector-empty">
+          <strong>{selectionCount > 1 ? "Multiple Tracks Selected" : "No Track Selected"}</strong>
+          <span>{selectionCount > 1 ? "Select one track to edit recording input and mix details." : "Click a track lane to show its details."}</span>
+        </div>
+      </aside>
+    );
+  }
+
+  const durationSeconds = (source?.durationSamples ?? 0) / sampleRate;
+  const startSeconds = track.startSample / sampleRate;
+  return (
+    <aside className="track-inspector">
+      <div className="inspector-tabs">
+        <button className="active">Inspector</button>
+        <button>Visibility</button>
+      </div>
+      <div className="inspector-track-title" style={{ borderLeftColor: track.color }}>
+        <strong>{track.name}</strong>
+        <span>{track.role ?? "track"}</span>
+      </div>
+      <div className="inspector-section">
+        <div className="inspector-section-title">Record input</div>
+        <label className="inspector-field">
+          <span><Mic size={12} /> Input</span>
+          <select value={inputDevice} onChange={(event) => onInputDeviceChange(track.id, event.target.value)} onFocus={onRefreshInputDevices}>
+            <option value="">Default input</option>
+            {inputDevices.map((device) => <option key={device} value={device}>{device}</option>)}
+          </select>
+        </label>
+      </div>
+      <div className="inspector-section">
+        <div className="inspector-section-title">Channel</div>
+        <label className="inspector-field">
+          <span>Vol</span>
+          <input type="range" min="-24" max="12" step="0.5" value={track.gainDb} onChange={(event) => onChange(track, { gainDb: Number(event.target.value) })} />
+          <em>{formatDb(track.gainDb)}</em>
+        </label>
+        <label className="inspector-field">
+          <span>Pan</span>
+          <input type="range" min="-1" max="1" step="0.05" value={track.pan} onChange={(event) => onChange(track, { pan: Number(event.target.value) })} />
+          <em>{track.pan.toFixed(2)}</em>
+        </label>
+        <label className="inspector-check">
+          <input type="checkbox" checked={!!track.aiGenerated} onChange={(event) => onChange(track, { aiGenerated: event.target.checked })} />
+          <span>AI generated stem</span>
+        </label>
+        <div className="inspector-actions">
+          <button type="button" className="danger" onClick={() => onDelete(track)}>
+            <Trash2 size={14} />
+            <span>Delete track</span>
+          </button>
+        </div>
+      </div>
+      <div className="inspector-section">
+        <div className="inspector-section-title">Audio</div>
+        <dl className="inspector-stats">
+          <div><dt>File</dt><dd>{source?.originalName ?? "No source"}</dd></div>
+          <div><dt>Start</dt><dd>{formatTime(startSeconds)}</dd></div>
+          <div><dt>Length</dt><dd>{formatTime(durationSeconds)}</dd></div>
+          <div><dt>Peak</dt><dd>{source ? formatDb(source.analysis.peakDb) : "—"}</dd></div>
+          <div><dt>LUFS</dt><dd>{source ? source.analysis.lufsEstimate.toFixed(1) : "—"}</dd></div>
+        </dl>
+      </div>
+    </aside>
+  );
+}
+
 function TrackRow({
   track,
   selected,
-  peaks,
+  armed,
+  clips,
+  selectedClipId,
+  selectedRange,
+  recording,
+  livePeaks,
   playhead,
   duration,
-  startSeconds,
-  sourceSeconds,
-  onToggleSelected,
+  onSelect,
+  onClipSelect,
+  onRangeSelect,
+  onRangeClear,
+  onArm,
   onSeek,
   onChange,
-  onDelete
 }: {
   track: Track;
   selected: boolean;
-  peaks?: number[];
+  armed: boolean;
+  clips: { id: string; name: string; startSeconds: number; sourceSeconds: number; peaks?: number[] }[];
+  selectedClipId?: string;
+  selectedRange?: { start: number; end: number };
+  recording: boolean;
+  livePeaks?: number[];
   playhead: number;
   duration: number;
-  startSeconds: number;
-  sourceSeconds: number;
-  onToggleSelected: () => void;
+  onSelect: () => void;
+  onClipSelect: (clipId: string) => void;
+  onRangeSelect: (start: number, end: number) => void;
+  onRangeClear: () => void;
+  onArm: () => void;
   onSeek: (seconds: number) => void;
   onChange: (patch: Partial<Track>) => void;
-  onDelete: () => void;
 }) {
-  const laneClick = (event: React.MouseEvent<HTMLDivElement>) => {
+  const dragRef = useRef<{ start: number; moved: boolean } | null>(null);
+  const secondsFromPointer = (event: React.PointerEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-    onSeek(fraction * duration);
+    return fraction * duration;
   };
-  const clipLeftPct = duration > 0 ? (startSeconds / duration) * 100 : 0;
-  const clipWidthPct = duration > 0 ? (sourceSeconds / duration) * 100 : 100;
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    onSelect();
+    const seconds = secondsFromPointer(event);
+    dragRef.current = { start: seconds, moved: false };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const seconds = secondsFromPointer(event);
+    if (Math.abs(seconds - drag.start) > 0.03) {
+      drag.moved = true;
+      onRangeSelect(drag.start, seconds);
+    }
+  };
+  const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    dragRef.current = null;
+    event.stopPropagation();
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    const seconds = secondsFromPointer(event);
+    if (drag.moved) {
+      onRangeSelect(drag.start, seconds);
+      return;
+    }
+    const clipNode = (event.target as HTMLElement | null)?.closest<HTMLElement>(".wave-clip");
+    const clipId = clipNode?.dataset.clipId;
+    if (clipId) {
+      onClipSelect(clipId);
+    } else {
+      onRangeClear();
+    }
+    onSeek(seconds);
+  };
   const cursorPct = duration > 0 ? Math.max(0, Math.min(100, (playhead / duration) * 100)) : 0;
+  const rangeStartPct = selectedRange && duration > 0 ? Math.max(0, Math.min(100, (selectedRange.start / duration) * 100)) : 0;
+  const rangeEndPct = selectedRange && duration > 0 ? Math.max(0, Math.min(100, (selectedRange.end / duration) * 100)) : 0;
   return (
-    <div className={`track ${selected ? "selected" : ""}`}>
+    <div
+      className={`track ${selected ? "selected" : ""} ${armed ? "armed" : ""}`}
+      onClick={(event) => {
+        if ((event.target as HTMLElement | null)?.closest(".wave-wrap")) return;
+        onSelect();
+      }}
+    >
       <div className="track-head" style={{ borderLeftColor: track.color }}>
-        <strong>{track.name}</strong>
-        <span>{track.role ?? "track"}</span>
+        <div className="track-compact-name" title={track.name}>{track.name}</div>
         <div className="toggles">
           <button
-            className={`sel-toggle ${selected ? "active" : ""}`}
-            title={selected ? "Selected — the agent will scope to this track when you chat." : "Not selected. Click to include this track in scope (no selection = the agent considers all tracks)."}
-            onClick={(event) => { event.stopPropagation(); onToggleSelected(); }}
-            aria-pressed={selected}
-          >SEL</button>
+            className={`record-arm ${armed ? "active" : ""}`}
+            title={armed ? "Record enabled. Click to disarm." : "Record enable this track"}
+            onClick={(event) => { event.stopPropagation(); onArm(); }}
+            aria-pressed={armed}
+          >R</button>
           <button className={track.muted ? "active" : ""} onClick={(event) => { event.stopPropagation(); onChange({ muted: !track.muted }); }}>M</button>
           <button className={track.solo ? "active" : ""} onClick={(event) => { event.stopPropagation(); onChange({ solo: !track.solo }); }}>S</button>
-          <button
-            className={`ai-toggle ${track.aiGenerated ? "active" : ""}`}
-            title={track.aiGenerated ? "Marked as AI-generated/separated stem. Click to unmark." : "Mark as AI-generated/separated stem (Suno, demucs, etc.) so the agent treats it differently."}
-            onClick={(event) => { event.stopPropagation(); onChange({ aiGenerated: !track.aiGenerated }); }}
-          >AI</button>
-          <button className="danger" title="Delete track" onClick={(event) => { event.stopPropagation(); onDelete(); }}><Trash2 size={14} /></button>
         </div>
-        <label>Vol <input type="range" min="-24" max="12" step="0.5" value={track.gainDb} onChange={(event) => onChange({ gainDb: Number(event.target.value) })} /></label>
-        <label>Pan <input type="range" min="-1" max="1" step="0.05" value={track.pan} onChange={(event) => onChange({ pan: Number(event.target.value) })} /></label>
       </div>
-      <div className="wave-wrap" onClick={laneClick} title="Click to set playhead">
-        <div
-          className="wave-clip"
-          style={{ left: `${clipLeftPct}%`, width: `${clipWidthPct}%`, borderLeftColor: track.color }}
-        >
-          <Waveform peaks={peaks} color={track.color} />
-        </div>
+      <div
+        className="wave-wrap"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        title="Click to select track and set playhead. Drag to select a time range."
+      >
+        {clips.map((clip) => {
+          const clipLeftPct = duration > 0 ? (clip.startSeconds / duration) * 100 : 0;
+          const clipWidthPct = duration > 0 ? (clip.sourceSeconds / duration) * 100 : 100;
+          return (
+            <div
+              key={clip.id}
+              data-clip-id={clip.id}
+              className={`wave-clip ${selectedClipId === clip.id ? "selected" : ""}`}
+              style={{ left: `${clipLeftPct}%`, width: `${clipWidthPct}%`, borderLeftColor: track.color }}
+              title={clip.name}
+            >
+              <Waveform peaks={clip.peaks} color={track.color} />
+              <span className="clip-label">{clip.name}</span>
+            </div>
+          );
+        })}
+        {selectedRange && Math.abs(rangeEndPct - rangeStartPct) > 0.1 ? (
+          <div
+            className="range-selection"
+            style={{ left: `${Math.min(rangeStartPct, rangeEndPct)}%`, width: `${Math.abs(rangeEndPct - rangeStartPct)}%` }}
+          />
+        ) : null}
+        {recording ? <LiveWaveform peaks={livePeaks ?? []} color={track.color} /> : null}
+        {recording ? <div className="recording-overlay">Recording</div> : null}
         <div className="playhead" style={{ left: `${cursorPct}%` }} />
       </div>
     </div>
@@ -1291,12 +1812,13 @@ function Waveform({ peaks, color }: { peaks?: number[]; color: string }) {
       ctx.fillStyle = "#161b20";
       ctx.fillRect(0, 0, rect.width, rect.height);
       if (!peaks?.length) return;
-      const step = Math.max(1, peaks.length / rect.width);
+      const step = peaks.length / rect.width;
       ctx.strokeStyle = color;
       ctx.lineWidth = 1;
       ctx.beginPath();
       for (let x = 0; x < rect.width; x++) {
-        const sample = Math.min(1, Math.max(0.02, peaks[Math.min(peaks.length - 1, Math.floor(x * step))] ?? 0));
+        const sample = Math.min(1, Math.max(0, peaks[Math.min(peaks.length - 1, Math.floor(x * step))] ?? 0));
+        if (sample <= 0.0001) continue;
         const y1 = ((1 - sample) * rect.height) / 2;
         const y2 = ((1 + sample) * rect.height) / 2;
         ctx.moveTo(x, y1);
@@ -1324,6 +1846,78 @@ function Waveform({ peaks, color }: { peaks?: number[]; color: string }) {
   return <canvas ref={canvasRef} />;
 }
 
+function LiveWaveform({ peaks, color }: { peaks: number[]; color: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const draw = () => {
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const scale = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * scale));
+      canvas.height = Math.max(1, Math.floor(rect.height * scale));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      ctx.fillStyle = "rgba(168, 61, 61, 0.12)";
+      ctx.fillRect(0, 0, rect.width, rect.height);
+
+      const center = rect.height / 2;
+      ctx.strokeStyle = "rgba(255, 184, 184, 0.34)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, center);
+      ctx.lineTo(rect.width, center);
+      ctx.stroke();
+
+      const targetCount = Math.max(24, Math.floor(rect.width));
+      const time = performance.now() / 1000;
+      const visible = peaks.length
+        ? peaks.slice(-targetCount)
+        : Array.from({ length: targetCount }, (_, i) => {
+            const a = Math.abs(Math.sin(i * 0.19 + time * 5.4));
+            const b = Math.abs(Math.sin(i * 0.047 + time * 1.7));
+            return 0.04 + a * b * 0.34;
+          });
+      const step = rect.width / Math.max(1, visible.length - 1);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      visible.forEach((peak, i) => {
+        const sample = Math.min(1, Math.max(0, peak));
+        const x = i * step;
+        const y1 = ((1 - sample) * rect.height) / 2;
+        const y2 = ((1 + sample) * rect.height) / 2;
+        ctx.moveTo(x, y1);
+        ctx.lineTo(x, y2);
+      });
+      ctx.stroke();
+
+      const sweepX = (time * 160) % rect.width;
+      const gradient = ctx.createLinearGradient(sweepX - 24, 0, sweepX + 24, 0);
+      gradient.addColorStop(0, "rgba(255, 184, 184, 0)");
+      gradient.addColorStop(0.5, "rgba(255, 184, 184, 0.32)");
+      gradient.addColorStop(1, "rgba(255, 184, 184, 0)");
+      ctx.fillStyle = gradient;
+      ctx.fillRect(Math.max(0, sweepX - 24), 0, 48, rect.height);
+    };
+
+    let frame = 0;
+    const animate = () => {
+      draw();
+      frame = requestAnimationFrame(animate);
+    };
+    frame = requestAnimationFrame(animate);
+    return () => {
+      cancelAnimationFrame(frame);
+    };
+  }, [peaks, color]);
+  return <canvas className="live-waveform" ref={canvasRef} />;
+}
+
 function MasterBar({ gainDb, onChange }: { gainDb: number; onChange: (gainDb: number) => void | Promise<void> }) {
   const [local, setLocal] = useState(gainDb);
   useEffect(() => { setLocal(gainDb); }, [gainDb]);
@@ -1349,6 +1943,7 @@ function MasterBar({ gainDb, onChange }: { gainDb: number; onChange: (gainDb: nu
 }
 
 const AUTO_MIX_STAGES = [
+  { id: "raw_session_prep", label: "Raw session prep" },
   { id: "prep_intent", label: "Prep / intent" },
   { id: "static_balance", label: "Static balance" },
   { id: "cleanup_filters", label: "Cleanup HP/LP" },
@@ -1452,6 +2047,28 @@ function formatTime(seconds: number) {
   return `${min}:${sec}`;
 }
 
+function buildAbJudgeFixPrompt(result: AbJudgeResponse) {
+  const winner = result.winner === "after" ? "the current MIX" : result.winner === "before" ? "the ORIGINAL/bypass" : "a tie";
+  const lines = [
+    `Use the latest Gemini A/B judge result as your main brief. It compared ORIGINAL/bypass against the current MIX on ${formatTime(result.clipStart)}-${formatTime(result.clipStart + result.clipDuration)} and chose ${winner} with ${(result.confidence * 100).toFixed(0)}% confidence.`,
+    `Summary: ${result.summary}`,
+  ];
+  if (result.improvements.length > 0) {
+    lines.push(`Preserve these improvements: ${result.improvements.join("; ")}`);
+  }
+  if (result.regressions.length > 0) {
+    lines.push(`Fix these regressions first: ${result.regressions.join("; ")}`);
+  }
+  if (result.mixIssuesAfter.length > 0) {
+    lines.push(`Issues heard in the current MIX: ${result.mixIssuesAfter.map((issue) => `${issue.severity} ${issue.category}: ${issue.message}`).join("; ")}`);
+  }
+  if (result.recommendedNextMoves.length > 0) {
+    lines.push(`Recommended next moves: ${result.recommendedNextMoves.join("; ")}`);
+  }
+  lines.push("Apply only small, reversible mix moves. Do not make the mix louder just to win the A/B. If the A/B result is a tie or the requested fix is not actionable from the available controls, make the smallest useful change or ask for clarification.");
+  return lines.join("\n\n");
+}
+
 type AssistantTurnMessage = {
   role: "assistant-turn";
   explanation: string;
@@ -1466,12 +2083,14 @@ type AssistantTurnMessage = {
 };
 
 type CritiqueMessage = { role: "critique"; critique: MixCritique; skills: string[] };
+type AbJudgeMessage = { role: "ab-judge"; result: AbJudgeResponse };
 
 type ChatMessage =
   | { role: "user"; text: string }
   | { role: "assistant"; text: string }
   | { role: "system"; text: string }
   | CritiqueMessage
+  | AbJudgeMessage
   | AssistantTurnMessage;
 
 type ActionDescription = {
@@ -1595,6 +2214,94 @@ function findLatestCritique(messages: ChatMessage[]): MixCritique | undefined {
   return undefined;
 }
 
+function findLatestAbJudge(messages: ChatMessage[]): AbJudgeResponse | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "ab-judge") return m.result;
+  }
+  return undefined;
+}
+
+function AbJudgeCard({ result, onApply }: { result: AbJudgeResponse; onApply?: () => void }) {
+  const winner = result.winner === "after" ? "MIX" : result.winner === "before" ? "ORIG" : "TIE";
+  const winnerClass = result.winner === "after" ? "good" : result.winner === "before" ? "poor" : "ok";
+  const issues = result.mixIssuesAfter;
+
+  return (
+    <div className="message critique ab-judge">
+      <div className="crit-head">
+        <div className={`crit-score ${winnerClass}`}>
+          <span className="crit-score-value">{winner}</span>
+          <span className="crit-score-label">{(result.confidence * 100).toFixed(0)}%</span>
+        </div>
+        <div className="crit-summary">
+          <strong>A/B judge</strong>
+          <p>{result.summary}</p>
+        </div>
+      </div>
+      <div className="crit-meters">
+        <span><span className="crit-meter-label">Model</span> {result.model}</span>
+        <span><span className="crit-meter-label">Clip</span> {formatTime(result.clipStart)}-{formatTime(result.clipStart + result.clipDuration)}</span>
+        {result.promptTokens || result.outputTokens ? (
+          <span><span className="crit-meter-label">Tokens</span> {(result.promptTokens ?? 0).toLocaleString()} in · {(result.outputTokens ?? 0).toLocaleString()} out</span>
+        ) : null}
+      </div>
+      {result.improvements.length > 0 ? (
+        <div className="crit-section">
+          <div className="crit-section-title">Improvements to preserve</div>
+          <ul className="crit-strengths">
+            {result.improvements.map((item, i) => <li key={i}>{item}</li>)}
+          </ul>
+        </div>
+      ) : null}
+      {result.regressions.length > 0 ? (
+        <div className="crit-section">
+          <div className="crit-section-title">Regressions to fix</div>
+          <ul className="crit-issues">
+            {result.regressions.map((item, i) => (
+              <li key={i}>
+                <span className="crit-sev crit-sev-medium">fix</span>
+                <span className="crit-msg">{item}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {issues.length > 0 ? (
+        <div className="crit-section">
+          <div className="crit-section-title">Current mix issues</div>
+          <ul className="crit-issues">
+            {issues.map((issue, i) => (
+              <li key={i}>
+                <span className={`crit-sev crit-sev-${issue.severity}`}>{issue.severity}</span>
+                <span className="crit-cat">{issue.category}</span>
+                <span className="crit-msg">{issue.message}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {result.recommendedNextMoves.length > 0 ? (
+        <div className="crit-section">
+          <div className="crit-section-title">Recommended next moves</div>
+          <ol className="crit-next">
+            {result.recommendedNextMoves.map((step, i) => <li key={i}>{step}</li>)}
+          </ol>
+        </div>
+      ) : null}
+      <div className="crit-foot">
+        <span className="crit-skills">{result.provider}</span>
+        {onApply ? (
+          <button type="button" className="crit-apply" onClick={onApply}>
+            <Power size={14} />
+            <span>Fix A/B</span>
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function CritiqueCard({ critique, skills, session, onApply }: { critique: MixCritique; skills: string[]; session: MixSession; onApply?: () => void }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const ratingClass = (n: number) => (n >= 8 ? "good" : n >= 5 ? "ok" : "poor");
@@ -1702,6 +2409,10 @@ function CritiqueCard({ critique, skills, session, onApply }: { critique: MixCri
 function describeAction(action: MixAction, session: MixSession): ActionDescription | null {
   const trackName = (id: string) => session.tracks.find((track) => track.id === id)?.name ?? "track";
   switch (action.tool) {
+    case "rename_track":
+      return { target: trackName(action.trackId), kind: "Rename", fields: [{ label: "name", value: action.name }] };
+    case "set_track_role":
+      return { target: trackName(action.trackId), kind: "Role", fields: [{ label: "role", value: action.role ?? "none" }] };
     case "set_track_gain":
       return { target: trackName(action.trackId), kind: "Gain", fields: [{ label: "level", value: formatDb(action.gainDb) }] };
     case "adjust_track_gain":

@@ -8,14 +8,21 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use super::automation::AutomationSnapshot;
 use super::mixer::MAX_TRACKS;
 
-/// Audio data bound to a track slot. Immutable once published; rebinding is
-/// done by storing a new `Arc<TrackSource>` into the slot's `ArcSwapOption`.
-pub struct TrackSource {
+/// Audio data for one clip on a track. Immutable once published.
+pub struct TrackClipSource {
     pub start_sample: u64,
     pub duration_samples: u64,
+    pub source_offset_sample: u64,
+    pub gain_db: f32,
     pub channels: u16,
     pub sample_rate: u32,
     pub buffer: Vec<f32>,
+}
+
+/// Audio data bound to a track slot. Immutable once published; rebinding is
+/// done by storing a new `Arc<TrackSource>` into the slot's `ArcSwapOption`.
+pub struct TrackSource {
+    pub clips: Vec<TrackClipSource>,
 }
 
 /// State shared between UI thread and audio thread.

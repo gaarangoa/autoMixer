@@ -100,7 +100,12 @@ pub fn clamp_actions(actions: &mut [MixAction]) -> Vec<String> {
             | MixAction::SetLowPass { frequency_hz, .. } => {
                 clamp_field(frequency_hz, 20.0, 20000.0, "frequencyHz", &mut warnings);
             }
-            MixAction::SetEqBand { frequency_hz, gain_db, q, .. } => {
+            MixAction::SetEqBand { band, frequency_hz, gain_db, q, .. } => {
+                let original = *band;
+                *band = (*band).min(3);
+                if *band != original {
+                    warnings.push(format!("band clamped from {original} to {band}"));
+                }
                 clamp_field(frequency_hz, 20.0, 20000.0, "frequencyHz", &mut warnings);
                 clamp_field(gain_db, -12.0, 12.0, "gainDb", &mut warnings);
                 clamp_field(q, 0.2, 10.0, "q", &mut warnings);
@@ -159,6 +164,8 @@ pub fn validate_actions(session: &MixSession, actions: &[MixAction]) -> Result<(
                 }
             }
             MixAction::DeleteTrack { track_id }
+            | MixAction::RenameTrack { track_id, .. }
+            | MixAction::SetTrackRole { track_id, .. }
             | MixAction::SetTrackPan { track_id, .. }
             | MixAction::MuteTrack { track_id, .. }
             | MixAction::SoloTrack { track_id, .. }
@@ -225,6 +232,14 @@ fn apply_action(
             let removed = session.tracks.remove(index);
             forward.push(JsonPatchOp { op: "remove".into(), path: format!("/tracks/{index}"), value: None });
             inverse.insert(0, JsonPatchOp { op: "add".into(), path: format!("/tracks/{index}"), value: Some(json!(removed)) });
+        }
+        MixAction::RenameTrack { track_id, name } => replace(session, forward, inverse, &track_path(session, track_id, "name")?, json!(name.trim().chars().take(80).collect::<String>()))?,
+        MixAction::SetTrackRole { track_id, role } => {
+            let value = role
+                .as_ref()
+                .map(|role| role.trim().chars().take(40).collect::<String>())
+                .filter(|role| !role.is_empty());
+            replace(session, forward, inverse, &track_path(session, track_id, "role")?, json!(value))?;
         }
         MixAction::SetTrackGain { track_id, gain_db } => replace(session, forward, inverse, &track_path(session, track_id, "gainDb")?, json!(gain_db))?,
         MixAction::AdjustTrackGain { track_id, delta_db } => {
@@ -501,6 +516,20 @@ mod tests {
             q: 1.0,
         }];
         assert!(validate_actions(&session, &bad).is_err());
+    }
+
+    #[test]
+    fn clamp_brings_out_of_range_eq_band_into_envelope() {
+        let mut actions = vec![MixAction::SetEqBand {
+            track_id: "x".into(),
+            band: 4,
+            frequency_hz: 4000.0,
+            gain_db: -1.5,
+            q: 1.0,
+        }];
+        let warnings = clamp_actions(&mut actions);
+        assert!(warnings.iter().any(|warning| warning.contains("band clamped from 4 to 3")));
+        assert!(matches!(&actions[0], MixAction::SetEqBand { band, .. } if *band == 3));
     }
 
     #[test]
