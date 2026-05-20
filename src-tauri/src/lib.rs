@@ -31,6 +31,7 @@ pub struct AppState {
     pub audio: Mutex<AudioEngine>,
     pub audio_service: Arc<AudioService>,
     pub recorder: Mutex<Option<recorder::RecordingHandle>>,
+    pub input_monitor: Mutex<Option<recorder::InputMonitorHandle>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -51,6 +52,7 @@ pub fn run() {
             audio: Mutex::new(engine),
             audio_service,
             recorder: Mutex::new(None),
+            input_monitor: Mutex::new(None),
         })
         .setup(move |app| {
             let menu = Menu::default(app.handle())?;
@@ -88,6 +90,7 @@ pub fn run() {
             commands::get_project,
             commands::import_audio_files,
             commands::create_recording_track,
+            commands::create_video_track,
             commands::apply_mix_actions,
             commands::undo_mix_action,
             commands::redo_mix_action,
@@ -101,6 +104,9 @@ pub fn run() {
             commands::start_recording,
             commands::poll_recording_meters,
             commands::stop_recording,
+            commands::start_input_monitor,
+            commands::poll_input_monitor_meters,
+            commands::stop_input_monitor,
             commands::delete_clip,
             commands::delete_clip_range,
             commands::set_master_bypass,
@@ -116,6 +122,8 @@ pub fn run() {
             commands::analyze_master_structure,
             commands::judge_mix_ab,
             commands::render_mix,
+            commands::save_video_recording,
+            commands::render_video_mix,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AutoMixer");

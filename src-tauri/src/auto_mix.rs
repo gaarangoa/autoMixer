@@ -845,6 +845,7 @@ mod tests {
             markers: Vec::new(),
             sections: Vec::new(),
             mixer_profile: Default::default(),
+            video_canvas: Default::default(),
         }
     }
 
@@ -901,6 +902,7 @@ mod tests {
             markers: Vec::new(),
             sections: Vec::new(),
             mixer_profile: Default::default(),
+            video_canvas: Default::default(),
         }
     }
 

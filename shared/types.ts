@@ -24,6 +24,14 @@ export type SourceFile = {
   peakPreview: number[];
 };
 
+export type VideoSourceFile = {
+  id: Id;
+  originalName: string;
+  path: string;
+  mimeType: string;
+  durationMs: number;
+};
+
 export type EqBand = {
   type: "low_shelf" | "peak" | "high_shelf";
   frequencyHz: number;
@@ -90,8 +98,46 @@ export type ClipRegion = {
   gainDb: number;
 };
 
+export type VideoClipRegion = {
+  id: Id;
+  videoSourceFileId: Id;
+  name?: string;
+  startSample: number;
+  endSample: number;
+  sourceOffsetMs?: number;
+  layout?: VideoLayout;
+};
+
+export type VideoFilterPreset = "none" | "warm" | "cool" | "mono" | "punch" | "dream";
+
+export type VideoLayout = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  cropTop: number;
+  cropRight: number;
+  cropBottom: number;
+  cropLeft: number;
+  opacity: number;
+  rotation: number;
+  zIndex: number;
+  brightness: number;
+  contrast: number;
+  saturation: number;
+  blur: number;
+  preset: VideoFilterPreset;
+};
+
+export type VideoCanvas = {
+  width: number;
+  height: number;
+  background: string;
+};
+
 export type Track = {
   id: Id;
+  kind?: "audio" | "video";
   name: string;
   role?: string;
   sourceFileId: Id;
@@ -106,6 +152,9 @@ export type Track = {
   sends: Sends;
   automation: AutomationLane[];
   clips: ClipRegion[];
+  videoClips?: VideoClipRegion[];
+  cameraDeviceId?: string;
+  recordCameraAudio?: boolean;
 };
 
 export type Region = {
@@ -142,6 +191,7 @@ export type MixSession = {
   sampleRate: number;
   bpm?: number;
   sourceFiles: SourceFile[];
+  videoSourceFiles?: VideoSourceFile[];
   tracks: Track[];
   buses: Bus[];
   regions: Region[];
@@ -149,6 +199,7 @@ export type MixSession = {
   master: MasterChannel;
   sections?: MixSection[];
   mixerProfile?: MixerProfile;
+  videoCanvas?: VideoCanvas;
 };
 
 export type MixerProfile = {

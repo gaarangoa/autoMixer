@@ -467,6 +467,7 @@ mod tests {
             markers: Vec::new(),
             sections: Vec::new(),
             mixer_profile: Default::default(),
+            video_canvas: Default::default(),
         };
         s.tracks.push(make_track("src1".into(), "Vocal".into(), 0));
         s.tracks.push(make_track("src2".into(), "Bass".into(), 1));

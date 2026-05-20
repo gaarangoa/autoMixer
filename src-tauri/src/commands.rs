@@ -1,8 +1,12 @@
 use std::{
+    collections::HashSet,
+    fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    process::Command,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Serialize;
 use tauri::{Emitter, State};
 
@@ -12,7 +16,7 @@ use crate::{
     assistant,
     audio,
     engine::commands::EngineCommand,
-    model::{AssistantRequest, AssistantResponse, HistorySource, JsonPatchOp, MixAction, MixProject, MixSection, MixSession, MixerProfile, SectionAnalysis, SkillCatalog},
+    model::{AssistantRequest, AssistantResponse, HistorySource, JsonPatchOp, MixAction, MixProject, MixSection, MixSession, MixerProfile, SectionAnalysis, SkillCatalog, VideoFilterPreset, VideoLayout},
     store::SessionStore,
     AppState,
 };
@@ -45,6 +49,15 @@ pub struct RecordingMetersResponse {
 #[derive(Serialize)]
 pub struct RenderResponse {
     path: String,
+}
+
+#[derive(Clone)]
+struct VideoRenderClip {
+    path: PathBuf,
+    start_sample: u64,
+    end_sample: u64,
+    source_offset_ms: u64,
+    layout: VideoLayout,
 }
 
 #[tauri::command]
@@ -102,6 +115,21 @@ pub fn create_recording_track(state: State<'_, AppState>, session_id: String) ->
         .lock()
         .map_err(|error| error.to_string())?
         .create_recording_track(&session_id)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn create_video_track(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .create_video_track(&session_id)?;
     if let Ok(mut audio) = state.audio.lock() {
         audio.bind_session_sources(&project.session)?;
         sync_session_to_engine(&mut audio, &project.session);
@@ -286,14 +314,17 @@ pub fn start_recording(
         .get_project(&session_id)?
         .session;
     let safe_start = start_sample.min(session_duration_samples(&session));
+    if let Some(handle) = state.input_monitor.lock().map_err(|error| error.to_string())?.take() {
+        handle.stop()?;
+    }
     let mut recorder = state.recorder.lock().map_err(|error| error.to_string())?;
-    if recorder.is_some() {
-        return Err("Recording is already active.".into());
+    if let Some(handle) = recorder.take() {
+        let _ = handle.stop();
     }
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
-        .as_secs();
+        .as_millis();
     let path = state
         .config
         .data_dir
@@ -305,13 +336,21 @@ pub fn start_recording(
         }
     }
     let handle = crate::recorder::start_recording(path, safe_start, target_track_id, input_device)?;
+    if let Err(error) = handle.wait_until_ready(Duration::from_secs(3)) {
+        let _ = handle.stop();
+        return Err(error);
+    }
     *recorder = Some(handle);
     Ok(())
 }
 
 #[tauri::command]
 pub fn poll_recording_meters(state: State<'_, AppState>) -> Result<RecordingMetersResponse, String> {
-    let recorder = state.recorder.lock().map_err(|error| error.to_string())?;
+    let mut recorder = state.recorder.lock().map_err(|error| error.to_string())?;
+    if let Some(error) = recorder.as_ref().and_then(|handle| handle.startup_error()) {
+        let _ = recorder.take();
+        return Err(error);
+    }
     let peaks = recorder
         .as_ref()
         .map(|handle| handle.drain_meters().into_iter().map(|meter| meter.peak).collect())
@@ -342,6 +381,46 @@ pub fn stop_recording(state: State<'_, AppState>, session_id: String) -> Result<
         audio.publish_automation(&project.session);
     }
     Ok(project)
+}
+
+#[tauri::command]
+pub fn start_input_monitor(state: State<'_, AppState>, input_device: Option<String>) -> Result<(), String> {
+    if state.recorder.lock().map_err(|error| error.to_string())?.is_some() {
+        return Ok(());
+    }
+    let mut monitor = state.input_monitor.lock().map_err(|error| error.to_string())?;
+    if let Some(handle) = monitor.take() {
+        handle.stop()?;
+    }
+    let handle = crate::recorder::start_input_monitor(input_device)?;
+    if let Err(error) = handle.wait_until_ready(Duration::from_secs(3)) {
+        let _ = handle.stop();
+        return Err(error);
+    }
+    *monitor = Some(handle);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn poll_input_monitor_meters(state: State<'_, AppState>) -> Result<RecordingMetersResponse, String> {
+    let mut monitor = state.input_monitor.lock().map_err(|error| error.to_string())?;
+    if let Some(error) = monitor.as_ref().and_then(|handle| handle.startup_error()) {
+        let _ = monitor.take();
+        return Err(error);
+    }
+    let peaks = monitor
+        .as_ref()
+        .map(|handle| handle.drain_meters().into_iter().map(|meter| meter.peak).collect())
+        .unwrap_or_default();
+    Ok(RecordingMetersResponse { peaks })
+}
+
+#[tauri::command]
+pub fn stop_input_monitor(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(handle) = state.input_monitor.lock().map_err(|error| error.to_string())?.take() {
+        handle.stop()?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -819,6 +898,128 @@ pub fn render_mix(state: State<'_, AppState>, session_id: String, output_path: S
 }
 
 #[tauri::command]
+pub fn save_video_recording(
+    state: State<'_, AppState>,
+    session_id: String,
+    track_id: String,
+    file_name: String,
+    mime_type: String,
+    start_sample: u64,
+    duration_ms: u64,
+    data_base64: String,
+    create_audio_track: bool,
+    source_offset_ms: u64,
+) -> Result<MixProject, String> {
+    let raw = data_base64
+        .split_once(',')
+        .map(|(_, payload)| payload)
+        .unwrap_or(data_base64.as_str());
+    let bytes = BASE64_STANDARD
+        .decode(raw.as_bytes())
+        .map_err(|error| format!("Could not decode video recording: {error}"))?;
+    let extension = video_extension(&file_name, &mime_type);
+    let temp_path = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .videos_dir()
+        .join(format!("incoming-{}.{}", uuid::Uuid::new_v4(), extension));
+    if let Some(parent) = temp_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&temp_path, bytes).map_err(|error| format!("Could not write video recording: {error}"))?;
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    let source_offset_ms = source_offset_ms.min(duration_ms.saturating_sub(1));
+    let mut project = store.add_video_recording_clip(&session_id, &track_id, &temp_path, file_name.clone(), mime_type, start_sample, duration_ms, source_offset_ms)?;
+    if create_audio_track {
+        let audio_path = store
+            .videos_dir()
+            .join(format!("{}-audio-{}.wav", Path::new(&file_name).file_stem().and_then(|item| item.to_str()).unwrap_or("camera"), uuid::Uuid::new_v4()));
+        if extract_video_audio(&temp_path, &audio_path, project.session.sample_rate, source_offset_ms).is_ok() {
+            if let Ok(updated) = store.add_source_file_at(&session_id, &audio_path, start_sample) {
+                project = updated;
+            }
+            let _ = fs::remove_file(&audio_path);
+        }
+    }
+    let _ = fs::remove_file(&temp_path);
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn render_video_mix(
+    state: State<'_, AppState>,
+    session_id: String,
+    output_path: String,
+    start_sample: Option<u64>,
+    end_sample: Option<u64>,
+    track_ids: Option<Vec<String>>,
+) -> Result<RenderResponse, String> {
+    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let path = normalize_mp4_path(PathBuf::from(output_path));
+    let full_end = session_duration_samples(&project.session);
+    let range_start = start_sample.unwrap_or(0).min(full_end);
+    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let selected_track_ids = track_ids
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect::<HashSet<_>>();
+    if selected_track_ids.is_empty() {
+        return Err("Select one or more video tracks in the canvas before exporting MP4.".into());
+    }
+    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    if video_inputs.is_empty() {
+        return Err("The selected video tracks have no recorded clips in the export range.".into());
+    }
+
+    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
+    let audio_path = renders_dir.join(format!("{session_id}.video-export.wav"));
+    audio::render_mix(&project.session, &audio_path)?;
+
+    let mut command = Command::new("ffmpeg");
+    command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+
+    for clip in &video_inputs {
+        command.arg("-i").arg(&clip.path);
+    }
+    if range_start > 0 {
+        command.arg("-ss").arg(format!("{:.3}", range_start as f64 / project.session.sample_rate as f64));
+    }
+    command
+        .arg("-t")
+        .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64))
+        .arg("-i")
+        .arg(&audio_path);
+    let filter = build_video_filter(&video_inputs, &project.session, range_start, range_end);
+    command
+        .arg("-filter_complex")
+        .arg(filter)
+        .arg("-map")
+        .arg("[v]")
+        .arg("-map")
+        .arg(format!("{}:a:0", video_inputs.len()));
+
+    let output = command
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-shortest")
+        .arg(&path)
+        .output()
+        .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg video export failed: {}", stderr.trim()));
+    }
+    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+}
+
+#[tauri::command]
 pub async fn judge_mix_ab(
     state: State<'_, AppState>,
     session_id: String,
@@ -870,6 +1071,238 @@ fn normalize_wav_path(path: PathBuf) -> PathBuf {
         path
     } else {
         path.with_extension("wav")
+    }
+}
+
+fn normalize_mp4_path(path: PathBuf) -> PathBuf {
+    if path.extension().and_then(|item| item.to_str()).is_some() {
+        path
+    } else {
+        path.with_extension("mp4")
+    }
+}
+
+fn video_extension(file_name: &str, mime_type: &str) -> &'static str {
+    if file_name.to_ascii_lowercase().ends_with(".mp4") || mime_type.contains("mp4") {
+        "mp4"
+    } else {
+        "webm"
+    }
+}
+
+fn extract_video_audio(video_path: &Path, audio_path: &Path, sample_rate: u32, source_offset_ms: u64) -> Result<(), String> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error");
+    if source_offset_ms > 0 {
+        command.arg("-ss").arg(format!("{:.3}", source_offset_ms as f64 / 1000.0));
+    }
+    let output = command
+        .arg("-i")
+        .arg(video_path)
+        .arg("-vn")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-ar")
+        .arg(sample_rate.to_string())
+        .arg("-ac")
+        .arg("2")
+        .arg(audio_path)
+        .output()
+        .map_err(|error| format!("Could not run ffmpeg to extract camera audio: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg camera audio extraction failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, selected_track_ids: &HashSet<String>) -> Vec<VideoRenderClip> {
+    let by_id: std::collections::HashMap<&str, &crate::model::VideoSourceFile> =
+        session.video_source_files.iter().map(|source| (source.id.as_str(), source)).collect();
+    let mut clips = Vec::new();
+    for (track_index, track) in session.tracks.iter().enumerate() {
+        if track.kind != crate::model::TrackKind::Video || track.muted || !selected_track_ids.contains(&track.id) {
+            continue;
+        }
+        for clip in &track.video_clips {
+            if clip.end_sample <= range_start || clip.start_sample >= range_end {
+                continue;
+            }
+            if let Some(source) = by_id.get(clip.video_source_file_id.as_str()) {
+                let trimmed_start = clip.start_sample.max(range_start);
+                let trimmed_end = clip.end_sample.min(range_end);
+                let offset_ms = clip.source_offset_ms.saturating_add(
+                    (((trimmed_start.saturating_sub(clip.start_sample)) as f64 / session.sample_rate as f64) * 1000.0).round() as u64
+                );
+                clips.push(VideoRenderClip {
+                    path: PathBuf::from(&source.path),
+                    start_sample: trimmed_start,
+                    end_sample: trimmed_end,
+                    source_offset_ms: offset_ms,
+                    layout: clip.layout.clone().unwrap_or_else(|| default_video_layout(track_index)),
+                });
+            }
+        }
+    }
+    clips.sort_by(|a, b| {
+        a.layout
+            .z_index
+            .cmp(&b.layout.z_index)
+            .then_with(|| a.start_sample.cmp(&b.start_sample))
+    });
+    clips
+}
+
+fn default_video_layout(index: usize) -> VideoLayout {
+    if index == 0 {
+        return VideoLayout {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            crop_top: 0.0,
+            crop_right: 0.0,
+            crop_bottom: 0.0,
+            crop_left: 0.0,
+            opacity: 1.0,
+            rotation: 0.0,
+            z_index: 0,
+            brightness: 1.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            blur: 0.0,
+            preset: VideoFilterPreset::None,
+        };
+    }
+    let slot = (index - 1) % 4;
+    let mut layout = default_video_layout(0);
+    layout.x = if slot == 0 || slot == 2 { 64.0 } else { 4.0 };
+    layout.y = if slot < 2 { 5.0 } else { 55.0 };
+    layout.width = 32.0;
+    layout.height = 40.0;
+    layout.z_index = index as i32;
+    layout
+}
+
+fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_start: u64, range_end: u64) -> String {
+    let sample_rate = session.sample_rate;
+    let canvas = &session.video_canvas;
+    let reference_w = canvas.width.clamp(240, 3840) as i32;
+    let reference_h = canvas.height.clamp(240, 3840) as i32;
+    let layouts: Vec<VideoLayout> = clips.iter().map(|clip| normalized_video_layout(&clip.layout)).collect();
+    let (min_x, min_y, max_x, max_y) = content_bounds(&layouts);
+    let output_w = even_dimension(pct_to_px((max_x - min_x).max(1.0), reference_w).clamp(240, 7680));
+    let output_h = even_dimension(pct_to_px((max_y - min_y).max(1.0), reference_h).clamp(240, 7680));
+    let background = ffmpeg_color(&canvas.background);
+    let duration = ((range_end.saturating_sub(range_start) as f64 / sample_rate as f64).max(0.1)) + 0.1;
+    let mut filter = format!("color=c={background}:s={output_w}x{output_h}:d={duration:.3}[base0]");
+    for (index, clip) in clips.iter().enumerate() {
+        let layout = layouts[index].clone();
+        let start = clip.start_sample.saturating_sub(range_start) as f64 / sample_rate as f64;
+        let clip_duration = clip.end_sample.saturating_sub(clip.start_sample) as f64 / sample_rate as f64;
+        let source_offset = clip.source_offset_ms as f64 / 1000.0;
+        let out_w = even_dimension(pct_to_px(layout.width, reference_w).max(2));
+        let out_h = even_dimension(pct_to_px(layout.height, reference_h).max(2));
+        let crop_w = (1.0 - ((layout.crop_left + layout.crop_right).min(90.0) / 100.0)).max(0.05);
+        let crop_h = (1.0 - ((layout.crop_top + layout.crop_bottom).min(90.0) / 100.0)).max(0.05);
+        let crop_x = (layout.crop_left / 100.0).clamp(0.0, 0.9);
+        let crop_y = (layout.crop_top / 100.0).clamp(0.0, 0.9);
+        let mut chain = format!(
+            "[{index}:v]trim=start={source_offset:.3}:duration={clip_duration:.3},setpts=PTS-STARTPTS+{start:.3}/TB,crop=iw*{crop_w:.5}:ih*{crop_h:.5}:iw*{crop_x:.5}:ih*{crop_y:.5},scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},setsar=1"
+        );
+        let eq_brightness = (layout.brightness - 1.0).clamp(-0.8, 0.8);
+        chain.push_str(&format!(",eq=brightness={eq_brightness:.3}:contrast={:.3}:saturation={:.3}", layout.contrast.clamp(0.2, 2.0), layout.saturation.clamp(0.0, 2.0)));
+        match layout.preset {
+            VideoFilterPreset::Warm => chain.push_str(",colorchannelmixer=rr=1.06:gg=1.01:bb=0.94"),
+            VideoFilterPreset::Cool => chain.push_str(",colorchannelmixer=rr=0.94:gg=1.01:bb=1.08"),
+            VideoFilterPreset::Mono => chain.push_str(",hue=s=0"),
+            VideoFilterPreset::Punch => chain.push_str(",eq=contrast=1.12:saturation=1.14"),
+            VideoFilterPreset::Dream => chain.push_str(",boxblur=1:1,eq=brightness=0.04:saturation=0.82"),
+            VideoFilterPreset::None => {}
+        }
+        if layout.blur >= 0.5 {
+            chain.push_str(&format!(",boxblur={}:1", layout.blur.round().clamp(1.0, 10.0)));
+        }
+        if layout.rotation.abs() >= 0.5 {
+            let radians = layout.rotation as f64 * std::f64::consts::PI / 180.0;
+            chain.push_str(&format!(",rotate={radians:.6}:c=none:ow=rotw(iw):oh=roth(ih),scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black@0"));
+        }
+        if layout.opacity < 0.999 {
+            chain.push_str(&format!(",format=rgba,colorchannelmixer=aa={:.3}", layout.opacity.clamp(0.0, 1.0)));
+        } else {
+            chain.push_str(",format=rgba");
+        }
+        chain.push_str(&format!("[clip{index}]"));
+        filter.push(';');
+        filter.push_str(&chain);
+        let x = pct_to_px(layout.x - min_x, reference_w);
+        let y = pct_to_px(layout.y - min_y, reference_h);
+        filter.push(';');
+        filter.push_str(&format!(
+            "[base{index}][clip{index}]overlay={x}:{y}:enable='between(t,{start:.3},{:.3})':eof_action=pass[base{}]",
+            start + clip_duration,
+            index + 1
+        ));
+    }
+    filter.push(';');
+    filter.push_str(&format!("[base{}]format=yuv420p[v]", clips.len()));
+    filter
+}
+
+fn normalized_video_layout(layout: &VideoLayout) -> VideoLayout {
+    let mut next = layout.clone();
+    next.width = next.width.clamp(1.0, 300.0);
+    next.height = next.height.clamp(1.0, 300.0);
+    next.x = next.x.clamp(-300.0, 300.0);
+    next.y = next.y.clamp(-300.0, 300.0);
+    next.crop_top = next.crop_top.clamp(0.0, 45.0);
+    next.crop_right = next.crop_right.clamp(0.0, 45.0);
+    next.crop_bottom = next.crop_bottom.clamp(0.0, 45.0);
+    next.crop_left = next.crop_left.clamp(0.0, 45.0);
+    next.opacity = next.opacity.clamp(0.0, 1.0);
+    next.brightness = next.brightness.clamp(0.2, 2.0);
+    next.contrast = next.contrast.clamp(0.2, 2.0);
+    next.saturation = next.saturation.clamp(0.0, 2.0);
+    next.blur = next.blur.clamp(0.0, 10.0);
+    next
+}
+
+fn pct_to_px(value: f32, total: i32) -> i32 {
+    ((value / 100.0) * total as f32).round() as i32
+}
+
+fn content_bounds(layouts: &[VideoLayout]) -> (f32, f32, f32, f32) {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for layout in layouts {
+        min_x = min_x.min(layout.x);
+        min_y = min_y.min(layout.y);
+        max_x = max_x.max(layout.x + layout.width);
+        max_y = max_y.max(layout.y + layout.height);
+    }
+    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+        (0.0, 0.0, 100.0, 100.0)
+    } else {
+        (min_x, min_y, max_x, max_y)
+    }
+}
+
+fn even_dimension(value: i32) -> i32 {
+    let value = value.max(2);
+    if value % 2 == 0 { value } else { value + 1 }
+}
+
+fn ffmpeg_color(value: &str) -> String {
+    if value.len() == 7 && value.starts_with('#') && value.chars().skip(1).all(|c| c.is_ascii_hexdigit()) {
+        format!("0x{}", &value[1..])
+    } else {
+        "black".into()
     }
 }
 

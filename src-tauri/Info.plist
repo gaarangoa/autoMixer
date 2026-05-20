@@ -4,5 +4,9 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>AutoMixer records audio from your default input device into new tracks.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>AutoMixer records video from connected cameras into video tracks.</string>
+  <key>NSCameraUseContinuityCameraDeviceType</key>
+  <true/>
 </dict>
 </plist>

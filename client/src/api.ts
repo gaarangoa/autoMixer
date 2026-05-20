@@ -25,6 +25,7 @@ export const api = {
   getSession: (id: string) => tauriInvoke<MixProject>("get_project", { sessionId: id }),
   importFiles: (sessionId: string, paths: string[]) => tauriInvoke<MixProject>("import_audio_files", { sessionId, paths }),
   createRecordingTrack: (sessionId: string) => tauriInvoke<MixProject>("create_recording_track", { sessionId }),
+  createVideoTrack: (sessionId: string) => tauriInvoke<MixProject>("create_video_track", { sessionId }),
   applyActions: (sessionId: string, actions: MixAction[], explanation?: string) =>
     tauriInvoke<MixProject>("apply_mix_actions", { sessionId, actions, explanation }),
   undo: (sessionId: string) => tauriInvoke<MixProject>("undo_mix_action", { sessionId }),
@@ -41,6 +42,9 @@ export const api = {
     tauriInvoke<void>("start_recording", { sessionId, startSample, targetTrackId, inputDevice }),
   recordingMeters: () => tauriInvoke<{ peaks: number[] }>("poll_recording_meters"),
   stopRecording: (sessionId: string) => tauriInvoke<MixProject>("stop_recording", { sessionId }),
+  startInputMonitor: (inputDevice?: string) => tauriInvoke<void>("start_input_monitor", { inputDevice }),
+  inputMonitorMeters: () => tauriInvoke<{ peaks: number[] }>("poll_input_monitor_meters"),
+  stopInputMonitor: () => tauriInvoke<void>("stop_input_monitor"),
   deleteClip: (sessionId: string, trackId: string, clipId: string) =>
     tauriInvoke<MixProject>("delete_clip", { sessionId, trackId, clipId }),
   deleteClipRange: (sessionId: string, trackId: string, startSample: number, endSample: number) =>
@@ -63,6 +67,10 @@ export const api = {
   onMenuLevelSections: (cb: () => void): Promise<UnlistenFn> =>
     listen("menu:level-sections", () => cb()),
   renderMix: (sessionId: string, outputPath: string) => tauriInvoke<{ path: string }>("render_mix", { sessionId, outputPath }),
+  saveVideoRecording: (sessionId: string, trackId: string, fileName: string, mimeType: string, startSample: number, durationMs: number, dataBase64: string, createAudioTrack = false, sourceOffsetMs = 0) =>
+    tauriInvoke<MixProject>("save_video_recording", { sessionId, trackId, fileName, mimeType, startSample, durationMs, dataBase64, createAudioTrack, sourceOffsetMs }),
+  renderVideoMix: (sessionId: string, outputPath: string, startSample?: number, endSample?: number, trackIds?: string[]) =>
+    tauriInvoke<{ path: string }>("render_video_mix", { sessionId, outputPath, startSample, endSample, trackIds }),
   judgeMixAb: (sessionId: string, apiKey: string, model = "gemini-flash-latest") =>
     tauriInvoke<AbJudgeResponse>("judge_mix_ab", { sessionId, options: { provider: "gemini", model, apiKey } }),
   judgeMixAbLocal: (sessionId: string) =>

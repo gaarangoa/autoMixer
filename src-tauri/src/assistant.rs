@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
 
 use crate::{
@@ -841,10 +841,213 @@ async fn try_model_critique(
 
     let raw_real = substitute_quoted(&raw_aliased, &track_aliases, false);
     let extracted = extract_json_object(&raw_real).unwrap_or_else(|| raw_real.clone());
-    serde_json::from_str::<crate::model::MixCritique>(&extracted).map_err(|err| CritiqueError {
+    parse_model_critique(&extracted).map_err(|err| CritiqueError {
         message: err.to_string(),
         raw: Some(raw_real),
     })
+}
+
+fn parse_model_critique(extracted: &str) -> Result<crate::model::MixCritique, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(extracted)?;
+    normalize_critique_value(&mut value);
+    serde_json::from_value(value)
+}
+
+fn normalize_critique_value(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(results) = obj.get("mixResults").and_then(Value::as_object).cloned() {
+        copy_missing(obj, "headroomDb", &results, &["headroomDb"]);
+        copy_missing(obj, "integratedLufsEstimate", &results, &["integratedLufsEstimate", "lufs", "integratedLUFSestimate"]);
+        copy_missing(obj, "truePeakDbEstimate", &results, &["truePeakDbEstimate", "truePeakDb", "peakDb"]);
+    }
+    coerce_number(obj, "headroomDb");
+    coerce_number(obj, "integratedLufsEstimate");
+    coerce_number(obj, "truePeakDbEstimate");
+
+    rename_key(obj, "trackIssues", "perTrack");
+    obj.entry("mixIssues").or_insert_with(|| json!([]));
+    obj.entry("perTrack").or_insert_with(|| json!([]));
+    normalize_issue_values(obj.get_mut("mixIssues"));
+
+    let mut extra_steps = Vec::new();
+    if let Some(per_track) = obj.get_mut("perTrack").and_then(Value::as_array_mut) {
+        for track in per_track {
+            let Some(track_obj) = track.as_object_mut() else {
+                continue;
+            };
+            rename_key(track_obj, "id", "trackId");
+            rename_key(track_obj, "name", "trackName");
+            track_obj.entry("issues").or_insert_with(|| json!([]));
+            normalize_issue_values(track_obj.get_mut("issues"));
+            track_obj.entry("strengths").or_insert_with(|| json!([]));
+            if !track_obj.contains_key("rating") {
+                let rating = rating_from_issues(track_obj.get("issues"));
+                track_obj.insert("rating".into(), json!(rating));
+            }
+            if let Some(track_steps) = track_obj.remove("recommendedNextSteps") {
+                collect_step_strings(&track_steps, &mut extra_steps);
+            }
+        }
+    }
+
+    if !obj.contains_key("summary") {
+        obj.insert("summary".into(), Value::String(build_critique_summary(obj)));
+    }
+
+    let mut steps = Vec::new();
+    if let Some(raw_steps) = obj.remove("recommendedNextSteps") {
+        collect_step_strings(&raw_steps, &mut steps);
+    }
+    steps.extend(extra_steps);
+    obj.insert("recommendedNextSteps".into(), Value::Array(steps.into_iter().map(Value::String).collect()));
+}
+
+fn copy_missing(
+    obj: &mut serde_json::Map<String, Value>,
+    target: &str,
+    source: &serde_json::Map<String, Value>,
+    source_keys: &[&str],
+) {
+    if obj.contains_key(target) {
+        return;
+    }
+    if let Some(value) = source_keys.iter().find_map(|key| source.get(*key)).cloned() {
+        obj.insert(target.into(), value);
+    }
+}
+
+fn rename_key(obj: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
+    if obj.contains_key(to) {
+        return;
+    }
+    if let Some(value) = obj.remove(from) {
+        obj.insert(to.into(), value);
+    }
+}
+
+fn coerce_number(obj: &mut serde_json::Map<String, Value>, key: &str) {
+    let Some(value) = obj.get(key) else {
+        return;
+    };
+    let Some(text) = value.as_str() else {
+        return;
+    };
+    if let Ok(number) = text.trim().parse::<f64>() {
+        obj.insert(key.into(), json!(number));
+    }
+}
+
+fn normalize_issue_values(value: Option<&mut Value>) {
+    let Some(issues) = value.and_then(Value::as_array_mut) else {
+        return;
+    };
+    for issue in issues {
+        let Some(issue_obj) = issue.as_object_mut() else {
+            continue;
+        };
+        rename_key(issue_obj, "issueLevel", "severity");
+        if let Some(severity) = issue_obj.get("severity").and_then(Value::as_str) {
+            let normalized = match severity {
+                "moderate" => Some("medium"),
+                "minor" => Some("low"),
+                "major" => Some("high"),
+                _ => None,
+            };
+            if let Some(normalized) = normalized {
+                issue_obj.insert("severity".into(), Value::String(normalized.into()));
+            }
+        }
+    }
+}
+
+fn collect_step_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_step_strings(item, out);
+            }
+        }
+        Value::String(s) => {
+            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                collect_step_strings(&parsed, out);
+            } else if !s.trim().is_empty() {
+                out.push(s.trim().to_string());
+            }
+        }
+        Value::Object(_) => {
+            if let Some(step) = step_object_to_string(value) {
+                out.push(step);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn step_object_to_string(value: &Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let action = obj.get("action").and_then(Value::as_str).unwrap_or("Next step").trim();
+    let details = obj.get("details").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let delta = obj.get("delta").or_else(|| obj.get("estimatedLUFS")).or_else(|| obj.get("headroom"));
+    let delta = delta.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+
+    let mut step = details
+        .map(|details| format!("{action}: {details}"))
+        .unwrap_or_else(|| action.to_string());
+    if let Some(delta) = delta {
+        step.push_str(" (");
+        step.push_str(delta);
+        step.push(')');
+    }
+    Some(step)
+}
+
+fn rating_from_issues(value: Option<&Value>) -> f32 {
+    let Some(issues) = value.and_then(Value::as_array) else {
+        return 8.0;
+    };
+    let penalty = issues.iter().fold(0.0, |acc, issue| {
+        let severity = issue
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("medium");
+        acc + match severity {
+            "high" => 2.0,
+            "low" => 0.5,
+            _ => 1.0,
+        }
+    });
+    (8.0_f32 - penalty).clamp(1.0, 10.0)
+}
+
+fn build_critique_summary(obj: &serde_json::Map<String, Value>) -> String {
+    let score = obj.get("mixScore").and_then(Value::as_f64);
+    let mut messages = obj
+        .get("mixIssues")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|issue| issue.get("message").and_then(Value::as_str))
+        .take(2)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+
+    if messages.is_empty() {
+        return match score {
+            Some(score) => format!("The model rated the mix {score:.1}/10 and did not provide a separate summary."),
+            None => "The model returned a technical critique without a separate summary.".into(),
+        };
+    }
+
+    let prefix = match score {
+        Some(score) => format!("The model rated the mix {score:.1}/10."),
+        None => "The model returned a technical critique.".into(),
+    };
+    messages.insert(0, prefix.as_str());
+    messages.join(" ")
 }
 
 /// Cheap true-peak estimator: 4× linear oversampling and take the max abs sample.
@@ -1282,4 +1485,54 @@ fn action_name(action: &MixAction) -> &'static str {
 fn contains_any(text: &str, words: &[&str]) -> bool {
     let lower = text.to_lowercase();
     words.iter().any(|word| lower.contains(word))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::CritiqueSeverity;
+
+    #[test]
+    fn parses_critique_with_model_aliases_and_object_steps() {
+        let raw = r#"{
+            "mixScore": 6.5,
+            "mixIssues": [
+                {"category":"headroom","severity":"high","message":"Only 1 dB headroom.","suggestedSkills":["mastering"]},
+                {"category":"tonality","issueLevel":"moderate","message":"The mix is dark."}
+            ],
+            "mixResults": {
+                "headroomDb": 1.0,
+                "lufs": -17.4,
+                "truePeakDbEstimate": -1.0,
+                "integratedLUFSestimate": "-14.4"
+            },
+            "trackIssues": [
+                {
+                    "id": "tk1",
+                    "name": "Synth",
+                    "issues": [{"category":"balance","issueLevel":"minor","message":"Low-mid cut reduces fullness."}],
+                    "recommendedNextSteps": [{"action":"Increase low-mid boost","delta":"+1 dB"}]
+                }
+            ],
+            "recommendedNextSteps": [
+                {"action":"Raise dry track levels","details":"Increase synth gain","delta":"+3 dB"},
+                "{\"action\":\"Brighten the mix\",\"details\":\"Boost synth presence\",\"delta\":\"+2 dB\"}"
+            ]
+        }"#;
+
+        let critique = parse_model_critique(raw).expect("critique should parse after normalization");
+
+        assert_eq!(critique.mix_score, 6.5);
+        assert_eq!(critique.headroom_db, 1.0);
+        assert_eq!(critique.integrated_lufs_estimate, -17.4);
+        assert_eq!(critique.true_peak_db_estimate, -1.0);
+        assert!(critique.summary.contains("6.5/10"));
+        assert_eq!(critique.per_track[0].track_id, "tk1");
+        assert_eq!(critique.per_track[0].track_name, "Synth");
+        assert!(matches!(critique.mix_issues[1].severity, CritiqueSeverity::Medium));
+        assert!(matches!(critique.per_track[0].issues[0].severity, CritiqueSeverity::Low));
+        assert_eq!(critique.recommended_next_steps.len(), 3);
+        assert!(critique.recommended_next_steps[0].contains("Raise dry track levels"));
+        assert!(critique.recommended_next_steps[2].contains("Increase low-mid boost"));
+    }
 }

@@ -9,7 +9,7 @@ use crate::{
     actions::record_patch,
     defaults::{default_master, make_track},
     engine::source::{import_to_session_rate, write_to_cache, ImportedAudio},
-    model::{ClipRegion, HistorySource, JsonPatchOp, MixProject, MixSession, SourceFile, TrackAnalysis},
+    model::{ClipRegion, HistorySource, JsonPatchOp, MixProject, MixSession, SourceFile, TrackAnalysis, TrackKind, VideoClipRegion, VideoSourceFile},
 };
 
 pub struct SessionStore {
@@ -27,6 +27,7 @@ impl SessionStore {
         fs::create_dir_all(self.sessions_dir()).map_err(|error| error.to_string())?;
         fs::create_dir_all(self.sources_dir()).map_err(|error| error.to_string())?;
         fs::create_dir_all(self.peaks_dir()).map_err(|error| error.to_string())?;
+        fs::create_dir_all(self.videos_dir()).map_err(|error| error.to_string())?;
         fs::create_dir_all(self.renders_dir()).map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -39,6 +40,7 @@ impl SessionStore {
             sample_rate: 48000,
             bpm: None,
             source_files: Vec::new(),
+            video_source_files: Vec::new(),
             tracks: Vec::new(),
             buses: Vec::new(),
             master: default_master(),
@@ -46,6 +48,7 @@ impl SessionStore {
             markers: Vec::new(),
             sections: Vec::new(),
             mixer_profile: crate::model::MixerProfile::default(),
+            video_canvas: crate::model::VideoCanvas::default(),
         };
         let project = MixProject { session, history: Vec::new(), redo_stack: Vec::new(), chat_messages: Vec::new() };
         self.save(&project)?;
@@ -103,39 +106,24 @@ impl SessionStore {
 
     pub fn create_recording_track(&self, session_id: &str) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
-        let source_id = Uuid::new_v4().to_string();
-        let frames = project.session.sample_rate as u64;
-        let channels = 1_u16;
-        let samples = vec![0.0_f32; frames as usize * channels as usize];
-        let cache_path = self.sources_dir().join(format!("{source_id}.f32cache"));
-        crate::engine::source::cache::write_cache(
-            &cache_path,
-            &crate::engine::source::cache::CacheHeader {
-                channels,
-                sample_rate: project.session.sample_rate,
-                frames,
-            },
-            &samples,
-        )?;
-        let peaks = crate::engine::source::peaks::build_peaks(&samples, channels, project.session.sample_rate);
-        let peak_path = self.peaks_dir().join(format!("{source_id}.peaks.json"));
-        fs::write(
-            &peak_path,
-            serde_json::to_string(&peaks).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        let source = SourceFile {
-            id: source_id.clone(),
-            original_name: "Recording".into(),
-            cache_path: cache_path.to_string_lossy().to_string(),
-            peak_path: peak_path.to_string_lossy().to_string(),
-            duration_samples: frames,
-            sample_rate: project.session.sample_rate,
-            channels,
-            analysis: analyze_samples(&samples, channels, project.session.sample_rate),
-            peak_preview: peaks.preview,
-        };
+        let source = self.create_silent_source(project.session.sample_rate, "Recording")?;
+        let source_id = source.id.clone();
         let track = make_track(source_id, format!("Recording {}", project.session.tracks.len() + 1), project.session.tracks.len());
+        project.session.source_files.push(source);
+        project.session.tracks.push(track);
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    pub fn create_video_track(&self, session_id: &str) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let source = self.create_silent_source(project.session.sample_rate, "Video Placeholder")?;
+        let source_id = source.id.clone();
+        let mut track = make_track(source_id, format!("Video {}", project.session.tracks.len() + 1), project.session.tracks.len());
+        track.kind = TrackKind::Video;
+        track.role = Some("video".into());
+        track.solo = false;
+        track.record_camera_audio = true;
         project.session.source_files.push(source);
         project.session.tracks.push(track);
         self.save(&project)?;
@@ -219,6 +207,55 @@ impl SessionStore {
         Ok(project)
     }
 
+    pub fn add_video_recording_clip(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        video_path: &Path,
+        original_name: String,
+        mime_type: String,
+        start_sample: u64,
+        duration_ms: u64,
+        source_offset_ms: u64,
+    ) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let track = project
+            .session
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        if track.kind != TrackKind::Video {
+            return Err("Record video into a video track.".into());
+        }
+        let source_id = Uuid::new_v4().to_string();
+        let extension = video_path.extension().and_then(|item| item.to_str()).unwrap_or("webm");
+        let destination = self.videos_dir().join(format!("{source_id}.{extension}"));
+        fs::copy(video_path, &destination)
+            .map_err(|error| format!("Could not save video recording: {error}"))?;
+        let source = VideoSourceFile {
+            id: source_id.clone(),
+            original_name: original_name.clone(),
+            path: destination.to_string_lossy().to_string(),
+            mime_type,
+            duration_ms,
+        };
+        let playable_ms = duration_ms.saturating_sub(source_offset_ms).max(1);
+        let duration_samples = ((playable_ms as f64 / 1000.0) * project.session.sample_rate as f64).round() as u64;
+        track.video_clips.push(VideoClipRegion {
+            id: Uuid::new_v4().to_string(),
+            video_source_file_id: source_id.clone(),
+            name: Some(strip_extension(&original_name)),
+            start_sample,
+            end_sample: start_sample + duration_samples.max(1),
+            source_offset_ms,
+            layout: None,
+        });
+        project.session.video_source_files.push(source);
+        self.save(&project)?;
+        Ok(project)
+    }
+
     pub fn delete_clip(&self, session_id: &str, track_id: &str, clip_id: &str) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
         let track_index = project
@@ -272,6 +309,9 @@ impl SessionStore {
             .iter()
             .position(|track| track.id == track_id)
             .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        if project.session.tracks[track_index].kind == crate::model::TrackKind::Video {
+            return self.delete_video_clip_range(session_id, track_id, start_sample, end_sample);
+        }
         if project.session.tracks[track_index].clips.is_empty() {
             let source_id = project.session.tracks[track_index].source_file_id.clone();
             let source = project
@@ -339,6 +379,72 @@ impl SessionStore {
             }],
             HistorySource::User,
             Some("Deleted selected track range".into()),
+        )?;
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    fn delete_video_clip_range(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        start_sample: u64,
+        end_sample: u64,
+    ) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let track_index = project
+            .session
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        let track = &mut project.session.tracks[track_index];
+        let before_clips = track.video_clips.clone();
+        let mut changed = false;
+        let mut next = Vec::with_capacity(track.video_clips.len());
+        for clip in track.video_clips.drain(..) {
+            let clip_start = clip.start_sample;
+            let clip_end = clip.end_sample;
+            if end_sample <= clip_start || start_sample >= clip_end {
+                next.push(clip);
+                continue;
+            }
+            changed = true;
+            if start_sample > clip_start {
+                let mut left = clip.clone();
+                left.end_sample = start_sample.min(clip_end);
+                next.push(left);
+            }
+            if end_sample < clip_end {
+                let mut right = clip;
+                right.id = Uuid::new_v4().to_string();
+                right.start_sample = end_sample;
+                right.source_offset_ms = right
+                    .source_offset_ms
+                    .saturating_add(((end_sample.saturating_sub(clip_start) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64);
+                next.push(right);
+            }
+        }
+        if !changed {
+            return Err("No recorded video clip in selected range.".to_string());
+        }
+        track.video_clips = next;
+        let after_clips = track.video_clips.clone();
+        project.session.tracks[track_index].video_clips = before_clips.clone();
+        record_patch(
+            &mut project,
+            vec![JsonPatchOp {
+                op: "replace".into(),
+                path: format!("/tracks/{track_index}/videoClips"),
+                value: Some(serde_json::json!(after_clips)),
+            }],
+            vec![JsonPatchOp {
+                op: "replace".into(),
+                path: format!("/tracks/{track_index}/videoClips"),
+                value: Some(serde_json::json!(before_clips)),
+            }],
+            HistorySource::User,
+            Some("Deleted selected video range".into()),
         )?;
         self.save(&project)?;
         Ok(project)
@@ -420,6 +526,16 @@ impl SessionStore {
                 .map_err(|e| format!("copy peaks for {}: {e}", src.original_name))?;
             src.peak_path = peak_rel;
         }
+        fs::create_dir_all(bundle_dir.join("videos")).map_err(|error| error.to_string())?;
+        for src in &mut bundled.session.video_source_files {
+            let video_src = PathBuf::from(&src.path);
+            let extension = video_src.extension().and_then(|item| item.to_str()).unwrap_or("webm");
+            let video_rel = format!("videos/{}.{}", src.id, extension);
+            let video_dst = bundle_dir.join(&video_rel);
+            fs::copy(&video_src, &video_dst)
+                .map_err(|e| format!("copy video for {}: {e}", src.original_name))?;
+            src.path = video_rel;
+        }
 
         let manifest = serde_json::json!({
             "version": 1,
@@ -465,6 +581,14 @@ impl SessionStore {
                 .map_err(|e| format!("import peaks for {}: {e}", src.original_name))?;
             src.peak_path = peak_dst.to_string_lossy().to_string();
         }
+        for src in &mut project.session.video_source_files {
+            let video_src = bundle_dir.join(&src.path);
+            let extension = video_src.extension().and_then(|item| item.to_str()).unwrap_or("webm");
+            let video_dst = self.videos_dir().join(format!("{}.{}", src.id, extension));
+            fs::copy(&video_src, &video_dst)
+                .map_err(|e| format!("import video for {}: {e}", src.original_name))?;
+            src.path = video_dst.to_string_lossy().to_string();
+        }
 
         self.save(&project)?;
         Ok(project)
@@ -472,6 +596,10 @@ impl SessionStore {
 
     pub fn renders_dir(&self) -> PathBuf {
         self.data_dir.join("renders")
+    }
+
+    pub fn videos_dir(&self) -> PathBuf {
+        self.data_dir.join("recordings")
     }
 
     fn sessions_dir(&self) -> PathBuf {
@@ -484,6 +612,41 @@ impl SessionStore {
 
     fn peaks_dir(&self) -> PathBuf {
         self.data_dir.join("peaks")
+    }
+
+    fn create_silent_source(&self, sample_rate: u32, original_name: &str) -> Result<SourceFile, String> {
+        let source_id = Uuid::new_v4().to_string();
+        let frames = sample_rate as u64;
+        let channels = 1_u16;
+        let samples = vec![0.0_f32; frames as usize * channels as usize];
+        let cache_path = self.sources_dir().join(format!("{source_id}.f32cache"));
+        crate::engine::source::cache::write_cache(
+            &cache_path,
+            &crate::engine::source::cache::CacheHeader {
+                channels,
+                sample_rate,
+                frames,
+            },
+            &samples,
+        )?;
+        let peaks = crate::engine::source::peaks::build_peaks(&samples, channels, sample_rate);
+        let peak_path = self.peaks_dir().join(format!("{source_id}.peaks.json"));
+        fs::write(
+            &peak_path,
+            serde_json::to_string(&peaks).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(SourceFile {
+            id: source_id,
+            original_name: original_name.into(),
+            cache_path: cache_path.to_string_lossy().to_string(),
+            peak_path: peak_path.to_string_lossy().to_string(),
+            duration_samples: frames,
+            sample_rate,
+            channels,
+            analysis: analyze_samples(&samples, channels, sample_rate),
+            peak_preview: peaks.preview,
+        })
     }
 }
 

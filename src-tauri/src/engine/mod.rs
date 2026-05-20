@@ -28,7 +28,7 @@ use thread::{AudioThreadConfig, AudioThreadDeps, AudioThreadHandle};
 
 use crate::model::MixSession;
 
-const COMMAND_QUEUE_CAPACITY: usize = 4096;
+const COMMAND_QUEUE_CAPACITY: usize = 65536;
 
 /// Top-level engine handle used by the UI / Tauri command surface.
 pub struct AudioEngine {
@@ -88,25 +88,19 @@ impl AudioEngine {
 
     pub fn play(&mut self, session_id: String) {
         self.playing_session = Some(session_id);
-        self.send(EngineCommand::Play);
         if let Some(thread) = self.audio_thread.as_ref() {
             thread.start();
         }
+        self.send(EngineCommand::Play);
     }
 
     pub fn pause(&mut self) {
         self.send(EngineCommand::Pause);
-        if let Some(thread) = self.audio_thread.as_ref() {
-            thread.stop();
-        }
     }
 
     pub fn stop(&mut self) {
         self.send(EngineCommand::Stop);
         self.playing_session = None;
-        if let Some(thread) = self.audio_thread.as_ref() {
-            thread.stop();
-        }
     }
 
     pub fn seek(&mut self, sample: u64) {

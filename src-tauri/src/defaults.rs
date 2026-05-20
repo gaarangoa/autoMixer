@@ -2,7 +2,7 @@ use uuid::Uuid;
 
 use crate::model::{
     CompressorState, EqBand, EqBandType, FilterState, LimiterState, MasterChannel, Sends, Track,
-    TrackChain,
+    TrackChain, TrackKind,
 };
 
 const COLORS: [&str; 7] = [
@@ -49,6 +49,7 @@ pub fn default_master() -> MasterChannel {
 pub fn make_track(source_file_id: String, name: String, index: usize) -> Track {
     Track {
         id: Uuid::new_v4().to_string(),
+        kind: TrackKind::Audio,
         name: name.clone(),
         role: infer_role(&name),
         source_file_id,
@@ -63,6 +64,9 @@ pub fn make_track(source_file_id: String, name: String, index: usize) -> Track {
         sends: Sends { reverb_db: -60.0, delay_db: -60.0 },
         automation: Vec::new(),
         clips: Vec::new(),
+        video_clips: Vec::new(),
+        camera_device_id: None,
+        record_camera_audio: false,
     }
 }
 

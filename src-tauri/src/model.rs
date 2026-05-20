@@ -32,6 +32,16 @@ pub struct SourceFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoSourceFile {
+    pub id: Id,
+    pub original_name: String,
+    pub path: String,
+    pub mime_type: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EqBandType {
     LowShelf,
@@ -142,8 +152,86 @@ pub struct ClipRegion {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VideoClipRegion {
+    pub id: Id,
+    pub video_source_file_id: Id,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    #[serde(default)]
+    pub source_offset_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<VideoLayout>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoLayout {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub crop_top: f32,
+    pub crop_right: f32,
+    pub crop_bottom: f32,
+    pub crop_left: f32,
+    pub opacity: f32,
+    pub rotation: f32,
+    pub z_index: i32,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub blur: f32,
+    pub preset: VideoFilterPreset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoCanvas {
+    pub width: u32,
+    pub height: u32,
+    pub background: String,
+}
+
+impl Default for VideoCanvas {
+    fn default() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            background: "#000000".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoFilterPreset {
+    None,
+    Warm,
+    Cool,
+    Mono,
+    Punch,
+    Dream,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TrackKind {
+    Audio,
+    Video,
+}
+
+fn default_track_kind() -> TrackKind {
+    TrackKind::Audio
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Track {
     pub id: Id,
+    #[serde(default = "default_track_kind")]
+    pub kind: TrackKind,
     pub name: String,
     pub role: Option<String>,
     pub source_file_id: Id,
@@ -159,6 +247,12 @@ pub struct Track {
     pub sends: Sends,
     pub automation: Vec<AutomationLane>,
     pub clips: Vec<ClipRegion>,
+    #[serde(default)]
+    pub video_clips: Vec<VideoClipRegion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_device_id: Option<String>,
+    #[serde(default)]
+    pub record_camera_audio: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +348,8 @@ pub struct MixSession {
     pub sample_rate: u32,
     pub bpm: Option<f32>,
     pub source_files: Vec<SourceFile>,
+    #[serde(default)]
+    pub video_source_files: Vec<VideoSourceFile>,
     pub tracks: Vec<Track>,
     pub buses: Vec<Bus>,
     pub master: MasterChannel,
@@ -263,6 +359,8 @@ pub struct MixSession {
     pub sections: Vec<MixSection>,
     #[serde(default)]
     pub mixer_profile: MixerProfile,
+    #[serde(default)]
+    pub video_canvas: VideoCanvas,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

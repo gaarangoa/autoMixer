@@ -95,7 +95,16 @@ fn run_audio_thread(deps: AudioThreadDeps, control_rx: Receiver<ControlMessage>)
         }
     };
 
-    let mut running = false;
+    let mut running = match stream.play() {
+        Ok(()) => {
+            shared.running.store(false, Ordering::Relaxed);
+            true
+        }
+        Err(error) => {
+            eprintln!("[engine] initial stream.play failed: {error}");
+            false
+        }
+    };
     loop {
         match control_rx.recv() {
             Ok(ControlMessage::Start) => {
@@ -109,11 +118,7 @@ fn run_audio_thread(deps: AudioThreadDeps, control_rx: Receiver<ControlMessage>)
                 }
             }
             Ok(ControlMessage::Stop) => {
-                if running {
-                    let _ = stream.pause();
-                    running = false;
-                    shared.running.store(false, Ordering::Relaxed);
-                }
+                shared.running.store(false, Ordering::Relaxed);
             }
             Ok(ControlMessage::Shutdown) | Err(_) => {
                 let _ = stream.pause();
