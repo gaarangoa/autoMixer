@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AbJudgeResponse, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog } from "../../shared/types";
+import type { AbJudgeResponse, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog } from "../../shared/types";
 
 function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {
@@ -12,6 +12,7 @@ function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
 export type PlayheadEvent = { sample: number; running: boolean };
 export type MetersEvent = { masterPeak: number; trackPeaks: number[] };
 export type AudioProgressEvent = { stage: string; message: string; elapsedSeconds: number };
+export type AgentVideoProgressEvent = { stage: string; message: string; current: number; total: number; elapsedSeconds: number };
 export type LlmChunkEvent = { phase: string; text: string };
 export type LlmStatsEvent = { phase: string; promptTokens: number; responseTokens: number; elapsedMs: number };
 
@@ -71,6 +72,12 @@ export const api = {
     tauriInvoke<MixProject>("save_video_recording", { sessionId, trackId, fileName, mimeType, startSample, durationMs, dataBase64, createAudioTrack, sourceOffsetMs }),
   renderVideoMix: (sessionId: string, outputPath: string, startSample?: number, endSample?: number, trackIds?: string[]) =>
     tauriInvoke<{ path: string }>("render_video_mix", { sessionId, outputPath, startSample, endSample, trackIds }),
+  exportRenderedVideo: (sourcePath: string, outputPath: string) =>
+    tauriInvoke<{ path: string }>("export_rendered_video", { sourcePath, outputPath }),
+  renderAutoVideoEdit: (sessionId: string, outputPath: string, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number) =>
+    tauriInvoke<{ path: string }>("render_auto_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds }),
+  renderAgentVideoEdit: (sessionId: string, outputPath: string, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number, ollamaBaseUrl: string, visionModel: string, editModel: string, instructions: string) =>
+    tauriInvoke<{ path: string; script: AgentVideoScriptEntry[] }>("render_agent_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds, ollamaBaseUrl, visionModel, editModel, instructions }),
   judgeMixAb: (sessionId: string, apiKey: string, model = "gemini-flash-latest") =>
     tauriInvoke<AbJudgeResponse>("judge_mix_ab", { sessionId, options: { provider: "gemini", model, apiKey } }),
   judgeMixAbLocal: (sessionId: string) =>
@@ -78,6 +85,8 @@ export const api = {
   analyzeMasterStructure: (sessionId: string) => tauriInvoke<MixProject>("analyze_master_structure", { sessionId }),
   onAudioProgress: (cb: (event: AudioProgressEvent) => void): Promise<UnlistenFn> =>
     listen<AudioProgressEvent>("audio:progress", e => cb(e.payload)),
+  onAgentVideoProgress: (cb: (event: AgentVideoProgressEvent) => void): Promise<UnlistenFn> =>
+    listen<AgentVideoProgressEvent>("agent-video:progress", e => cb(e.payload)),
   onLlmChunk: (cb: (event: LlmChunkEvent) => void): Promise<UnlistenFn> =>
     listen<LlmChunkEvent>("llm:chunk", e => cb(e.payload)),
   onLlmStats: (cb: (event: LlmStatsEvent) => void): Promise<UnlistenFn> =>

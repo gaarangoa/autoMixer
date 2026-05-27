@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Camera, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Settings, Square, Trash2, Upload, Video } from "lucide-react";
-import type { AbJudgeResponse, AssistantResponse, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoLayout } from "../../shared/types";
+import type { AbJudgeResponse, AgentVideoScriptEntry, AssistantResponse, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -9,6 +9,7 @@ import { api } from "./api";
 
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "gpt-oss:20b";
+const DEFAULT_AGENT_VIDEO_MODEL = "qwen2.5vl:latest";
 
 type CameraPreviewTrack = {
   id: string;
@@ -48,6 +49,13 @@ type CameraPreviewPayload = {
   canvas: VideoCanvas;
 };
 
+type VideoEditorWindowPayload = {
+  sessionId: string;
+  trackIds: string[];
+  range?: { start: number; end: number };
+  playhead: number;
+};
+
 type CameraCanvasLayerModel = {
   id: string;
   track: CameraPreviewTrack;
@@ -56,9 +64,36 @@ type CameraCanvasLayerModel = {
   live: boolean;
 };
 
+type VideoEditHistoryItem = {
+  id: string;
+  createdAt: string;
+  outputPath: string;
+  visionModel: string;
+  editModel: string;
+  intervalSeconds: number;
+  instructions: string;
+  script: AgentVideoScriptEntry[];
+};
+
+type VideoChatMessage = {
+  role: "user" | "agent" | "system";
+  text: string;
+  createdAt: string;
+};
+
+type MainVideoEdit = {
+  script: AgentVideoScriptEntry[];
+  outputPath?: string;
+  createdAt?: string;
+  rangeStartSeconds?: number;
+};
+
 export function App() {
   const initialOllamaUrlRef = useRef(localStorage.getItem("autoMixer.ollamaUrl"));
   const initialOllamaModelRef = useRef(localStorage.getItem("autoMixer.ollamaModel"));
+  const initialAgentVideoModelRef = useRef(localStorage.getItem("autoMixer.agentVideoModel"));
+  const initialAgentVideoEditModelRef = useRef(localStorage.getItem("autoMixer.agentVideoEditModel"));
+  const initialAgentVideoInstructionsRef = useRef(localStorage.getItem("autoMixer.agentVideoInstructions"));
   const initialGeminiKeyRef = useRef(localStorage.getItem("autoMixer.geminiApiKey"));
   const playStartedAtRef = useRef(0);
   const pausedAtRef = useRef(0);
@@ -66,6 +101,7 @@ export function App() {
   const togglePlayRef = useRef<() => void | Promise<void>>(() => undefined);
   const videoRecordersRef = useRef<Record<string, { recorder: MediaRecorder; stream: MediaStream; previewElement: HTMLVideoElement; chunks: Blob[]; startSample: number; startedAt: number; mimeType: string; createAudioTrack: boolean; transportOffsetMs: number }>>({});
   const cameraPreviewWindowRef = useRef<WebviewWindow | null>(null);
+  const videoEditorWindowRef = useRef<WebviewWindow | null>(null);
   const trackLanesRef = useRef<HTMLDivElement>(null);
   const [project, setProject] = useState<MixProject>();
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
@@ -103,6 +139,19 @@ export function App() {
   const [renameDraft, setRenameDraft] = useState<string | null>(null);
   const [newDraft, setNewDraft] = useState<string | null>(null);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; message: string; elapsedSeconds: number } | null>(null);
+  const [videoEditorOpen, setVideoEditorOpen] = useState(false);
+  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("1");
+  const [agentVideoModel, setAgentVideoModel] = useState(() => initialAgentVideoModelRef.current ?? DEFAULT_AGENT_VIDEO_MODEL);
+  const [agentVideoEditModel, setAgentVideoEditModel] = useState(() => initialAgentVideoEditModelRef.current ?? initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
+  const [agentVideoInstructions, setAgentVideoInstructions] = useState(() => initialAgentVideoInstructionsRef.current ?? "");
+  const [agentEditStatus, setAgentEditStatus] = useState<string | null>(null);
+  const [agentEditProgress, setAgentEditProgress] = useState<{ stage: string; message: string; current: number; total: number; elapsedSeconds: number } | null>(null);
+  const [agentEditScript, setAgentEditScript] = useState<AgentVideoScriptEntry[]>([]);
+  const [, setMainVideoEdit] = useState<MainVideoEdit>({ script: [] });
+  const [videoEditHistory, setVideoEditHistory] = useState<VideoEditHistoryItem[]>([]);
+  const [videoChatMessages, setVideoChatMessages] = useState<VideoChatMessage[]>([]);
+  const [videoChatDraft, setVideoChatDraft] = useState("");
+  const [videoHistoryLoadedSessionId, setVideoHistoryLoadedSessionId] = useState<string | null>(null);
   const [scopedSection, setScopedSection] = useState<{ index: number; start: number; end: number; label: string } | null>(null);
   const [loopSection, setLoopSection] = useState<{ start: number; end: number } | null>(null);
   const [profilePresets, setProfilePresets] = useState<ProfilePreset[]>([]);
@@ -218,6 +267,19 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void api.onAgentVideoProgress((event) => {
+      setAgentEditProgress(event);
+      setAgentEditStatus(event.message);
+      if (event.stage === "done" || event.stage === "error") {
+        setTimeout(() => setAgentEditProgress(null), 6000);
+      }
+    }).then((fn) => { if (cancelled) fn(); else unlisten = fn; });
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
     const unlisteners: (() => void)[] = [];
     const reg = (p: Promise<() => void>) => {
       void p.then((fn) => { if (cancelled) fn(); else unlisteners.push(fn); });
@@ -294,6 +356,59 @@ export function App() {
     localStorage.setItem("autoMixer.ollamaModel", ollamaModel);
     setModelOptions((items) => items.includes(ollamaModel) ? items : [...items, ollamaModel]);
   }, [ollamaModel]);
+
+  useEffect(() => {
+    localStorage.setItem("autoMixer.agentVideoModel", agentVideoModel);
+    setModelOptions((items) => items.includes(agentVideoModel) ? items : [...items, agentVideoModel]);
+  }, [agentVideoModel]);
+
+  useEffect(() => {
+    localStorage.setItem("autoMixer.agentVideoEditModel", agentVideoEditModel);
+    setModelOptions((items) => items.includes(agentVideoEditModel) ? items : [...items, agentVideoEditModel]);
+  }, [agentVideoEditModel]);
+
+  useEffect(() => {
+    localStorage.setItem("autoMixer.agentVideoInstructions", agentVideoInstructions);
+  }, [agentVideoInstructions]);
+
+  useEffect(() => {
+    if (!session) return;
+    setVideoHistoryLoadedSessionId(null);
+    const raw = localStorage.getItem(`autoMixer.videoEditHistory.${session.id}`);
+    if (!raw) {
+      setVideoEditHistory([]);
+      setVideoChatMessages([]);
+      setMainVideoEdit({ script: [] });
+      setVideoHistoryLoadedSessionId(session.id);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as { history?: VideoEditHistoryItem[]; chat?: VideoChatMessage[] } | VideoEditHistoryItem[];
+      if (Array.isArray(parsed)) {
+        setVideoEditHistory(parsed);
+        setVideoChatMessages([]);
+        setMainVideoEdit(parsed[0] ? { script: parsed[0].script, outputPath: parsed[0].outputPath, createdAt: parsed[0].createdAt } : { script: [] });
+      } else {
+        const history = Array.isArray(parsed.history) ? parsed.history : [];
+        setVideoEditHistory(history);
+        setVideoChatMessages(Array.isArray(parsed.chat) ? parsed.chat : []);
+        setMainVideoEdit(history[0] ? { script: history[0].script, outputPath: history[0].outputPath, createdAt: history[0].createdAt } : { script: [] });
+      }
+    } catch {
+      setVideoEditHistory([]);
+      setVideoChatMessages([]);
+      setMainVideoEdit({ script: [] });
+    }
+    setVideoHistoryLoadedSessionId(session.id);
+  }, [session?.id]);
+
+  useEffect(() => {
+    if (!session || videoHistoryLoadedSessionId !== session.id) return;
+    localStorage.setItem(
+      `autoMixer.videoEditHistory.${session.id}`,
+      JSON.stringify({ history: videoEditHistory.slice(0, 20), chat: videoChatMessages.slice(-80) })
+    );
+  }, [session?.id, videoHistoryLoadedSessionId, videoEditHistory, videoChatMessages]);
 
   useEffect(() => {
     localStorage.setItem("autoMixer.geminiApiKey", geminiApiKey);
@@ -426,44 +541,7 @@ export function App() {
 
   useEffect(() => {
     if (!session) return;
-    const videoSourceById = new Map((session.videoSourceFiles ?? []).map((source) => [source.id, source]));
-    const tracks = session.tracks
-      .filter((track) => track.kind === "video" && selectedTrackIds.includes(track.id))
-      .map((track, trackIndex) => {
-        const deviceId = trackCameraDevices[track.id] ?? track.cameraDeviceId ?? "";
-        const device = cameraDevices.find((item) => item.deviceId === deviceId);
-        const clips = (track.videoClips ?? []).flatMap((clip) => {
-          const source = videoSourceById.get(clip.videoSourceFileId);
-          if (!source) return [];
-          return [{
-            id: clip.id,
-            name: clip.name ?? source.originalName,
-            src: source.path,
-            startSeconds: clip.startSample / session.sampleRate,
-            endSeconds: clip.endSample / session.sampleRate,
-            localTime: Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000 + playhead - (clip.startSample / session.sampleRate)),
-            layout: normalizeVideoLayout(clip.layout, trackIndex),
-          }];
-        });
-        const activeClip = clips.find((clip) => playhead >= clip.startSeconds && playhead <= clip.endSeconds);
-        return {
-          id: track.id,
-          name: track.name,
-          color: track.color,
-          deviceId,
-          deviceLabel: device?.label || "Default camera",
-          armed: armedVideoTrackIds.includes(track.id),
-          recording: videoRecordingTrackIds.includes(track.id),
-          transportPlaying: playing,
-          activeClip,
-          defaultLayout: defaultVideoLayout(trackIndex),
-        };
-      });
-    if (tracks.length > 0) {
-      void openCameraPreviewWindow(tracks, false);
-    } else {
-      void updateCameraPreviewWindow([]);
-    }
+    void updateCameraPreviewWindow(buildCameraPreviewTracks());
   }, [session, selectedTrackIds.join("|"), JSON.stringify(trackCameraDevices), cameraDevices.length, armedVideoTrackIds.join("|"), videoRecordingTrackIds.join("|"), playing, Math.round(playhead * 5)]);
 
   useEffect(() => {
@@ -766,7 +844,7 @@ export function App() {
     try {
       const result = await api.ollamaModels(ollamaUrl);
       const models = result.models.filter(Boolean);
-      setModelOptions(models.includes(ollamaModel) ? models : [...models, ollamaModel]);
+      setModelOptions(Array.from(new Set([...models, ollamaModel, agentVideoModel, agentVideoEditModel])));
       setModelStatus(`${models.length} model${models.length === 1 ? "" : "s"}`);
     } catch (error) {
       setModelStatus(error instanceof Error ? error.message : "Could not reach Ollama");
@@ -844,6 +922,43 @@ export function App() {
     }
   }
 
+  function buildCameraPreviewTracks() {
+    if (!session) return [];
+    const videoSourceById = new Map((session.videoSourceFiles ?? []).map((source) => [source.id, source]));
+    return session.tracks
+      .filter((track) => track.kind === "video" && selectedTrackIds.includes(track.id))
+      .map((track, trackIndex) => {
+        const deviceId = trackCameraDevices[track.id] ?? track.cameraDeviceId ?? "";
+        const device = cameraDevices.find((item) => item.deviceId === deviceId);
+        const clips = (track.videoClips ?? []).flatMap((clip) => {
+          const source = videoSourceById.get(clip.videoSourceFileId);
+          if (!source) return [];
+          return [{
+            id: clip.id,
+            name: clip.name ?? source.originalName,
+            src: source.path,
+            startSeconds: clip.startSample / session.sampleRate,
+            endSeconds: clip.endSample / session.sampleRate,
+            localTime: Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000 + playhead - (clip.startSample / session.sampleRate)),
+            layout: normalizeVideoLayout(clip.layout, trackIndex),
+          }];
+        });
+        const activeClip = clips.find((clip) => playhead >= clip.startSeconds && playhead <= clip.endSeconds);
+        return {
+          id: track.id,
+          name: track.name,
+          color: track.color,
+          deviceId,
+          deviceLabel: device?.label || "Default camera",
+          armed: armedVideoTrackIds.includes(track.id),
+          recording: videoRecordingTrackIds.includes(track.id),
+          transportPlaying: playing,
+          activeClip,
+          defaultLayout: defaultVideoLayout(trackIndex),
+        };
+      });
+  }
+
   async function openCameraPreviewWindow(tracks: CameraPreviewTrack[], force = true) {
     try {
       let preview = await WebviewWindow.getByLabel("camera-preview");
@@ -887,6 +1002,60 @@ export function App() {
       tracks,
       canvas: normalizeVideoCanvas(session?.videoCanvas),
     } satisfies CameraPreviewPayload).catch(() => undefined);
+  }
+
+  function videoEditorPayload(): VideoEditorWindowPayload | undefined {
+    if (!session) return undefined;
+    return {
+      sessionId: session.id,
+      trackIds: selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video")),
+      range: selectedRange ? {
+        start: Math.max(0, Math.min(selectedRange.start, selectedRange.end)),
+        end: Math.max(0, Math.max(selectedRange.start, selectedRange.end)),
+      } : undefined,
+      playhead,
+    };
+  }
+
+  async function openVideoEditorWindow() {
+    const payload = videoEditorPayload();
+    if (!payload) return;
+    try {
+      const query = new URLSearchParams({ videoEditor: "1", sessionId: payload.sessionId });
+      if (payload.trackIds.length > 0) query.set("trackIds", payload.trackIds.join(","));
+      if (payload.range) {
+        query.set("start", String(payload.range.start));
+        query.set("end", String(payload.range.end));
+      }
+      let editor = await WebviewWindow.getByLabel("video-editor");
+      if (!editor) {
+        editor = new WebviewWindow("video-editor", {
+          url: `/?${query.toString()}`,
+          title: "AutoMixer Video Editor",
+          width: 1280,
+          height: 820,
+          minWidth: 900,
+          minHeight: 560,
+          resizable: true,
+          center: true,
+        });
+        videoEditorWindowRef.current = editor;
+        const createdEditor = editor;
+        createdEditor.once("tauri://created", () => {
+          void createdEditor.emit("video-editor:update", payload);
+        });
+        createdEditor.once("tauri://error", (event) => {
+          pushSystem(`Could not open video editor window: ${String(event.payload)}`);
+        });
+      } else {
+        videoEditorWindowRef.current = editor;
+        await editor.emit("video-editor:update", payload).catch(() => undefined);
+      }
+      await editor.show().catch(() => undefined);
+      await editor.setFocus().catch(() => undefined);
+    } catch (error) {
+      pushSystem(error);
+    }
   }
 
   async function startVideoRecordingsAt(startSeconds: number) {
@@ -1010,27 +1179,13 @@ export function App() {
     setProject(updated);
   }
 
-  function selectTrack(trackId: string, event?: React.MouseEvent) {
-    if (!session) return;
+  function toggleTrackSelection(trackId: string) {
     setSelectedClip(undefined);
     setSelectedRange(undefined);
     setSelectedTrackIds((current) => {
-      if (event?.shiftKey && current.length > 0) {
-        const anchor = current[current.length - 1];
-        const anchorIndex = session.tracks.findIndex((track) => track.id === anchor);
-        const targetIndex = session.tracks.findIndex((track) => track.id === trackId);
-        if (anchorIndex !== -1 && targetIndex !== -1) {
-          const [start, end] = [anchorIndex, targetIndex].sort((a, b) => a - b);
-          return session.tracks.slice(start, end + 1).map((track) => track.id);
-        }
-      }
-      if (event?.metaKey || event?.ctrlKey) {
-        return current.includes(trackId)
-          ? current.filter((id) => id !== trackId)
-          : [...current, trackId];
-      }
-      if (!event && current.includes(trackId)) return current;
-      return [trackId];
+      return current.includes(trackId)
+        ? current.filter((id) => id !== trackId)
+        : [...current, trackId];
     });
   }
 
@@ -1821,6 +1976,119 @@ export function App() {
     }
   }
 
+  async function renderAutoVideoEdit() {
+    if (!session) return;
+    const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video"));
+    if (selectedVideoTrackIds.length === 0) {
+      pushSystem("Select one or more video tracks before running Auto Video Edit.");
+      return;
+    }
+    const intervalText = window.prompt("Cut/sample interval in seconds", "1");
+    if (intervalText === null) return;
+    const sampleIntervalSeconds = Number(intervalText);
+    if (!Number.isFinite(sampleIntervalSeconds) || sampleIntervalSeconds <= 0) {
+      pushSystem("Use a positive number for the Auto Video Edit interval.");
+      return;
+    }
+    const range = selectedRange
+      ? {
+          startSample: Math.round(Math.max(0, Math.min(selectedRange.start, selectedRange.end)) * session.sampleRate),
+          endSample: Math.round(Math.max(0, Math.max(selectedRange.start, selectedRange.end)) * session.sampleRate),
+        }
+      : undefined;
+    const outputPath = await save({
+      defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}_auto_edit.mp4`,
+      filters: [{ name: "MP4", extensions: ["mp4"] }]
+    });
+    if (!outputPath) return;
+    setBusy(true);
+    try {
+      await api.renderAutoVideoEdit(session.id, outputPath, range?.startSample, range?.endSample, selectedVideoTrackIds, sampleIntervalSeconds);
+      const rangeText = range ? ` (${formatTime(range.startSample / session.sampleRate)}-${formatTime(range.endSample / session.sampleRate)})` : "";
+      setMessages((items) => [...items, { role: "system", text: `Auto Video Edit rendered ${selectedVideoTrackIds.length} selected track${selectedVideoTrackIds.length === 1 ? "" : "s"} every ${sampleIntervalSeconds}s${rangeText} ${outputPath}` }]);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function renderAgentVideoEdit(sampleIntervalSeconds: number) {
+    if (!session) return;
+    const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video"));
+    if (selectedVideoTrackIds.length === 0) {
+      pushSystem("Select one or more video tracks before running Agent Video Edit.");
+      setAgentEditStatus("Select one or more video tracks first.");
+      return;
+    }
+    if (!Number.isFinite(sampleIntervalSeconds) || sampleIntervalSeconds <= 0) {
+      pushSystem("Use a positive number for the Agent Video Edit interval.");
+      setAgentEditStatus("Use a positive interval.");
+      return;
+    }
+    const visionModel = agentVideoModel.trim() || DEFAULT_AGENT_VIDEO_MODEL;
+    const editModel = agentVideoEditModel.trim() || ollamaModel.trim() || DEFAULT_OLLAMA_MODEL;
+    const range = selectedRange
+      ? {
+          startSample: Math.round(Math.max(0, Math.min(selectedRange.start, selectedRange.end)) * session.sampleRate),
+          endSample: Math.round(Math.max(0, Math.max(selectedRange.start, selectedRange.end)) * session.sampleRate),
+        }
+      : undefined;
+    const outputPath = await save({
+      defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}_agent_edit.mp4`,
+      filters: [{ name: "MP4", extensions: ["mp4"] }]
+    });
+    if (!outputPath) return;
+    setBusy(true);
+    setAgentEditScript([]);
+    setAgentEditProgress({ stage: "starting", message: "Starting Agent Video Edit...", current: 0, total: 1, elapsedSeconds: 0 });
+    setAgentEditStatus(`Running ${visionModel} for vision and ${editModel} for edit decisions...`);
+    try {
+      const result = await api.renderAgentVideoEdit(session.id, outputPath, range?.startSample, range?.endSample, selectedVideoTrackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, agentVideoInstructions.trim());
+      const rangeText = range ? ` (${formatTime(range.startSample / session.sampleRate)}-${formatTime(range.endSample / session.sampleRate)})` : "";
+      setAgentEditScript(result.script);
+      setVideoEditHistory((items) => [{
+        id: `${Date.now()}`,
+        createdAt: new Date().toISOString(),
+        outputPath,
+        visionModel,
+        editModel,
+        intervalSeconds: sampleIntervalSeconds,
+        instructions: agentVideoInstructions.trim(),
+        script: result.script,
+      }, ...items].slice(0, 20));
+      setVideoChatMessages((items) => [...items, {
+        role: "agent",
+        text: `Rendered ${result.script.length} decisions with ${visionModel} + ${editModel}${rangeText}.`,
+        createdAt: new Date().toISOString(),
+      }]);
+      setMessages((items) => [...items, { role: "system", text: `Agent Video Edit rendered with vision ${visionModel} and edit ${editModel} every ${sampleIntervalSeconds}s${rangeText} ${result.path}` }]);
+      setAgentEditStatus(`Done: ${result.path}`);
+    } catch (error) {
+      pushSystem(error);
+      setAgentEditStatus(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function sendVideoEditorChat() {
+    const text = videoChatDraft.trim();
+    if (!text) return;
+    const now = new Date().toISOString();
+    setVideoChatMessages((items) => [
+      ...items,
+      { role: "user", text, createdAt: now },
+      {
+        role: "agent",
+        text: "Added to the edit guidelines. Run Agent Edit again to apply it to the script and export.",
+        createdAt: now,
+      },
+    ]);
+    setAgentVideoInstructions((current) => current.trim() ? `${current.trim()}\n${text}` : text);
+    setVideoChatDraft("");
+  }
+
   function pushSystem(error: unknown) {
     let text: string;
     if (error instanceof Error) text = error.message;
@@ -1842,6 +2110,20 @@ export function App() {
       </main>
     );
   }
+
+  const selectedVideoTrackIdsForEditor = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video"));
+  const selectedVideoTracksForEditor = session.tracks.filter((track) => track.kind === "video" && selectedVideoTrackIdsForEditor.includes(track.id));
+  const audioTrackCountForEditor = session.tracks.filter((track) => track.kind !== "video").length;
+  const videoEditorScript = agentEditScript.length > 0 ? agentEditScript : videoEditHistory[0]?.script ?? [];
+  const rangeStartSeconds = selectedRange ? Math.max(0, Math.min(selectedRange.start, selectedRange.end)) : 0;
+  const explicitRangeEndSeconds = selectedRange ? Math.max(0, Math.max(selectedRange.start, selectedRange.end)) : 0;
+  const scriptEndSeconds = Math.max(0, ...videoEditorScript.map((entry) => entry.endSeconds));
+  const clipEndSeconds = Math.max(0, ...selectedVideoTracksForEditor.flatMap((track) => (track.videoClips ?? []).map((clip) => clip.endSample / session.sampleRate)));
+  const videoEditorStartSeconds = selectedRange ? rangeStartSeconds : 0;
+  const videoEditorEndSeconds = Math.max(selectedRange ? explicitRangeEndSeconds : duration, scriptEndSeconds, clipEndSeconds, 1);
+  const videoEditorSpanSeconds = Math.max(1, videoEditorEndSeconds - videoEditorStartSeconds);
+  const videoCanvas = normalizeVideoCanvas(session.videoCanvas);
+
   return (
     <main className="app">
       <section className="mix">
@@ -1986,7 +2268,12 @@ export function App() {
               <span>A/B</span>
             </button>
             <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={18} /></button>
-            <button onClick={() => void renderCurrentVideo()} title="Export MP4"><Video size={18} /></button>
+            <button
+              onClick={() => void openVideoEditorWindow()}
+              title="Open Video Editor"
+            >
+              <Video size={18} />
+            </button>
             <button className="upload" onClick={() => void importFiles()} title="Import audio">
               <Upload size={18} />
             </button>
@@ -2003,6 +2290,257 @@ export function App() {
             {analysisProgress.elapsedSeconds > 0 ? (
               <span className="progress-banner-time">{Math.round(analysisProgress.elapsedSeconds)}s</span>
             ) : null}
+          </div>
+        ) : null}
+
+        {videoEditorOpen ? (
+          <div className="video-editor-shell">
+            <div className="video-editor-head">
+              <div>
+                <strong>Video Editor</strong>
+                <span>
+                  {selectedVideoTracksForEditor.length} video track{selectedVideoTracksForEditor.length === 1 ? "" : "s"} selected
+                  {selectedRange ? ` · ${formatTime(videoEditorStartSeconds)}-${formatTime(videoEditorEndSeconds)}` : " · full timeline"}
+                </span>
+              </div>
+              <div className="video-editor-actions">
+                <button type="button" onClick={() => void openCameraPreviewWindow(buildCameraPreviewTracks(), true)} disabled={selectedVideoTracksForEditor.length === 0}>
+                  Show Canvas Preview
+                </button>
+                <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
+                  <Download size={15} /> Export MP4
+                </button>
+                <button type="button" onClick={() => void renderAutoVideoEdit()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
+                  Quick Edit
+                </button>
+                <button type="button" className="primary" onClick={() => void renderAgentVideoEdit(Number(agentIntervalSeconds))} disabled={busy || selectedVideoTracksForEditor.length === 0}>
+                  Run Agent Edit
+                </button>
+                <button type="button" className="video-editor-close" onClick={() => setVideoEditorOpen(false)}>×</button>
+              </div>
+            </div>
+
+            <div className="video-editor-body">
+              <section className="video-editor-main">
+                <div className="video-editor-canvas">
+                  <div className="video-editor-canvas-frame" style={{ aspectRatio: `${videoCanvas.width} / ${videoCanvas.height}`, background: videoCanvas.background }}>
+                    {selectedVideoTracksForEditor.length === 0 ? (
+                      <span>Select video tracks to edit.</span>
+                    ) : videoEditorScript.find((entry) => entry.chosenTrackName) ? (
+                      <div className="video-editor-program">
+                        <Video size={38} />
+                        <strong>{videoEditorScript.find((entry) => entry.chosenTrackName)?.chosenTrackName}</strong>
+                        <span>{videoEditorScript.length} agent decisions on the timeline</span>
+                      </div>
+                    ) : (
+                      <div className="video-editor-program">
+                        <Video size={38} />
+                        <strong>{videoCanvas.width}×{videoCanvas.height}</strong>
+                        <span>Run the agent to build the edit script.</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="video-editor-timeline">
+                  <div className="video-editor-ruler">
+                    <span>{formatTime(videoEditorStartSeconds)}</span>
+                    <span>{formatTime(videoEditorStartSeconds + videoEditorSpanSeconds / 2)}</span>
+                    <span>{formatTime(videoEditorEndSeconds)}</span>
+                  </div>
+                  <div className="video-editor-row agent-row">
+                    <div className="video-editor-row-label">Agent cuts</div>
+                    <div className="video-editor-row-lane">
+                      {videoEditorScript.length === 0 ? <span className="video-editor-empty">No agent decisions yet</span> : null}
+                      {videoEditorScript.map((entry) => {
+                        const startPct = Math.max(0, Math.min(100, ((entry.startSeconds - videoEditorStartSeconds) / videoEditorSpanSeconds) * 100));
+                        const endPct = Math.max(startPct + 0.4, Math.min(100, ((entry.endSeconds - videoEditorStartSeconds) / videoEditorSpanSeconds) * 100));
+                        return (
+                          <button
+                            type="button"
+                            className={`video-editor-event ${entry.chosenTrackName ? "" : "black"}`}
+                            key={`event-${entry.windowIndex}-${entry.startSeconds}`}
+                            style={{ left: `${startPct}%`, width: `${Math.max(0.8, endPct - startPct)}%` }}
+                            title={`${formatTime(entry.startSeconds)}-${formatTime(entry.endSeconds)} ${entry.chosenTrackName ?? "black"}`}
+                            onClick={() => seekTo(entry.startSeconds)}
+                          >
+                            {entry.chosenTrackName ?? "black"}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="video-editor-row audio-row">
+                    <div className="video-editor-row-label">Audio mix</div>
+                    <div className="video-editor-row-lane">
+                      <div className="video-editor-audio-bed">
+                        <span>{audioTrackCountForEditor} audio track{audioTrackCountForEditor === 1 ? "" : "s"} in export mix</span>
+                      </div>
+                    </div>
+                  </div>
+                  {selectedVideoTracksForEditor.map((track) => (
+                    <div className="video-editor-row" key={`editor-track-${track.id}`}>
+                      <div className="video-editor-row-label">{track.name}</div>
+                      <div className="video-editor-row-lane">
+                        {(track.videoClips ?? []).map((clip) => {
+                          const clipStart = clip.startSample / session.sampleRate;
+                          const clipEnd = clip.endSample / session.sampleRate;
+                          if (clipEnd < videoEditorStartSeconds || clipStart > videoEditorEndSeconds) return null;
+                          const startPct = Math.max(0, Math.min(100, ((clipStart - videoEditorStartSeconds) / videoEditorSpanSeconds) * 100));
+                          const endPct = Math.max(startPct + 0.6, Math.min(100, ((clipEnd - videoEditorStartSeconds) / videoEditorSpanSeconds) * 100));
+                          return (
+                            <button
+                              type="button"
+                              className="video-editor-clip"
+                              key={clip.id}
+                              style={{ left: `${startPct}%`, width: `${Math.max(1, endPct - startPct)}%`, borderColor: track.color }}
+                              onClick={() => {
+                                setSelectedClip({ trackId: track.id, clipId: clip.id });
+                                seekTo(clipStart);
+                              }}
+                            >
+                              {clip.name ?? track.name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {agentEditProgress ? (
+                  <div className={`agent-editor-progress stage-${agentEditProgress.stage}`}>
+                    <div className="agent-editor-progress-row">
+                      <strong>{agentEditProgress.stage}</strong>
+                      <span>{agentEditProgress.current}/{agentEditProgress.total}</span>
+                      <em>{Math.round(agentEditProgress.elapsedSeconds)}s</em>
+                    </div>
+                    <div className="agent-editor-progress-bar">
+                      <span style={{ width: `${Math.max(3, Math.min(100, (agentEditProgress.current / Math.max(1, agentEditProgress.total)) * 100))}%` }} />
+                    </div>
+                    <div className="agent-editor-status">{agentEditProgress.message}</div>
+                  </div>
+                ) : agentEditStatus ? <div className="agent-editor-status">{agentEditStatus}</div> : null}
+
+                {videoEditorScript.length > 0 ? (
+                  <div className="agent-editor-script">
+                    <div className="agent-editor-script-head">
+                      <strong>Edit script</strong>
+                      <span>{videoEditorScript.length} decisions</span>
+                    </div>
+                    <div className="agent-editor-script-list">
+                      {videoEditorScript.map((entry) => (
+                        <div className="agent-editor-script-item" key={`${entry.windowIndex}-${entry.startSeconds}-${entry.endSeconds}`}>
+                          <div className="agent-editor-script-meta">
+                            <strong>{formatTime(entry.startSeconds)}-{formatTime(entry.endSeconds)}</strong>
+                            <span>
+                              {entry.decision ? `${entry.decision} · ` : ""}
+                              {entry.chosenTrackName ? `${entry.chosenTrackName} · track ${(entry.chosenTrackIndex ?? 0) + 1}` : "Black / no active video"}
+                              {entry.varietyOverride ? " · variation override" : ""}
+                            </span>
+                          </div>
+                          <p>{entry.reason}</p>
+                          {entry.candidates.length > 0 ? (
+                            <div className="agent-editor-script-candidates">
+                              {entry.candidates.map((candidate) => (
+                                <span key={`${entry.windowIndex}-${candidate.imageNumber}`}>
+                                  Frame {candidate.imageNumber}: {candidate.angleLabel ? `${candidate.angleLabel} · ` : ""}{candidate.trackName} @ {formatTime(candidate.timelineSeconds)}
+                                  {candidate.note ? ` - ${candidate.note}` : ""}
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                          {entry.dataProvided?.length > 0 ? (
+                            <div className="agent-editor-script-data">
+                              <strong>Data provided</strong>
+                              {entry.dataProvided.map((item, index) => (
+                                <span key={`${entry.windowIndex}-data-${index}`}>{item}</span>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </section>
+
+              <aside className="video-editor-side">
+                <div className="video-editor-card">
+                  <strong>Agent setup</strong>
+                  <label>
+                    Interval
+                    <input value={agentIntervalSeconds} onChange={(event) => setAgentIntervalSeconds(event.target.value)} inputMode="decimal" />
+                  </label>
+                  <label>
+                    Vision model
+                    <select value={agentVideoModel} onChange={(event) => setAgentVideoModel(event.target.value)}>
+                      {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    Edit model
+                    <select value={agentVideoEditModel} onChange={(event) => setAgentVideoEditModel(event.target.value)}>
+                      {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    Guidelines
+                    <textarea
+                      value={agentVideoInstructions}
+                      onChange={(event) => setAgentVideoInstructions(event.target.value)}
+                      placeholder="Use the overhead angle when it adds information, hold shots through phrases, cut on musical changes."
+                    />
+                  </label>
+                </div>
+
+                <div className="video-editor-card video-editor-chat">
+                  <strong>Agent chat</strong>
+                  <div className="video-editor-chat-log">
+                    {videoChatMessages.length === 0 ? (
+                      <span className="video-editor-empty">Tell the editor what to change, then run Agent Edit.</span>
+                    ) : videoChatMessages.map((message, index) => (
+                      <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
+                        <span>{message.role}</span>
+                        <p>{message.text}</p>
+                      </div>
+                    ))}
+                  </div>
+                  <form
+                    className="video-editor-chat-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      sendVideoEditorChat();
+                    }}
+                  >
+                    <textarea value={videoChatDraft} onChange={(event) => setVideoChatDraft(event.target.value)} placeholder="Example: use Video 8 more for the overhead view during dense parts." />
+                    <button type="submit">Add</button>
+                  </form>
+                </div>
+
+                <div className="video-editor-card video-editor-history">
+                  <strong>History</strong>
+                  {videoEditHistory.length === 0 ? (
+                    <span className="video-editor-empty">No saved video edit runs yet.</span>
+                  ) : videoEditHistory.map((item) => (
+                    <button
+                      type="button"
+                      key={item.id}
+                      onClick={() => {
+                        setAgentEditScript(item.script);
+                        setAgentVideoInstructions(item.instructions);
+                        setAgentVideoModel(item.visionModel);
+                        setAgentVideoEditModel(item.editModel);
+                      }}
+                    >
+                      <span>{new Date(item.createdAt).toLocaleString()}</span>
+                      <strong>{item.script.length} decisions</strong>
+                      <em>{item.outputPath}</em>
+                    </button>
+                  ))}
+                </div>
+              </aside>
+            </div>
           </div>
         ) : null}
 
@@ -2165,7 +2703,7 @@ export function App() {
                             ? inputMonitorPeaks
                             : undefined
                       }
-                      onSelect={(event) => selectTrack(track.id, event)}
+                      onToggleSelect={() => toggleTrackSelection(track.id)}
                       onClipSelect={(clipId) => {
                         trackLanesRef.current?.focus({ preventScroll: true });
                         const clip = clips.find((item) => item.id === clipId);
@@ -2180,7 +2718,6 @@ export function App() {
                       onRangeSelect={(start, end) => {
                         trackLanesRef.current?.focus({ preventScroll: true });
                         playbackAnchorRef.current = Math.max(0, Math.min(start, end));
-                        setSelectedTrackIds((ids) => ids.includes(track.id) ? ids : [track.id]);
                         setSelectedClip(undefined);
                         setSelectedRange({ trackId: track.id, start: Math.min(start, end), end: Math.max(start, end) });
                       }}
@@ -2568,6 +3105,875 @@ function emitCameraPreviewLayout(payload: CameraPreviewLayoutEvent) {
 
 function emitCameraPreviewCanvas(canvas: VideoCanvas) {
   return emit("camera-preview:canvas", { canvas: normalizeVideoCanvas(canvas) } satisfies CameraPreviewCanvasEvent).catch(() => undefined);
+}
+
+function readVideoEditorPayloadFromUrl(): VideoEditorWindowPayload | undefined {
+  const params = new URLSearchParams(window.location.search);
+  const sessionId = params.get("sessionId") ?? "";
+  if (!sessionId) return undefined;
+  const trackIds = (params.get("trackIds") ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  const start = Number(params.get("start"));
+  const end = Number(params.get("end"));
+  return {
+    sessionId,
+    trackIds,
+    range: Number.isFinite(start) && Number.isFinite(end) ? { start: Math.min(start, end), end: Math.max(start, end) } : undefined,
+    playhead: 0,
+  };
+}
+
+export function VideoEditorWindowApp() {
+  const initialOllamaUrlRef = useRef(localStorage.getItem("autoMixer.ollamaUrl"));
+  const initialOllamaModelRef = useRef(localStorage.getItem("autoMixer.ollamaModel"));
+  const initialAgentVideoModelRef = useRef(localStorage.getItem("autoMixer.agentVideoModel"));
+  const initialAgentVideoEditModelRef = useRef(localStorage.getItem("autoMixer.agentVideoEditModel"));
+  const initialAgentVideoInstructionsRef = useRef(localStorage.getItem("autoMixer.agentVideoInstructions"));
+  const initialPayloadRef = useRef<VideoEditorWindowPayload | undefined>(readVideoEditorPayloadFromUrl());
+  const rangeDragRef = useRef<{ start: number; pointerId: number } | null>(null);
+  const [project, setProject] = useState<MixProject>();
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>(initialPayloadRef.current?.trackIds ?? []);
+  const [selectedRange, setSelectedRange] = useState<{ start: number; end: number } | undefined>(initialPayloadRef.current?.range);
+  const [playhead, setPlayhead] = useState(initialPayloadRef.current?.playhead ?? 0);
+  const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
+  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("1");
+  const [agentVideoModel, setAgentVideoModel] = useState(() => initialAgentVideoModelRef.current ?? DEFAULT_AGENT_VIDEO_MODEL);
+  const [agentVideoEditModel, setAgentVideoEditModel] = useState(() => initialAgentVideoEditModelRef.current ?? initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
+  const [agentVideoInstructions, setAgentVideoInstructions] = useState(() => initialAgentVideoInstructionsRef.current ?? "");
+  const [agentEditProgress, setAgentEditProgress] = useState<{ stage: string; message: string; current: number; total: number; elapsedSeconds: number } | null>(null);
+  const [agentEditScript, setAgentEditScript] = useState<AgentVideoScriptEntry[]>([]);
+  const [mainVideoEdit, setMainVideoEdit] = useState<MainVideoEdit>({ script: [] });
+  const [programPlaying, setProgramPlaying] = useState(false);
+  const [programPreviewSize, setProgramPreviewSize] = useState<"small" | "medium" | "large">("medium");
+  const [videoEditHistory, setVideoEditHistory] = useState<VideoEditHistoryItem[]>([]);
+  const [videoChatMessages, setVideoChatMessages] = useState<VideoChatMessage[]>([]);
+  const [videoChatDraft, setVideoChatDraft] = useState("");
+  const [videoHistoryLoadedSessionId, setVideoHistoryLoadedSessionId] = useState<string | null>(null);
+  const [ollamaUrl, setOllamaUrl] = useState(() => initialOllamaUrlRef.current ?? DEFAULT_OLLAMA_URL);
+  const [ollamaModel, setOllamaModel] = useState(() => initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
+  const [modelOptions, setModelOptions] = useState<string[]>(() => [initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL]);
+  const session = project?.session;
+
+  useEffect(() => {
+    void bootstrapVideoEditor(initialPayloadRef.current);
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<VideoEditorWindowPayload>("video-editor:update", (event) => {
+      const payload = event.payload;
+      setSelectedTrackIds(payload.trackIds);
+      setSelectedRange(payload.range);
+      setPlayhead(payload.playhead);
+      void bootstrapVideoEditor(payload);
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void api.onAgentVideoProgress((event) => {
+      setAgentEditProgress(event);
+      setStatus(event.message);
+      if (event.stage === "done" || event.stage === "error") {
+        setTimeout(() => setAgentEditProgress(null), 6000);
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("autoMixer.ollamaUrl", ollamaUrl);
+  }, [ollamaUrl]);
+
+  useEffect(() => {
+    localStorage.setItem("autoMixer.agentVideoModel", agentVideoModel);
+    setModelOptions((items) => items.includes(agentVideoModel) ? items : [...items, agentVideoModel]);
+  }, [agentVideoModel]);
+
+  useEffect(() => {
+    localStorage.setItem("autoMixer.agentVideoEditModel", agentVideoEditModel);
+    setModelOptions((items) => items.includes(agentVideoEditModel) ? items : [...items, agentVideoEditModel]);
+  }, [agentVideoEditModel]);
+
+  useEffect(() => {
+    localStorage.setItem("autoMixer.agentVideoInstructions", agentVideoInstructions);
+  }, [agentVideoInstructions]);
+
+  useEffect(() => {
+    if (!session) return;
+    setVideoHistoryLoadedSessionId(null);
+    const raw = localStorage.getItem(`autoMixer.videoEditHistory.${session.id}`);
+    if (!raw) {
+      setVideoEditHistory([]);
+      setVideoChatMessages([]);
+      setVideoHistoryLoadedSessionId(session.id);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as { history?: VideoEditHistoryItem[]; chat?: VideoChatMessage[] } | VideoEditHistoryItem[];
+      if (Array.isArray(parsed)) {
+        setVideoEditHistory(parsed);
+        setVideoChatMessages([]);
+      } else {
+        setVideoEditHistory(Array.isArray(parsed.history) ? parsed.history : []);
+        setVideoChatMessages(Array.isArray(parsed.chat) ? parsed.chat : []);
+      }
+    } catch {
+      setVideoEditHistory([]);
+      setVideoChatMessages([]);
+    }
+    setVideoHistoryLoadedSessionId(session.id);
+  }, [session?.id]);
+
+  useEffect(() => {
+    if (!session || videoHistoryLoadedSessionId !== session.id) return;
+    localStorage.setItem(
+      `autoMixer.videoEditHistory.${session.id}`,
+      JSON.stringify({ history: videoEditHistory.slice(0, 20), chat: videoChatMessages.slice(-80) })
+    );
+  }, [session?.id, videoHistoryLoadedSessionId, videoEditHistory, videoChatMessages]);
+
+  useEffect(() => {
+    void refreshCameraDevices();
+  }, []);
+
+  useEffect(() => {
+    if (mainVideoEdit.script.length > 0 || !videoEditHistory[0]) return;
+    const latest = videoEditHistory[0];
+    const rangeStartSeconds = latest.script.length > 0 ? Math.min(...latest.script.map((entry) => entry.startSeconds)) : 0;
+    setMainVideoEdit({ script: latest.script, outputPath: latest.outputPath, createdAt: latest.createdAt, rangeStartSeconds });
+  }, [videoEditHistory, mainVideoEdit.script.length]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.code !== "Space") return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, button")) return;
+      event.preventDefault();
+      toggleProgramPlayback();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedRange?.start, selectedRange?.end, playhead, mainVideoEdit.script]);
+
+  async function bootstrapVideoEditor(payload?: VideoEditorWindowPayload) {
+    const sessionId = payload?.sessionId;
+    if (!sessionId) {
+      setStatus("Open the video editor from the main AutoMixer window.");
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const [config, loaded] = await Promise.all([api.config().catch(() => undefined), api.getSession(sessionId)]);
+      if (config) {
+        if (!initialOllamaUrlRef.current) setOllamaUrl(config.ollamaBaseUrl);
+        if (!initialOllamaModelRef.current) {
+          setOllamaModel(config.ollamaModel);
+          setModelOptions((items) => Array.from(new Set([...items, config.ollamaModel])));
+        }
+      }
+      setProject(loaded);
+      const videoIds = loaded.session.tracks.filter((track) => track.kind === "video").map((track) => track.id);
+      const nextTrackIds = payload?.trackIds?.filter((id) => videoIds.includes(id)) ?? [];
+      setSelectedTrackIds(nextTrackIds.length > 0 ? nextTrackIds : videoIds);
+      setSelectedRange(payload?.range);
+      setPlayhead(payload?.playhead ?? 0);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshCameraDevices() {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setCameraDevices(devices.filter((device) => device.kind === "videoinput"));
+    } catch {
+      setCameraDevices([]);
+    }
+  }
+
+  function selectedVideoTracks() {
+    if (!session) return [];
+    return session.tracks.filter((track) => track.kind === "video" && selectedTrackIds.includes(track.id));
+  }
+
+  function allVideoTracks() {
+    if (!session) return [];
+    return session.tracks.filter((track) => track.kind === "video");
+  }
+
+  function selectedVideoTrackIds() {
+    return selectedVideoTracks().map((track) => track.id);
+  }
+
+  function buildPreviewTracks() {
+    if (!session) return [];
+    const videoSourceById = new Map((session.videoSourceFiles ?? []).map((source) => [source.id, source]));
+    return selectedVideoTracks().map((track, trackIndex) => {
+      const deviceId = track.cameraDeviceId ?? "";
+      const device = cameraDevices.find((item) => item.deviceId === deviceId);
+      const clips = (track.videoClips ?? []).flatMap((clip) => {
+        const source = videoSourceById.get(clip.videoSourceFileId);
+        if (!source) return [];
+        return [{
+          id: clip.id,
+          name: clip.name ?? source.originalName,
+          src: source.path,
+          startSeconds: clip.startSample / session.sampleRate,
+          endSeconds: clip.endSample / session.sampleRate,
+          localTime: Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000 + playhead - (clip.startSample / session.sampleRate)),
+          layout: normalizeVideoLayout(clip.layout, trackIndex),
+        }];
+      });
+      const activeClip = clips.find((clip) => playhead >= clip.startSeconds && playhead <= clip.endSeconds);
+      return {
+        id: track.id,
+        name: track.name,
+        color: track.color,
+        deviceId,
+        deviceLabel: device?.label || "Default camera",
+        armed: false,
+        recording: false,
+        transportPlaying: false,
+        activeClip,
+        defaultLayout: defaultVideoLayout(trackIndex),
+      };
+    });
+  }
+
+  async function openCameraPreview() {
+    if (!session) return;
+    const tracks = buildPreviewTracks();
+    try {
+      let preview = await WebviewWindow.getByLabel("camera-preview");
+      if (!preview) {
+        preview = new WebviewWindow("camera-preview", {
+          url: "/?cameraPreview=1",
+          title: "AutoMixer Camera Preview",
+          width: 980,
+          height: 640,
+          minWidth: 520,
+          minHeight: 360,
+          resizable: true,
+          center: false,
+        });
+        const createdPreview = preview;
+        createdPreview.once("tauri://created", () => {
+          void createdPreview.emit("camera-preview:update", { tracks, canvas: normalizeVideoCanvas(session.videoCanvas) } satisfies CameraPreviewPayload);
+        });
+      } else {
+        await preview.emit("camera-preview:update", { tracks, canvas: normalizeVideoCanvas(session.videoCanvas) } satisfies CameraPreviewPayload).catch(() => undefined);
+      }
+      await preview.show().catch(() => undefined);
+      await preview.setFocus().catch(() => undefined);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function renderRangeSamples() {
+    if (!session || !selectedRange) return undefined;
+    return {
+      startSample: Math.round(Math.max(0, selectedRange.start) * session.sampleRate),
+      endSample: Math.round(Math.max(0, selectedRange.end) * session.sampleRate),
+    };
+  }
+
+  function clampRangeSeconds(value: number, maxSeconds: number) {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(Math.max(0, maxSeconds), value));
+  }
+
+  function setEditorRange(start: number, end: number, maxSeconds: number) {
+    const a = clampRangeSeconds(start, maxSeconds);
+    const b = clampRangeSeconds(end, maxSeconds);
+    setSelectedRange({ start: Math.min(a, b), end: Math.max(a, b) });
+    setPlayhead(Math.min(a, b));
+  }
+
+  function editorSecondsFromPointer(event: ReactPointerEvent<HTMLElement>, maxSeconds: number) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+    return clampRangeSeconds(ratio * maxSeconds, maxSeconds);
+  }
+
+  function handleSelectionPointerDown(event: ReactPointerEvent<HTMLDivElement>, maxSeconds: number) {
+    if (event.button !== 0) return;
+    const seconds = editorSecondsFromPointer(event, maxSeconds);
+    rangeDragRef.current = { start: seconds, pointerId: event.pointerId };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setEditorRange(seconds, seconds, maxSeconds);
+  }
+
+  function handleSelectionPointerMove(event: ReactPointerEvent<HTMLDivElement>, maxSeconds: number) {
+    const drag = rangeDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    setEditorRange(drag.start, editorSecondsFromPointer(event, maxSeconds), maxSeconds);
+  }
+
+  function handleSelectionPointerUp(event: ReactPointerEvent<HTMLDivElement>, maxSeconds: number) {
+    const drag = rangeDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    setEditorRange(drag.start, editorSecondsFromPointer(event, maxSeconds), maxSeconds);
+    rangeDragRef.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+
+  function editorPlaybackEnd() {
+    if (!session) return 1;
+    const selectedTracks = selectedVideoTracks();
+    const clipEnd = Math.max(0, ...selectedTracks.flatMap((track) => (track.videoClips ?? []).map((clip) => clip.endSample / session.sampleRate)));
+    const scriptEnd = Math.max(0, ...mainVideoEdit.script.map((entry) => entry.endSeconds));
+    const rangeEnd = selectedRange?.end ?? 0;
+    return Math.max(clipEnd, scriptEnd, rangeEnd, 1);
+  }
+
+  function toggleProgramPlayback() {
+    if (mainVideoEdit.script.length === 0) {
+      setStatus("Run Agent Edit first to create the Main video lane.");
+      return;
+    }
+    const start = selectedRange?.start ?? 0;
+    const end = selectedRange?.end ?? editorPlaybackEnd();
+    if (!programPlaying && (playhead < start || playhead >= end)) {
+      setPlayhead(start);
+    }
+    setProgramPlaying((playing) => !playing);
+  }
+
+  async function renderCurrentVideo() {
+    if (!session) return;
+    const outputPath = await save({
+      defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}.mp4`,
+      filters: [{ name: "MP4", extensions: ["mp4"] }]
+    });
+    if (!outputPath) return;
+    setBusy(true);
+    try {
+      if (mainVideoEdit.outputPath) {
+        const result = await api.exportRenderedVideo(mainVideoEdit.outputPath, outputPath);
+        setStatus(`Exported Main video ${result.path}`);
+      } else {
+        const trackIds = selectedVideoTrackIds();
+        if (trackIds.length === 0) {
+          setStatus("Select one or more video tracks, or run Agent Edit to create the Main video.");
+          return;
+        }
+        const range = renderRangeSamples();
+        await api.renderVideoMix(session.id, outputPath, range?.startSample, range?.endSample, trackIds);
+        setStatus(`Rendered raw selected tracks ${outputPath}`);
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function renderAutoVideoEdit() {
+    if (!session) return;
+    const trackIds = selectedVideoTrackIds();
+    if (trackIds.length === 0) {
+      setStatus("Select one or more video tracks in the main window, then open the editor again.");
+      return;
+    }
+    const sampleIntervalSeconds = Number(agentIntervalSeconds);
+    if (!Number.isFinite(sampleIntervalSeconds) || sampleIntervalSeconds <= 0) {
+      setStatus("Use a positive interval.");
+      return;
+    }
+    const range = renderRangeSamples();
+    const outputPath = await save({
+      defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}_auto_edit.mp4`,
+      filters: [{ name: "MP4", extensions: ["mp4"] }]
+    });
+    if (!outputPath) return;
+    setBusy(true);
+    try {
+      await api.renderAutoVideoEdit(session.id, outputPath, range?.startSample, range?.endSample, trackIds, sampleIntervalSeconds);
+      setStatus(`Quick edit rendered ${outputPath}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function renderAgentVideoEdit(sampleIntervalSeconds: number) {
+    if (!session) return;
+    const trackIds = selectedVideoTrackIds();
+    if (trackIds.length === 0) {
+      setStatus("Select one or more video tracks in the main window, then open the editor again.");
+      return;
+    }
+    if (!Number.isFinite(sampleIntervalSeconds) || sampleIntervalSeconds <= 0) {
+      setStatus("Use a positive interval.");
+      return;
+    }
+    const visionModel = agentVideoModel.trim() || DEFAULT_AGENT_VIDEO_MODEL;
+    const editModel = agentVideoEditModel.trim() || ollamaModel.trim() || DEFAULT_OLLAMA_MODEL;
+    const range = renderRangeSamples();
+    const outputPath = await save({
+      defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}_agent_edit.mp4`,
+      filters: [{ name: "MP4", extensions: ["mp4"] }]
+    });
+    if (!outputPath) return;
+    setBusy(true);
+    setAgentEditScript([]);
+    setAgentEditProgress({ stage: "starting", message: "Starting Agent Video Edit...", current: 0, total: 1, elapsedSeconds: 0 });
+    setStatus(`Running ${visionModel} for vision and ${editModel} for edit decisions...`);
+    try {
+      const result = await api.renderAgentVideoEdit(session.id, outputPath, range?.startSample, range?.endSample, trackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, agentVideoInstructions.trim());
+      const createdAt = new Date().toISOString();
+      const rangeStartSeconds = range ? range.startSample / session.sampleRate : 0;
+      setAgentEditScript(result.script);
+      setMainVideoEdit({ script: result.script, outputPath, createdAt, rangeStartSeconds });
+      setVideoEditHistory((items) => [{
+        id: `${Date.now()}`,
+        createdAt,
+        outputPath,
+        visionModel,
+        editModel,
+        intervalSeconds: sampleIntervalSeconds,
+        instructions: agentVideoInstructions.trim(),
+        script: result.script,
+      }, ...items].slice(0, 20));
+      setVideoChatMessages((items) => [...items, {
+        role: "agent",
+        text: `Rendered ${result.script.length} decisions into the Main video lane with ${visionModel} + ${editModel}.`,
+        createdAt,
+      }]);
+      setStatus(`Done: ${result.path}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function sendVideoEditorChat() {
+    const text = videoChatDraft.trim();
+    if (!text) return;
+    const now = new Date().toISOString();
+    setVideoChatMessages((items) => [
+      ...items,
+      { role: "user", text, createdAt: now },
+      { role: "agent", text: "Added to the edit guidelines. Run Agent Edit again to apply it.", createdAt: now },
+    ]);
+    setAgentVideoInstructions((current) => current.trim() ? `${current.trim()}\n${text}` : text);
+    setVideoChatDraft("");
+  }
+
+  function cycleProgramPreviewSize() {
+    setProgramPreviewSize((size) => size === "small" ? "medium" : size === "medium" ? "large" : "small");
+  }
+
+  if (loading) return <main className="loading">Loading Video Editor...</main>;
+  if (!session) {
+    return (
+      <main className="loading">
+        <div>
+          <h1>Video Editor</h1>
+          <p>{status ?? "No session was loaded."}</p>
+        </div>
+      </main>
+    );
+  }
+
+  const selectedTracks = selectedVideoTracks();
+  const availableVideoTracks = allVideoTracks();
+  const audioTrackCount = session.tracks.filter((track) => track.kind !== "video").length;
+  const videoEditorScript = agentEditScript.length > 0 ? agentEditScript : mainVideoEdit.script.length > 0 ? mainVideoEdit.script : videoEditHistory[0]?.script ?? [];
+  const rangeStartSeconds = selectedRange ? Math.max(0, selectedRange.start) : 0;
+  const explicitRangeEndSeconds = selectedRange ? Math.max(0, selectedRange.end) : 0;
+  const scriptEndSeconds = Math.max(0, ...videoEditorScript.map((entry) => entry.endSeconds), ...mainVideoEdit.script.map((entry) => entry.endSeconds));
+  const clipEndSeconds = Math.max(0, ...selectedTracks.flatMap((track) => (track.videoClips ?? []).map((clip) => clip.endSample / session.sampleRate)));
+  const duration = Math.max(0, ...session.tracks.flatMap((track) => track.kind === "video" ? (track.videoClips ?? []).map((clip) => clip.endSample / session.sampleRate) : track.clips.map((clip) => clip.endSample / session.sampleRate)));
+  const editorStartSeconds = 0;
+  const editorEndSeconds = Math.max(duration, scriptEndSeconds, clipEndSeconds, explicitRangeEndSeconds, 1);
+  const editorSpanSeconds = Math.max(1, editorEndSeconds - editorStartSeconds);
+  const selectedRangeStartPct = selectedRange ? Math.max(0, Math.min(100, (selectedRange.start / editorSpanSeconds) * 100)) : 0;
+  const selectedRangeEndPct = selectedRange ? Math.max(selectedRangeStartPct, Math.min(100, (selectedRange.end / editorSpanSeconds) * 100)) : 0;
+  const videoCanvas = normalizeVideoCanvas(session.videoCanvas);
+  const activeProgramEntry = mainVideoEdit.script.find((entry) => entry.chosenTrackName && playhead >= entry.startSeconds && playhead < entry.endSeconds);
+  const renderedProgramStartSeconds = mainVideoEdit.rangeStartSeconds ?? (mainVideoEdit.script.length > 0 ? Math.min(...mainVideoEdit.script.map((entry) => entry.startSeconds)) : 0);
+  const renderedProgramLocalTime = Math.max(0, playhead - renderedProgramStartSeconds);
+
+  return (
+    <main className="video-editor-window">
+      <div className="video-editor-shell windowed">
+        <div className="video-editor-head">
+          <div>
+            <strong>Video Editor</strong>
+            <span>
+              {selectedTracks.length} video track{selectedTracks.length === 1 ? "" : "s"} selected
+              {selectedRange ? ` · edit range ${formatTime(selectedRange.start)}-${formatTime(selectedRange.end)}` : " · full timeline"}
+            </span>
+          </div>
+          <div className="video-editor-actions">
+            <button type="button" onClick={toggleProgramPlayback} disabled={mainVideoEdit.script.length === 0}>
+              {programPlaying ? <Pause size={15} /> : <Play size={15} />} {programPlaying ? "Pause" : "Play"}
+            </button>
+            <button type="button" onClick={() => void bootstrapVideoEditor({ sessionId: session.id, trackIds: selectedTrackIds, range: selectedRange, playhead })}>
+              Refresh
+            </button>
+            <button type="button" onClick={() => void openCameraPreview()} disabled={selectedTracks.length === 0}>
+              Show Canvas Preview
+            </button>
+            <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedTracks.length === 0}>
+              <Download size={15} /> Export MP4
+            </button>
+            <button type="button" onClick={() => void renderAutoVideoEdit()} disabled={busy || selectedTracks.length === 0}>
+              Quick Edit
+            </button>
+            <button type="button" className="primary" onClick={() => void renderAgentVideoEdit(Number(agentIntervalSeconds))} disabled={busy || selectedTracks.length === 0}>
+              Run Agent Edit
+            </button>
+          </div>
+        </div>
+
+        <div className="video-editor-body">
+          <section className="video-editor-main">
+            <div className="video-editor-canvas">
+              <div className="video-editor-canvas-frame" style={{ aspectRatio: mainVideoEdit.outputPath ? undefined : `${videoCanvas.width} / ${videoCanvas.height}`, background: videoCanvas.background }}>
+                {selectedTracks.length === 0 ? (
+                  <span>Select video tracks in the main window, then open the editor.</span>
+                ) : mainVideoEdit.outputPath ? (
+                  <div className="program-preview-stage">
+                    <ProgramPreviewVideo
+                      src={mainVideoEdit.outputPath}
+                      localTime={renderedProgramLocalTime}
+                      playing={programPlaying}
+                      muted={false}
+                      onTime={(seconds) => setPlayhead(renderedProgramStartSeconds + seconds)}
+                      onPause={() => setProgramPlaying(false)}
+                      size={programPreviewSize}
+                      onResize={cycleProgramPreviewSize}
+                    />
+                    <div className="video-editor-program-overlay">
+                      <strong>{activeProgramEntry?.chosenTrackName ?? "Main video"}</strong>
+                      <span>{formatTime(playhead)} · rendered agent video</span>
+                    </div>
+                  </div>
+                ) : videoEditorScript.find((entry) => entry.chosenTrackName) ? (
+                  <div className="video-editor-program">
+                    <Video size={38} />
+                    <strong>Render the Main video</strong>
+                    <span>Run Agent Edit to create the MP4, then the canvas will play that rendered video.</span>
+                  </div>
+                ) : (
+                  <div className="video-editor-program">
+                    <Video size={38} />
+                    <strong>{videoCanvas.width}x{videoCanvas.height}</strong>
+                    <span>Run the agent to build the edit script.</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="video-editor-rangebar">
+              <label>
+                Start
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={selectedRange ? selectedRange.start.toFixed(2) : ""}
+                  placeholder={formatTime(0)}
+                  onChange={(event) => {
+                    const value = Number(event.currentTarget.value);
+                    if (Number.isFinite(value)) setEditorRange(value, selectedRange?.end ?? editorEndSeconds, editorEndSeconds);
+                  }}
+                />
+              </label>
+              <label>
+                End
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={selectedRange ? selectedRange.end.toFixed(2) : ""}
+                  placeholder={formatTime(editorEndSeconds)}
+                  onChange={(event) => {
+                    const value = Number(event.currentTarget.value);
+                    if (Number.isFinite(value)) setEditorRange(selectedRange?.start ?? 0, value, editorEndSeconds);
+                  }}
+                />
+              </label>
+              <button type="button" onClick={() => setEditorRange(0, editorEndSeconds, editorEndSeconds)}>Whole Timeline</button>
+              <button type="button" onClick={() => setSelectedRange(undefined)}>Clear Range</button>
+              <span>{selectedRange ? `Edits use ${formatTime(selectedRange.start)}-${formatTime(selectedRange.end)}` : "Edits use the full timeline"}</span>
+            </div>
+
+            <div className="video-editor-timeline">
+              <div className="video-editor-ruler">
+                <span>{formatTime(editorStartSeconds)}</span>
+                <span>{formatTime(editorStartSeconds + editorSpanSeconds / 2)}</span>
+                <span>{formatTime(editorEndSeconds)}</span>
+              </div>
+              <div className="video-editor-row selection-row">
+                <div className="video-editor-row-label">Edit range</div>
+                <div
+                  className="video-editor-row-lane video-editor-selection-lane"
+                  onPointerDown={(event) => handleSelectionPointerDown(event, editorEndSeconds)}
+                  onPointerMove={(event) => handleSelectionPointerMove(event, editorEndSeconds)}
+                  onPointerUp={(event) => handleSelectionPointerUp(event, editorEndSeconds)}
+                  onPointerCancel={() => { rangeDragRef.current = null; }}
+                >
+                  <span className="video-editor-selection-help">Drag here to choose the section for Agent Edit and export</span>
+                  {selectedRange ? (
+                    <div
+                      className="video-editor-selection"
+                      style={{ left: `${selectedRangeStartPct}%`, width: `${Math.max(0.6, selectedRangeEndPct - selectedRangeStartPct)}%` }}
+                    >
+                      {formatTime(selectedRange.start)}-{formatTime(selectedRange.end)}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <div className="video-editor-row main-video-row">
+                <div className="video-editor-row-label">Main video</div>
+                <div className="video-editor-row-lane">
+                  {mainVideoEdit.script.length === 0 ? <span className="video-editor-empty">Run Agent Edit to write the selected shots here</span> : null}
+                  {mainVideoEdit.script.map((entry) => {
+                    const startPct = Math.max(0, Math.min(100, ((entry.startSeconds - editorStartSeconds) / editorSpanSeconds) * 100));
+                    const endPct = Math.max(startPct + 0.4, Math.min(100, ((entry.endSeconds - editorStartSeconds) / editorSpanSeconds) * 100));
+                    const active = playhead >= entry.startSeconds && playhead < entry.endSeconds;
+                    return (
+                      <button
+                        type="button"
+                        className={`video-editor-event main ${entry.chosenTrackName ? "" : "black"} ${active ? "active" : ""}`}
+                        key={`main-${entry.windowIndex}-${entry.startSeconds}`}
+                        style={{ left: `${startPct}%`, width: `${Math.max(0.8, endPct - startPct)}%` }}
+                        title={`${formatTime(entry.startSeconds)}-${formatTime(entry.endSeconds)} ${entry.chosenTrackName ?? "black"}`}
+                        onClick={() => setPlayhead(entry.startSeconds)}
+                      >
+                        {entry.chosenTrackName ?? "black"}
+                      </button>
+                    );
+                  })}
+                  <div className="video-editor-program-playhead" style={{ left: `${Math.max(0, Math.min(100, (playhead / editorSpanSeconds) * 100))}%` }} />
+                </div>
+              </div>
+              <div className="video-editor-row agent-row">
+                <div className="video-editor-row-label">Agent cuts</div>
+                <div className="video-editor-row-lane">
+                  {videoEditorScript.length === 0 ? <span className="video-editor-empty">No agent decisions yet</span> : null}
+                  {videoEditorScript.map((entry) => {
+                    const startPct = Math.max(0, Math.min(100, ((entry.startSeconds - editorStartSeconds) / editorSpanSeconds) * 100));
+                    const endPct = Math.max(startPct + 0.4, Math.min(100, ((entry.endSeconds - editorStartSeconds) / editorSpanSeconds) * 100));
+                    return (
+                      <button
+                        type="button"
+                        className={`video-editor-event ${entry.chosenTrackName ? "" : "black"}`}
+                        key={`event-${entry.windowIndex}-${entry.startSeconds}`}
+                        style={{ left: `${startPct}%`, width: `${Math.max(0.8, endPct - startPct)}%` }}
+                        title={`${formatTime(entry.startSeconds)}-${formatTime(entry.endSeconds)} ${entry.chosenTrackName ?? "black"}`}
+                        onClick={() => setPlayhead(entry.startSeconds)}
+                      >
+                        {entry.chosenTrackName ?? "black"}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="video-editor-row audio-row">
+                <div className="video-editor-row-label">Audio mix</div>
+                <div className="video-editor-row-lane">
+                  <div className="video-editor-audio-bed">
+                    <span>{audioTrackCount} audio track{audioTrackCount === 1 ? "" : "s"} in export mix</span>
+                  </div>
+                </div>
+              </div>
+              {selectedTracks.map((track) => (
+                <div className="video-editor-row" key={`editor-track-${track.id}`}>
+                  <div className="video-editor-row-label">{track.name}</div>
+                  <div className="video-editor-row-lane">
+                    {(track.videoClips ?? []).map((clip) => {
+                      const clipStart = clip.startSample / session.sampleRate;
+                      const clipEnd = clip.endSample / session.sampleRate;
+                      if (clipEnd < editorStartSeconds || clipStart > editorEndSeconds) return null;
+                      const startPct = Math.max(0, Math.min(100, ((clipStart - editorStartSeconds) / editorSpanSeconds) * 100));
+                      const endPct = Math.max(startPct + 0.6, Math.min(100, ((clipEnd - editorStartSeconds) / editorSpanSeconds) * 100));
+                      return (
+                        <button
+                          type="button"
+                          className="video-editor-clip"
+                          key={clip.id}
+                          style={{ left: `${startPct}%`, width: `${Math.max(1, endPct - startPct)}%`, borderColor: track.color }}
+                          onClick={() => setPlayhead(clipStart)}
+                        >
+                          {clip.name ?? track.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {agentEditProgress ? (
+              <div className={`agent-editor-progress stage-${agentEditProgress.stage}`}>
+                <div className="agent-editor-progress-row">
+                  <strong>{agentEditProgress.stage}</strong>
+                  <span>{agentEditProgress.current}/{agentEditProgress.total}</span>
+                  <em>{Math.round(agentEditProgress.elapsedSeconds)}s</em>
+                </div>
+                <div className="agent-editor-progress-bar">
+                  <span style={{ width: `${Math.max(3, Math.min(100, (agentEditProgress.current / Math.max(1, agentEditProgress.total)) * 100))}%` }} />
+                </div>
+                <div className="agent-editor-status">{agentEditProgress.message}</div>
+              </div>
+            ) : status ? <div className="agent-editor-status">{status}</div> : null}
+
+            {videoEditorScript.length > 0 ? (
+              <div className="agent-editor-script">
+                <div className="agent-editor-script-head">
+                  <strong>Edit script</strong>
+                  <span>{videoEditorScript.length} decisions</span>
+                </div>
+                <div className="agent-editor-script-list">
+                  {videoEditorScript.map((entry) => (
+                    <div className="agent-editor-script-item" key={`${entry.windowIndex}-${entry.startSeconds}-${entry.endSeconds}`}>
+                      <div className="agent-editor-script-meta">
+                        <strong>{formatTime(entry.startSeconds)}-{formatTime(entry.endSeconds)}</strong>
+                        <span>
+                          {entry.decision ? `${entry.decision} · ` : ""}
+                          {entry.chosenTrackName ? `${entry.chosenTrackName} · track ${(entry.chosenTrackIndex ?? 0) + 1}` : "Black / no active video"}
+                          {entry.varietyOverride ? " · variation override" : ""}
+                        </span>
+                      </div>
+                      <p>{entry.reason}</p>
+                      {entry.dataProvided?.length > 0 ? (
+                        <div className="agent-editor-script-data">
+                          <strong>Data provided</strong>
+                          {entry.dataProvided.map((item, index) => (
+                            <span key={`${entry.windowIndex}-data-${index}`}>{item}</span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </section>
+
+          <aside className="video-editor-side">
+            <div className="video-editor-card video-editor-track-picker">
+              <strong>Video tracks</strong>
+              {availableVideoTracks.length === 0 ? (
+                <span className="video-editor-empty">No video tracks in this session.</span>
+              ) : availableVideoTracks.map((track) => (
+                <label key={`video-editor-select-${track.id}`} className="video-editor-track-option">
+                  <input
+                    type="checkbox"
+                    checked={selectedTrackIds.includes(track.id)}
+                    onChange={(event) => {
+                      const checked = event.currentTarget.checked;
+                      setSelectedTrackIds((items) => {
+                        if (checked) return [...items.filter((id) => id !== track.id), track.id];
+                        if (items.length <= 1 && items.includes(track.id)) {
+                          setStatus("Keep at least one video track selected for the editor.");
+                          return items;
+                        }
+                        return items.filter((id) => id !== track.id);
+                      });
+                    }}
+                  />
+                  <span style={{ borderColor: track.color }} />
+                  {track.name}
+                </label>
+              ))}
+            </div>
+
+            <div className="video-editor-card">
+              <strong>Agent setup</strong>
+              <label>
+                Interval
+                <input value={agentIntervalSeconds} onChange={(event) => setAgentIntervalSeconds(event.target.value)} inputMode="decimal" />
+              </label>
+              <label>
+                Vision model
+                <select value={agentVideoModel} onChange={(event) => setAgentVideoModel(event.target.value)}>
+                  {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
+                </select>
+              </label>
+              <label>
+                Edit model
+                <select value={agentVideoEditModel} onChange={(event) => setAgentVideoEditModel(event.target.value)}>
+                  {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
+                </select>
+              </label>
+              <label>
+                Guidelines
+                <textarea
+                  value={agentVideoInstructions}
+                  onChange={(event) => setAgentVideoInstructions(event.target.value)}
+                  placeholder="Use overhead shots when they add information, hold through phrases, cut on musical changes."
+                />
+              </label>
+            </div>
+
+            <div className="video-editor-card video-editor-chat">
+              <strong>Agent chat</strong>
+              <div className="video-editor-chat-log">
+                {videoChatMessages.length === 0 ? (
+                  <span className="video-editor-empty">Tell the editor what to change, then run Agent Edit.</span>
+                ) : videoChatMessages.map((message, index) => (
+                  <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
+                    <span>{message.role}</span>
+                    <p>{message.text}</p>
+                  </div>
+                ))}
+              </div>
+              <form
+                className="video-editor-chat-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  sendVideoEditorChat();
+                }}
+              >
+                <textarea value={videoChatDraft} onChange={(event) => setVideoChatDraft(event.target.value)} placeholder="Example: use Video 8 more for the overhead view during dense parts." />
+                <button type="submit">Add</button>
+              </form>
+            </div>
+
+            <div className="video-editor-card video-editor-history">
+              <strong>History</strong>
+              {videoEditHistory.length === 0 ? (
+                <span className="video-editor-empty">No saved video edit runs yet.</span>
+              ) : videoEditHistory.map((item) => (
+                <button
+                  type="button"
+                  key={item.id}
+                  onClick={() => {
+                    const rangeStartSeconds = item.script.length > 0 ? Math.min(...item.script.map((entry) => entry.startSeconds)) : 0;
+                    setAgentEditScript(item.script);
+                    setMainVideoEdit({ script: item.script, outputPath: item.outputPath, createdAt: item.createdAt, rangeStartSeconds });
+                    setAgentVideoInstructions(item.instructions);
+                    setAgentVideoModel(item.visionModel);
+                    setAgentVideoEditModel(item.editModel);
+                  }}
+                >
+                  <span>{new Date(item.createdAt).toLocaleString()}</span>
+                  <strong>{item.script.length} decisions</strong>
+                  <em>{item.outputPath}</em>
+                </button>
+              ))}
+            </div>
+          </aside>
+        </div>
+      </div>
+    </main>
+  );
 }
 
 function cameraVideoConstraints(deviceId?: string): MediaTrackConstraints {
@@ -3075,7 +4481,7 @@ function TrackInspector({
         </div>
         <div className="inspector-empty">
           <strong>{selectionCount > 1 ? "Multiple Tracks Selected" : "No Track Selected"}</strong>
-          <span>{selectionCount > 1 ? "Select one track to edit recording input and mix details." : "Click a track lane to show its details."}</span>
+          <span>{selectionCount > 1 ? "Select one track to edit recording input and mix details." : "Click S on a track to show its details."}</span>
         </div>
       </aside>
     );
@@ -3173,6 +4579,10 @@ function TrackInspector({
           <input type="checkbox" checked={!!track.aiGenerated} onChange={(event) => onChange(track, { aiGenerated: event.target.checked })} />
           <span>AI generated stem</span>
         </label>
+        <label className="inspector-check">
+          <input type="checkbox" checked={track.solo} onChange={(event) => onChange(track, { solo: event.target.checked })} />
+          <span>Solo</span>
+        </label>
         <div className="inspector-actions">
           <button type="button" className="danger" onClick={() => onDelete(track)}>
             <Trash2 size={14} />
@@ -3212,7 +4622,7 @@ function TrackRow({
   duration,
   alignmentCandidates,
   alignmentGuideSeconds,
-  onSelect,
+  onToggleSelect,
   onClipSelect,
   onClipMove,
   onAlignmentGuideChange,
@@ -3241,7 +4651,7 @@ function TrackRow({
   duration: number;
   alignmentCandidates: number[];
   alignmentGuideSeconds?: number;
-  onSelect: (event?: React.MouseEvent) => void;
+  onToggleSelect: () => void;
   onClipSelect: (clipId: string) => void;
   onClipMove: (clipId: string, deltaSeconds: number) => void;
   onAlignmentGuideChange: (seconds: number | undefined) => void;
@@ -3271,7 +4681,6 @@ function TrackRow({
     if (event.button !== 0) return;
     event.stopPropagation();
     const seconds = secondsFromPointer(event);
-    onSelect();
     dragRef.current = { start: seconds, moved: false };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
@@ -3356,10 +4765,6 @@ function TrackRow({
       onDrop={onDrop}
       role="option"
       aria-selected={selected}
-      onClick={(event) => {
-        if ((event.target as HTMLElement | null)?.closest(".wave-wrap")) return;
-        onSelect(event);
-      }}
     >
       <div className="track-head" style={{ borderLeftColor: track.color }}>
         <div className="track-title-row">
@@ -3373,7 +4778,12 @@ function TrackRow({
             aria-pressed={armed}
           >R</button>
           <button className={track.muted ? "active" : ""} onClick={(event) => { event.stopPropagation(); onChange({ muted: !track.muted }); }}>M</button>
-          <button className={track.solo ? "active" : ""} onClick={(event) => { event.stopPropagation(); onChange({ solo: !track.solo }); }}>S</button>
+          <button
+            className={`select-toggle ${selected ? "active" : ""}`}
+            title={selected ? "Selected. Click to remove from selection." : "Select this track"}
+            onClick={(event) => { event.stopPropagation(); onToggleSelect(); }}
+            aria-pressed={selected}
+          >S</button>
         </div>
         {!isVideo && (recording || monitoring) ? (
           <div className={`track-record-meter ${recording ? "recording" : "monitoring"}`} title="Live input level">
@@ -3387,7 +4797,7 @@ function TrackRow({
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
-        title="Click to select track and set playhead. Drag to select a time range."
+        title="Click to set playhead. Drag to select a time range."
       >
         {clips.map((clip) => {
           const preview = movePreview?.clipId === clip.id ? movePreview : undefined;
@@ -3477,6 +4887,79 @@ function TimelineVideo({ src, color, active, localTime, playing }: { src?: strin
   }, [active, localTime, playing, url]);
   if (!url || failed) return <VideoStrip color={color} />;
   return <video className="video-preview" ref={ref} src={url} muted playsInline preload="auto" onLoadedData={() => setFailed(false)} onError={() => setFailed(true)} />;
+}
+
+function ProgramPreviewVideo({
+  src,
+  localTime,
+  playing,
+  muted,
+  size,
+  onTime,
+  onPause,
+  onResize,
+}: {
+  src?: string;
+  localTime: number;
+  playing: boolean;
+  muted: boolean;
+  size: "small" | "medium" | "large";
+  onTime: (seconds: number) => void;
+  onPause: () => void;
+  onResize: () => void;
+}) {
+  const ref = useRef<HTMLVideoElement>(null);
+  const wasPlayingRef = useRef(false);
+  const [failed, setFailed] = useState(false);
+  const [portraitDisplay, setPortraitDisplay] = useState(false);
+  const url = src ? convertFileSrc(src) : undefined;
+  useEffect(() => {
+    const video = ref.current;
+    if (!video || !url) return;
+    if ((!playing || !wasPlayingRef.current) && Number.isFinite(localTime) && Math.abs(video.currentTime - localTime) > 0.12) {
+      video.currentTime = localTime;
+    }
+    if (playing) {
+      void video.play().catch(() => undefined);
+    } else {
+      video.pause();
+    }
+    wasPlayingRef.current = playing;
+  }, [localTime, playing, url]);
+  if (!url || failed) {
+    return (
+      <div className="program-preview-fallback">
+        <Video size={38} />
+        <span>Video preview unavailable</span>
+      </div>
+    );
+  }
+  return (
+    <div className={`program-preview-fit ${portraitDisplay ? "portrait" : ""} size-${size}`}>
+      <video
+        className="program-preview-video"
+        ref={ref}
+        src={url}
+        muted={muted}
+        playsInline
+        preload="auto"
+        controls
+        onLoadedMetadata={(event) => {
+          const video = event.currentTarget;
+          setPortraitDisplay(video.videoWidth > video.videoHeight);
+        }}
+        onLoadedData={() => setFailed(false)}
+        onError={() => setFailed(true)}
+        onTimeUpdate={(event) => onTime(event.currentTarget.currentTime)}
+        onPause={onPause}
+        onEnded={onPause}
+        onClick={(event) => {
+          if (event.detail === 1) onResize();
+        }}
+        title="Click to resize preview"
+      />
+    </div>
+  );
 }
 
 function Waveform({ peaks, color }: { peaks?: number[]; color: string }) {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -8,7 +8,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     ab_judge::{AbJudgeOptions, AbJudgeResponse},
@@ -51,13 +51,131 @@ pub struct RenderResponse {
     path: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentVideoEditResponse {
+    path: String,
+    script: Vec<AgentVideoScriptEntry>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentVideoScriptCandidate {
+    image_number: usize,
+    track_index: usize,
+    track_name: String,
+    timeline_seconds: f64,
+    angle_label: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentVideoScriptEntry {
+    window_index: u32,
+    total_windows: u32,
+    start_seconds: f64,
+    end_seconds: f64,
+    decision: String,
+    candidates: Vec<AgentVideoScriptCandidate>,
+    chosen_track_index: Option<usize>,
+    chosen_track_name: Option<String>,
+    reason: String,
+    data_provided: Vec<String>,
+    model_choice: Option<usize>,
+    variety_override: bool,
+    source_offset_seconds: Option<f64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentAudioWindowFeatures {
+    peak_db: f32,
+    rms_db: f32,
+    lufs_estimate: f32,
+    loudness: String,
+    transient_density: f32,
+    transient_activity: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentVideoProgress {
+    stage: String,
+    message: String,
+    current: u32,
+    total: u32,
+    elapsed_seconds: f32,
+}
+
 #[derive(Clone)]
 struct VideoRenderClip {
+    track_id: String,
+    track_index: usize,
+    track_name: String,
     path: PathBuf,
     start_sample: u64,
     end_sample: u64,
     source_offset_ms: u64,
     layout: VideoLayout,
+}
+
+struct AutoEditSegment {
+    input_index: usize,
+    timeline_start: u64,
+    timeline_end: u64,
+    source_offset_ms: u64,
+}
+
+struct RenderedAudioAnalysis {
+    samples: Vec<f32>,
+    channels: usize,
+    sample_rate: u32,
+}
+
+const MAX_DYNAMIC_HOLD_WINDOWS: u32 = 4;
+const MIN_WINDOWS_BEFORE_COVERAGE_CUT: u32 = 4;
+const MIN_USAGE_GAP_FOR_COVERAGE_CUT: u32 = 2;
+
+#[derive(Serialize)]
+struct OllamaChatRequest {
+    model: String,
+    stream: bool,
+    messages: Vec<OllamaChatMessage>,
+}
+
+#[derive(Serialize)]
+struct OllamaChatMessage {
+    role: String,
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatResponse {
+    message: OllamaChatResponseMessage,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatResponseMessage {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct AgentShotChoice {
+    choice: usize,
+    decision: Option<String>,
+    reason: Option<String>,
+    edit_intent: Option<String>,
+    continuity_plan: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentWindowFrameAnalysis {
+    candidate_labels: Option<Vec<String>>,
+    candidate_notes: Option<Vec<String>>,
+    window_summary: Option<String>,
 }
 
 #[tauri::command]
@@ -1020,6 +1138,255 @@ pub fn render_video_mix(
 }
 
 #[tauri::command]
+pub fn export_rendered_video(source_path: String, output_path: String) -> Result<RenderResponse, String> {
+    let source = PathBuf::from(source_path);
+    if !source.exists() {
+        return Err("The Main video render is missing. Run Agent Edit again before exporting.".into());
+    }
+    let path = normalize_mp4_path(PathBuf::from(output_path));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if source == path {
+        return Ok(RenderResponse { path: path.to_string_lossy().to_string() });
+    }
+    fs::copy(&source, &path).map_err(|error| format!("Could not export Main video: {error}"))?;
+    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+}
+
+#[tauri::command]
+pub fn render_auto_video_edit(
+    state: State<'_, AppState>,
+    session_id: String,
+    output_path: String,
+    start_sample: Option<u64>,
+    end_sample: Option<u64>,
+    track_ids: Vec<String>,
+    sample_interval_seconds: Option<f64>,
+) -> Result<RenderResponse, String> {
+    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let path = normalize_mp4_path(PathBuf::from(output_path));
+    let full_end = session_duration_samples(&project.session);
+    let range_start = start_sample.unwrap_or(0).min(full_end);
+    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let selected_track_ids = track_ids
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect::<HashSet<_>>();
+    if selected_track_ids.is_empty() {
+        return Err("Select one or more video tracks before running Auto Video Edit.".into());
+    }
+    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    if video_inputs.is_empty() {
+        return Err("The selected video tracks have no recorded clips in the edit range.".into());
+    }
+    let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0) * project.session.sample_rate as f64).round() as u64).max(1);
+    let segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
+    if segments.is_empty() {
+        return Err("Auto Video Edit could not find visible selected clips in the edit range.".into());
+    }
+
+    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
+    let audio_path = renders_dir.join(format!("{session_id}.auto-video-edit.wav"));
+    audio::render_mix(&project.session, &audio_path)?;
+
+    let mut command = Command::new("ffmpeg");
+    command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    for clip in &video_inputs {
+        command.arg("-i").arg(&clip.path);
+    }
+    if range_start > 0 {
+        command.arg("-ss").arg(format!("{:.3}", range_start as f64 / project.session.sample_rate as f64));
+    }
+    command
+        .arg("-t")
+        .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64))
+        .arg("-i")
+        .arg(&audio_path);
+
+    let filter = build_auto_edit_filter(&video_inputs, &segments, &project.session, range_start, range_end);
+    command
+        .arg("-filter_complex")
+        .arg(filter)
+        .arg("-map")
+        .arg("[v]")
+        .arg("-map")
+        .arg(format!("{}:a:0", video_inputs.len()));
+
+    let output = command
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-shortest")
+        .arg(&path)
+        .output()
+        .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg auto video edit failed: {}", stderr.trim()));
+    }
+    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+}
+
+#[tauri::command]
+pub async fn render_agent_video_edit(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    output_path: String,
+    start_sample: Option<u64>,
+    end_sample: Option<u64>,
+    track_ids: Vec<String>,
+    sample_interval_seconds: Option<f64>,
+    ollama_base_url: Option<String>,
+    ollama_model: Option<String>,
+    vision_model: Option<String>,
+    edit_model: Option<String>,
+    instructions: Option<String>,
+) -> Result<AgentVideoEditResponse, String> {
+    let started = std::time::Instant::now();
+    emit_agent_progress(&app, &started, "starting", "Preparing Agent Video Edit...", 0, 1);
+    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let path = normalize_mp4_path(PathBuf::from(output_path));
+    let full_end = session_duration_samples(&project.session);
+    let range_start = start_sample.unwrap_or(0).min(full_end);
+    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let selected_track_ids = track_ids
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect::<HashSet<_>>();
+    if selected_track_ids.is_empty() {
+        emit_agent_progress(&app, &started, "error", "No selected video tracks.", 0, 1);
+        return Err("Select one or more video tracks before running Agent Video Edit.".into());
+    }
+    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    if video_inputs.is_empty() {
+        emit_agent_progress(&app, &started, "error", "Selected tracks have no clips in range.", 0, 1);
+        return Err("The selected video tracks have no recorded clips in the edit range.".into());
+    }
+    let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0) * project.session.sample_rate as f64).round() as u64).max(1);
+    let base_url = ollama_base_url
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| state.config.ollama_base_url.clone())
+        .trim_end_matches('/')
+        .to_string();
+    let fallback_model = ollama_model
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "qwen2.5vl:latest".to_string());
+    let vision_model = vision_model
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback_model.clone());
+    let edit_model = edit_model
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback_model.clone());
+    if base_url.is_empty() || vision_model.is_empty() || edit_model.is_empty() {
+        emit_agent_progress(&app, &started, "error", "No Ollama vision model configured.", 0, 1);
+        return Err("Configure Ollama models before running Agent Video Edit.".into());
+    }
+    let instructions = instructions
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let total_windows = range_end.saturating_sub(range_start).div_ceil(interval_samples).max(1) as u32;
+    emit_agent_progress(&app, &started, "audio", "Rendering mix audio for agent analysis...", 0, total_windows);
+    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
+    let audio_path = renders_dir.join(format!("{session_id}.agent-video-edit.wav"));
+    audio::render_mix(&project.session, &audio_path)?;
+    let audio_analysis = load_rendered_audio_analysis(&audio_path)
+        .map_err(|error| {
+            emit_agent_progress(&app, &started, "error", "Could not analyze rendered audio for the video agent.", 0, total_windows);
+            error
+        })?;
+    emit_agent_progress(
+        &app,
+        &started,
+        "sampling",
+        &format!("Sampling frames from {} selected video tracks...", selected_track_ids.len()),
+        0,
+        total_windows,
+    );
+    let temp_dir = state.config.data_dir.join("agent-video-edit").join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir_all(&temp_dir).map_err(|error| format!("Could not prepare agent frame cache: {error}"))?;
+    let (segments, script) = build_agent_edit_segments(
+        &app,
+        &started,
+        &video_inputs,
+        &project.session,
+        range_start,
+        range_end,
+        interval_samples,
+        &base_url,
+        &vision_model,
+        &edit_model,
+        instructions.as_deref(),
+        Some(&audio_analysis),
+        &temp_dir,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        emit_agent_progress(&app, &started, "fallback", &format!("Vision agent failed; using automatic cuts. {error}"), 0, total_windows);
+        let segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
+        let script = build_fallback_agent_script(&video_inputs, &segments, range_start, range_end, total_windows, project.session.sample_rate, &error);
+        (segments, script)
+    });
+    let _ = fs::remove_dir_all(&temp_dir);
+    if segments.is_empty() {
+        emit_agent_progress(&app, &started, "error", "No visible clips found in selected range.", 0, total_windows);
+        return Err("Agent Video Edit could not find visible selected clips in the edit range.".into());
+    }
+
+    emit_agent_progress(&app, &started, "audio", "Using analyzed mix audio for video export...", total_windows, total_windows);
+
+    let mut command = Command::new("ffmpeg");
+    command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    for clip in &video_inputs {
+        command.arg("-i").arg(&clip.path);
+    }
+    if range_start > 0 {
+        command.arg("-ss").arg(format!("{:.3}", range_start as f64 / project.session.sample_rate as f64));
+    }
+    command
+        .arg("-t")
+        .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64))
+        .arg("-i")
+        .arg(&audio_path);
+
+    let filter = build_auto_edit_filter(&video_inputs, &segments, &project.session, range_start, range_end);
+    command
+        .arg("-filter_complex")
+        .arg(filter)
+        .arg("-map")
+        .arg("[v]")
+        .arg("-map")
+        .arg(format!("{}:a:0", video_inputs.len()));
+
+    emit_agent_progress(&app, &started, "rendering", &format!("Rendering {} selected cuts to MP4...", segments.len()), total_windows, total_windows);
+    let output = command
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-shortest")
+        .arg(&path)
+        .output()
+        .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        emit_agent_progress(&app, &started, "error", "ffmpeg failed while rendering the agent edit.", total_windows, total_windows);
+        return Err(format!("ffmpeg agent video edit failed: {}", stderr.trim()));
+    }
+    emit_agent_progress(&app, &started, "done", "Agent Video Edit complete.", total_windows, total_windows);
+    Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script })
+}
+
+#[tauri::command]
 pub async fn judge_mix_ab(
     state: State<'_, AppState>,
     session_id: String,
@@ -1065,6 +1432,26 @@ fn analyze_section_window(
 
 fn round1(x: f32) -> f32 { if x.is_finite() { (x * 10.0).round() / 10.0 } else { 0.0 } }
 fn round2(x: f32) -> f32 { if x.is_finite() { (x * 100.0).round() / 100.0 } else { 0.0 } }
+
+fn emit_agent_progress(
+    app: &AppHandle,
+    started: &std::time::Instant,
+    stage: &str,
+    message: &str,
+    current: u32,
+    total: u32,
+) {
+    let _ = app.emit(
+        "agent-video:progress",
+        AgentVideoProgress {
+            stage: stage.to_string(),
+            message: message.to_string(),
+            current,
+            total: total.max(1),
+            elapsed_seconds: started.elapsed().as_secs_f32(),
+        },
+    );
+}
 
 fn normalize_wav_path(path: PathBuf) -> PathBuf {
     if path.extension().and_then(|item| item.to_str()).is_some() {
@@ -1139,6 +1526,9 @@ fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, 
                     (((trimmed_start.saturating_sub(clip.start_sample)) as f64 / session.sample_rate as f64) * 1000.0).round() as u64
                 );
                 clips.push(VideoRenderClip {
+                    track_id: track.id.clone(),
+                    track_index,
+                    track_name: track.name.clone(),
                     path: PathBuf::from(&source.path),
                     start_sample: trimmed_start,
                     end_sample: trimmed_end,
@@ -1250,6 +1640,1077 @@ fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_sta
     }
     filter.push(';');
     filter.push_str(&format!("[base{}]format=yuv420p[v]", clips.len()));
+    filter
+}
+
+fn layout_processing_suffix(layout: &VideoLayout, reference_w: i32, reference_h: i32) -> String {
+    let layout = normalized_video_layout(layout);
+    let (out_w, out_h) = layout_output_size(&layout, reference_w, reference_h);
+    let crop_w = (1.0 - ((layout.crop_left + layout.crop_right).min(90.0) / 100.0)).max(0.05);
+    let crop_h = (1.0 - ((layout.crop_top + layout.crop_bottom).min(90.0) / 100.0)).max(0.05);
+    let crop_x = (layout.crop_left / 100.0).clamp(0.0, 0.9);
+    let crop_y = (layout.crop_top / 100.0).clamp(0.0, 0.9);
+    let mut suffix = format!(
+        ",crop=iw*{crop_w:.5}:ih*{crop_h:.5}:iw*{crop_x:.5}:ih*{crop_y:.5},scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},setsar=1"
+    );
+    let eq_brightness = (layout.brightness - 1.0).clamp(-0.8, 0.8);
+    suffix.push_str(&format!(
+        ",eq=brightness={eq_brightness:.3}:contrast={:.3}:saturation={:.3}",
+        layout.contrast.clamp(0.2, 2.0),
+        layout.saturation.clamp(0.0, 2.0)
+    ));
+    match layout.preset {
+        VideoFilterPreset::Warm => suffix.push_str(",colorchannelmixer=rr=1.06:gg=1.01:bb=0.94"),
+        VideoFilterPreset::Cool => suffix.push_str(",colorchannelmixer=rr=0.94:gg=1.01:bb=1.08"),
+        VideoFilterPreset::Mono => suffix.push_str(",hue=s=0"),
+        VideoFilterPreset::Punch => suffix.push_str(",eq=contrast=1.12:saturation=1.14"),
+        VideoFilterPreset::Dream => suffix.push_str(",boxblur=1:1,eq=brightness=0.04:saturation=0.82"),
+        VideoFilterPreset::None => {}
+    }
+    if layout.blur >= 0.5 {
+        suffix.push_str(&format!(",boxblur={}:1", layout.blur.round().clamp(1.0, 10.0)));
+    }
+    if layout.rotation.abs() >= 0.5 {
+        let radians = layout.rotation as f64 * std::f64::consts::PI / 180.0;
+        suffix.push_str(&format!(",rotate={radians:.6}:c=none:ow=rotw(iw):oh=roth(ih),scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black@0"));
+    }
+    if layout.opacity < 0.999 {
+        suffix.push_str(&format!(",format=rgba,colorchannelmixer=aa={:.3}", layout.opacity.clamp(0.0, 1.0)));
+    } else {
+        suffix.push_str(",format=rgba");
+    }
+    suffix
+}
+
+fn layout_output_size(layout: &VideoLayout, reference_w: i32, reference_h: i32) -> (i32, i32) {
+    let layout = normalized_video_layout(layout);
+    (
+        even_dimension(pct_to_px(layout.width, reference_w).max(2)),
+        even_dimension(pct_to_px(layout.height, reference_h).max(2)),
+    )
+}
+
+fn centered_layout_position(layout: &VideoLayout, reference_w: i32, reference_h: i32) -> (i32, i32) {
+    let (out_w, out_h) = layout_output_size(layout, reference_w, reference_h);
+    ((reference_w - out_w) / 2, (reference_h - out_h) / 2)
+}
+
+fn layout_summary(layout: &VideoLayout) -> String {
+    let layout = normalized_video_layout(layout);
+    format!(
+        "manual x {:.1}%, y {:.1}%, w {:.1}%, h {:.1}%, crop T/R/B/L {:.1}/{:.1}/{:.1}/{:.1}%, rotation {:.1} deg, brightness {:.2}, contrast {:.2}, saturation {:.2}, blur {:.1}, preset {:?}; agent cut placement: centered",
+        layout.x,
+        layout.y,
+        layout.width,
+        layout.height,
+        layout.crop_top,
+        layout.crop_right,
+        layout.crop_bottom,
+        layout.crop_left,
+        layout.rotation,
+        layout.brightness,
+        layout.contrast,
+        layout.saturation,
+        layout.blur,
+        layout.preset
+    )
+}
+
+fn build_auto_edit_segments(
+    clips: &[VideoRenderClip],
+    range_start: u64,
+    range_end: u64,
+    interval_samples: u64,
+    sample_rate: u32,
+) -> Vec<AutoEditSegment> {
+    let mut segments: Vec<AutoEditSegment> = Vec::new();
+    let mut cursor = range_start;
+    let mut previous_track: Option<&str> = None;
+    while cursor < range_end {
+        let next = (cursor + interval_samples).min(range_end);
+        let mut active = clips
+            .iter()
+            .enumerate()
+            .filter(|(_, clip)| clip.start_sample < next && clip.end_sample > cursor)
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            cursor = next;
+            continue;
+        }
+        active.sort_by(|(_, a), (_, b)| {
+            let a_same = previous_track == Some(a.track_id.as_str());
+            let b_same = previous_track == Some(b.track_id.as_str());
+            a_same
+                .cmp(&b_same)
+                .then_with(|| a.track_index.cmp(&b.track_index))
+                .then_with(|| a.start_sample.cmp(&b.start_sample))
+        });
+        let (input_index, clip) = active[0];
+        let segment_start = cursor.max(clip.start_sample);
+        let segment_end = next.min(clip.end_sample);
+        if segment_end > segment_start {
+            let source_offset_ms = clip.source_offset_ms.saturating_add(
+                (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64) * 1000.0).round() as u64
+            );
+            segments.push(AutoEditSegment {
+                input_index,
+                timeline_start: segment_start,
+                timeline_end: segment_end,
+                source_offset_ms,
+            });
+            previous_track = Some(clip.track_id.as_str());
+        }
+        cursor = next;
+    }
+    segments
+}
+
+fn build_fallback_agent_script(
+    clips: &[VideoRenderClip],
+    segments: &[AutoEditSegment],
+    range_start: u64,
+    range_end: u64,
+    total_windows: u32,
+    sample_rate: u32,
+    error: &str,
+) -> Vec<AgentVideoScriptEntry> {
+    let mut script = Vec::new();
+    let mut timeline_cursor = range_start;
+    let mut window_index = 0_u32;
+    let mut sorted_segments = segments.iter().collect::<Vec<_>>();
+    sorted_segments.sort_by_key(|segment| segment.timeline_start);
+    for segment in sorted_segments {
+        if segment.timeline_start > timeline_cursor {
+            window_index += 1;
+            script.push(AgentVideoScriptEntry {
+                window_index,
+                total_windows,
+                start_seconds: timeline_cursor as f64 / sample_rate as f64,
+                end_seconds: segment.timeline_start as f64 / sample_rate as f64,
+                decision: "black".into(),
+                candidates: Vec::new(),
+                chosen_track_index: None,
+                chosen_track_name: None,
+                reason: "No selected video clip is active in this gap, so it remains black to preserve sync.".into(),
+                data_provided: vec![
+                    format!("Window time: {:.2}s-{:.2}s", timeline_cursor as f64 / sample_rate as f64, segment.timeline_start as f64 / sample_rate as f64),
+                    "No active selected video candidates.".into(),
+                ],
+                model_choice: None,
+                variety_override: false,
+                source_offset_seconds: None,
+            });
+        }
+        let clip = &clips[segment.input_index];
+        window_index += 1;
+        script.push(AgentVideoScriptEntry {
+            window_index,
+            total_windows,
+            start_seconds: segment.timeline_start as f64 / sample_rate as f64,
+            end_seconds: segment.timeline_end as f64 / sample_rate as f64,
+            decision: "fallback-cut".into(),
+            candidates: vec![AgentVideoScriptCandidate {
+                image_number: 1,
+                track_index: clip.track_index,
+                track_name: clip.track_name.clone(),
+                timeline_seconds: segment.timeline_start as f64 / sample_rate as f64,
+                angle_label: Some(clip.track_name.clone()),
+                note: Some("Automatic fallback candidate.".into()),
+            }],
+            chosen_track_index: Some(clip.track_index),
+            chosen_track_name: Some(clip.track_name.clone()),
+            reason: format!("Vision model failed, so the automatic cutter selected this active angle. Error: {error}"),
+            data_provided: vec![
+                format!("Window time: {:.2}s-{:.2}s", segment.timeline_start as f64 / sample_rate as f64, segment.timeline_end as f64 / sample_rate as f64),
+                format!("Fallback candidate: {} on track {}", clip.track_name, clip.track_index + 1),
+            ],
+            model_choice: None,
+            variety_override: false,
+            source_offset_seconds: Some(segment.source_offset_ms as f64 / 1000.0),
+        });
+        timeline_cursor = segment.timeline_end;
+    }
+    if range_end > timeline_cursor {
+        window_index += 1;
+        script.push(AgentVideoScriptEntry {
+            window_index,
+            total_windows,
+            start_seconds: timeline_cursor as f64 / sample_rate as f64,
+            end_seconds: range_end as f64 / sample_rate as f64,
+            decision: "black".into(),
+            candidates: Vec::new(),
+            chosen_track_index: None,
+            chosen_track_name: None,
+            reason: "No selected video clip is active in this final gap, so it remains black to preserve sync.".into(),
+            data_provided: vec![
+                format!("Window time: {:.2}s-{:.2}s", timeline_cursor as f64 / sample_rate as f64, range_end as f64 / sample_rate as f64),
+                "No active selected video candidates.".into(),
+            ],
+            model_choice: None,
+            variety_override: false,
+            source_offset_seconds: None,
+        });
+    }
+    script
+}
+
+fn load_rendered_audio_analysis(path: &Path) -> Result<RenderedAudioAnalysis, String> {
+    let mut reader = hound::WavReader::open(path).map_err(|error| format!("Could not open rendered mix audio: {error}"))?;
+    let spec = reader.spec();
+    let channels = spec.channels.max(1) as usize;
+    let samples = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|sample| sample.map(|value| value.clamp(-1.0, 1.0)).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?,
+        hound::SampleFormat::Int if spec.bits_per_sample <= 16 => {
+            let scale = ((1_i32 << spec.bits_per_sample.saturating_sub(1)) - 1).max(1) as f32;
+            reader
+                .samples::<i16>()
+                .map(|sample| sample.map(|value| (value as f32 / scale).clamp(-1.0, 1.0)).map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        hound::SampleFormat::Int => {
+            let scale = ((1_i64 << spec.bits_per_sample.saturating_sub(1)) - 1).max(1) as f32;
+            reader
+                .samples::<i32>()
+                .map(|sample| sample.map(|value| (value as f32 / scale).clamp(-1.0, 1.0)).map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    Ok(RenderedAudioAnalysis {
+        samples,
+        channels,
+        sample_rate: spec.sample_rate,
+    })
+}
+
+fn audio_features_for_window(
+    analysis: Option<&RenderedAudioAnalysis>,
+    window_start: u64,
+    window_end: u64,
+    session_sample_rate: u32,
+) -> AgentAudioWindowFeatures {
+    let Some(analysis) = analysis else {
+        return AgentAudioWindowFeatures {
+            peak_db: -90.0,
+            rms_db: -90.0,
+            lufs_estimate: -90.0,
+            loudness: "unknown".into(),
+            transient_density: 0.0,
+            transient_activity: "unknown".into(),
+        };
+    };
+    let frame_count = analysis.samples.len() / analysis.channels.max(1);
+    let start_frame = ((window_start as f64 / session_sample_rate as f64) * analysis.sample_rate as f64)
+        .round()
+        .clamp(0.0, frame_count as f64) as usize;
+    let end_frame = ((window_end as f64 / session_sample_rate as f64) * analysis.sample_rate as f64)
+        .round()
+        .clamp(start_frame as f64, frame_count as f64) as usize;
+    if end_frame <= start_frame {
+        return AgentAudioWindowFeatures {
+            peak_db: -90.0,
+            rms_db: -90.0,
+            lufs_estimate: -90.0,
+            loudness: "silence".into(),
+            transient_density: 0.0,
+            transient_activity: "low".into(),
+        };
+    }
+
+    let mut peak = 0.0_f32;
+    let mut sum_squares = 0.0_f64;
+    let mut previous = 0.0_f32;
+    let mut transient_hits = 0_u32;
+    let mut count = 0_u32;
+    for frame in start_frame..end_frame {
+        let offset = frame * analysis.channels;
+        let mut mono = 0.0_f32;
+        for channel in 0..analysis.channels {
+            mono += analysis.samples.get(offset + channel).copied().unwrap_or(0.0);
+        }
+        mono /= analysis.channels as f32;
+        let abs = mono.abs();
+        peak = peak.max(abs);
+        sum_squares += (mono as f64) * (mono as f64);
+        if count > 0 && (mono - previous).abs() > 0.10 {
+            transient_hits += 1;
+        }
+        previous = mono;
+        count += 1;
+    }
+    let rms = (sum_squares / count.max(1) as f64).sqrt() as f32;
+    let peak_db = amplitude_to_db(peak);
+    let rms_db = amplitude_to_db(rms);
+    let lufs_estimate = (rms_db - 1.5).max(-90.0);
+    let transient_density = transient_hits as f32 / count.max(1) as f32;
+    let loudness = if rms_db < -45.0 {
+        "silence"
+    } else if rms_db < -28.0 {
+        "quiet"
+    } else if rms_db < -18.0 {
+        "medium"
+    } else {
+        "loud"
+    };
+    let transient_activity = if transient_density > 0.08 {
+        "high"
+    } else if transient_density > 0.025 {
+        "medium"
+    } else {
+        "low"
+    };
+    AgentAudioWindowFeatures {
+        peak_db: round1(peak_db),
+        rms_db: round1(rms_db),
+        lufs_estimate: round1(lufs_estimate),
+        loudness: loudness.into(),
+        transient_density: round2(transient_density),
+        transient_activity: transient_activity.into(),
+    }
+}
+
+fn amplitude_to_db(value: f32) -> f32 {
+    20.0 * value.max(0.000_001).log10()
+}
+
+fn audio_features_text(features: &AgentAudioWindowFeatures) -> String {
+    format!(
+        "peak {:.1} dBFS, RMS {:.1} dB, LUFS estimate {:.1}, loudness {}, transient activity {} ({:.2})",
+        features.peak_db,
+        features.rms_db,
+        features.lufs_estimate,
+        features.loudness,
+        features.transient_activity,
+        features.transient_density
+    )
+}
+
+async fn build_agent_edit_segments(
+    app: &AppHandle,
+    started: &std::time::Instant,
+    clips: &[VideoRenderClip],
+    session: &MixSession,
+    range_start: u64,
+    range_end: u64,
+    interval_samples: u64,
+    base_url: &str,
+    vision_model: &str,
+    edit_model: &str,
+    instructions: Option<&str>,
+    audio_analysis: Option<&RenderedAudioAnalysis>,
+    temp_dir: &Path,
+) -> Result<(Vec<AutoEditSegment>, Vec<AgentVideoScriptEntry>), String> {
+    let sample_rate = session.sample_rate;
+    let mut segments: Vec<AutoEditSegment> = Vec::new();
+    let mut script = Vec::new();
+    let mut cursor = range_start;
+    let total_windows = range_end.saturating_sub(range_start).div_ceil(interval_samples).max(1) as u32;
+    let mut window_index = 0_u32;
+    let mut previous_input_index: Option<usize> = None;
+    let mut consecutive_same = 0_u32;
+    let mut usage_counts: HashMap<usize, u32> = HashMap::new();
+    while cursor < range_end {
+        window_index += 1;
+        let next = (cursor + interval_samples).min(range_end);
+        let audio_features = audio_features_for_window(audio_analysis, cursor, next, sample_rate);
+        let active = clips
+            .iter()
+            .enumerate()
+            .filter(|(_, clip)| clip.start_sample < next && clip.end_sample > cursor)
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            emit_agent_progress(app, started, "sampling", "No active selected clip in this window; skipping.", window_index, total_windows);
+            script.push(AgentVideoScriptEntry {
+                window_index,
+                total_windows,
+                start_seconds: cursor as f64 / sample_rate as f64,
+                end_seconds: next as f64 / sample_rate as f64,
+                decision: "black".into(),
+                candidates: Vec::new(),
+                chosen_track_index: None,
+                chosen_track_name: None,
+                reason: "No selected video clip is active in this window, so the export keeps this section black to preserve sync.".into(),
+                data_provided: vec![
+                    format!("Window time: {:.2}s-{:.2}s", cursor as f64 / sample_rate as f64, next as f64 / sample_rate as f64),
+                    "Active selected video candidates: 0".into(),
+                    format!("Audio features: {}", audio_features_text(&audio_features)),
+                ],
+                model_choice: None,
+                variety_override: false,
+                source_offset_seconds: None,
+            });
+            cursor = next;
+            continue;
+        }
+        emit_agent_progress(
+            app,
+            started,
+            "sampling",
+            &format!("Extracting frames for window {window_index}/{total_windows}..."),
+            window_index,
+            total_windows,
+        );
+        let sample = cursor + (next - cursor) / 2;
+        let mut labels = Vec::new();
+        let mut images = Vec::new();
+        let mut candidates = Vec::new();
+        for (slot, (input_index, clip)) in active.iter().enumerate() {
+            let sample = sample.clamp(clip.start_sample, clip.end_sample.saturating_sub(1));
+            let frame_path = temp_dir.join(format!("shot-{}-{slot}.jpg", segments.len()));
+            if extract_video_frame(clip, sample, session, &frame_path).is_ok() {
+                if let Ok(bytes) = fs::read(&frame_path) {
+                    images.push(BASE64_STANDARD.encode(bytes));
+                    labels.push((
+                        *input_index,
+                        format!(
+                            "{} (track {}, timeline {:.2}s, {})",
+                            clip.track_name,
+                            clip.track_index + 1,
+                            sample as f64 / sample_rate as f64,
+                            layout_summary(&clip.layout)
+                        ),
+                    ));
+                    candidates.push(AgentVideoScriptCandidate {
+                        image_number: labels.len(),
+                        track_index: clip.track_index,
+                        track_name: clip.track_name.clone(),
+                        timeline_seconds: sample as f64 / sample_rate as f64,
+                        angle_label: None,
+                        note: None,
+                    });
+                }
+            }
+        }
+        if labels.is_empty() {
+            emit_agent_progress(
+                app,
+                started,
+                "sampling",
+                &format!("Window {window_index}/{total_windows}: no readable frames; skipping."),
+                window_index,
+                total_windows,
+            );
+            script.push(AgentVideoScriptEntry {
+                window_index,
+                total_windows,
+                start_seconds: cursor as f64 / sample_rate as f64,
+                end_seconds: next as f64 / sample_rate as f64,
+                decision: "black".into(),
+                candidates: Vec::new(),
+                chosen_track_index: None,
+                chosen_track_name: None,
+                reason: "The selected tracks were active here, but no readable frame could be extracted, so the export leaves this window black.".into(),
+                data_provided: vec![
+                    format!("Window time: {:.2}s-{:.2}s", cursor as f64 / sample_rate as f64, next as f64 / sample_rate as f64),
+                    format!("Active selected video candidates: {}", active.len()),
+                    "Readable extracted frames: 0".into(),
+                    format!("Audio features: {}", audio_features_text(&audio_features)),
+                ],
+                model_choice: None,
+                variety_override: false,
+                source_offset_seconds: None,
+            });
+            cursor = next;
+            continue;
+        }
+        let image_count = images.len();
+        emit_agent_progress(
+            app,
+            started,
+            "vision",
+            &format!("Stage 1/2: analyzing frames and audio for window {window_index}/{total_windows}..."),
+            window_index,
+            total_windows,
+        );
+        let frame_analysis = analyze_agent_window_frames(base_url, vision_model, &labels, images, instructions)
+            .await
+            .ok();
+        if let Some(angle_labels) = frame_analysis.as_ref().and_then(|analysis| analysis.candidate_labels.as_ref()) {
+            for (candidate, angle_label) in candidates.iter_mut().zip(angle_labels.iter()) {
+                let angle_label = angle_label.trim();
+                if !angle_label.is_empty() {
+                    candidate.angle_label = Some(angle_label.to_string());
+                }
+            }
+        }
+        if let Some(notes) = frame_analysis.as_ref().and_then(|analysis| analysis.candidate_notes.as_ref()) {
+            for (candidate, note) in candidates.iter_mut().zip(notes.iter()) {
+                let note = note.trim();
+                if !note.is_empty() {
+                    candidate.note = Some(note.to_string());
+                }
+            }
+        }
+        let frame_summary = frame_analysis
+            .as_ref()
+            .and_then(|analysis| analysis.window_summary.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("No visual summary returned.");
+        emit_agent_progress(
+            app,
+            started,
+            "decision",
+            &format!("Stage 2/2: deciding edit point for window {window_index}/{total_windows}..."),
+            window_index,
+            total_windows,
+        );
+        let previous_label = previous_input_index
+            .and_then(|previous| labels.iter().position(|(input_index, _)| *input_index == previous))
+            .map(|index| index + 1);
+        let model_choice = if image_count >= 2 {
+            decide_agent_shot(
+                base_url,
+                edit_model,
+                &labels,
+                &candidates,
+                &audio_features,
+                frame_summary,
+                previous_label,
+                consecutive_same,
+                instructions,
+            )
+                .await
+                .ok()
+        } else {
+            Some(AgentShotChoice {
+                choice: 1,
+                decision: Some("cut".into()),
+                reason: Some("Only one readable camera angle was available for this window.".into()),
+                edit_intent: Some("single available angle".into()),
+                continuity_plan: Some("Use the only available readable shot.".into()),
+            })
+        };
+        let model_requested_hold = model_choice
+            .as_ref()
+            .and_then(|choice| choice.decision.as_deref())
+            .map(|decision| decision.eq_ignore_ascii_case("hold"))
+            .unwrap_or(false);
+        let mut chosen_label_index = model_choice
+            .as_ref()
+            .and_then(|choice| choice.choice.checked_sub(1))
+            .filter(|index| *index < labels.len())
+            .unwrap_or(0);
+        if model_requested_hold {
+            if let Some(previous_label) = previous_label {
+                if previous_label > 0 && previous_label <= labels.len() {
+                    chosen_label_index = previous_label - 1;
+                }
+            }
+        }
+        let mut variety_override = false;
+        let mut coverage_override = false;
+        if labels.len() > 1 {
+            if let Some(previous) = previous_input_index {
+                let chosen_input_index = labels[chosen_label_index].0;
+                if chosen_input_index == previous && consecutive_same >= MAX_DYNAMIC_HOLD_WINDOWS {
+                    let alternate = labels
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (input_index, _))| *input_index != previous)
+                        .filter(|(label_index, _)| {
+                            candidates
+                                .get(*label_index)
+                                .and_then(|candidate| candidate.note.as_deref())
+                                .map(|note| !candidate_note_rejects_dynamic_cut(note))
+                                .unwrap_or(true)
+                        })
+                        .min_by_key(|(_, (input_index, _))| usage_counts.get(input_index).copied().unwrap_or(0))
+                        .or_else(|| {
+                            labels
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, (input_index, _))| *input_index != previous)
+                                .min_by_key(|(_, (input_index, _))| usage_counts.get(input_index).copied().unwrap_or(0))
+                        });
+                    if let Some((alternate_index, _)) = alternate {
+                        chosen_label_index = alternate_index;
+                        variety_override = true;
+                    }
+                }
+            }
+        }
+        if !variety_override && labels.len() > 1 && window_index >= MIN_WINDOWS_BEFORE_COVERAGE_CUT {
+            let chosen_input_index = labels[chosen_label_index].0;
+            let chosen_usage = usage_counts.get(&chosen_input_index).copied().unwrap_or(0);
+            let alternate = labels
+                .iter()
+                .enumerate()
+                .filter(|(_, (input_index, _))| *input_index != chosen_input_index)
+                .filter(|(label_index, _)| {
+                    candidates
+                        .get(*label_index)
+                        .and_then(|candidate| candidate.note.as_deref())
+                        .map(|note| !candidate_note_rejects_dynamic_cut(note))
+                        .unwrap_or(true)
+                })
+                .min_by_key(|(_, (input_index, _))| usage_counts.get(input_index).copied().unwrap_or(0));
+            if let Some((alternate_index, (alternate_input_index, _))) = alternate {
+                let alternate_usage = usage_counts.get(alternate_input_index).copied().unwrap_or(0);
+                let usage_gap = chosen_usage.saturating_sub(alternate_usage);
+                if alternate_usage == 0 || usage_gap >= MIN_USAGE_GAP_FOR_COVERAGE_CUT {
+                    chosen_label_index = alternate_index;
+                    coverage_override = true;
+                    variety_override = true;
+                }
+            }
+        }
+        let input_index = labels[chosen_label_index].0;
+        let clip = &clips[input_index];
+        let segment_start = cursor.max(clip.start_sample);
+        let segment_end = next.min(clip.end_sample);
+        if segment_end > segment_start {
+            let source_offset_ms = clip.source_offset_ms.saturating_add(
+                (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64) * 1000.0).round() as u64
+            );
+            if let Some(previous_segment) = segments
+                .last_mut()
+                .filter(|segment| segment.input_index == input_index && segment.timeline_end == segment_start)
+            {
+                previous_segment.timeline_end = segment_end;
+            } else {
+                segments.push(AutoEditSegment {
+                    input_index,
+                    timeline_start: segment_start,
+                    timeline_end: segment_end,
+                    source_offset_ms,
+                });
+            }
+            *usage_counts.entry(input_index).or_insert(0) += 1;
+            let entering_previous_input_index = previous_input_index;
+            let held_count_before_update = if previous_input_index == Some(input_index) {
+                consecutive_same
+            } else {
+                0
+            };
+            if previous_input_index == Some(input_index) {
+                consecutive_same += 1;
+            } else {
+                previous_input_index = Some(input_index);
+                consecutive_same = 1;
+            }
+            let model_reason = model_choice
+                .as_ref()
+                .and_then(|choice| choice.reason.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("The model selected this as the strongest readable shot for this edit window.");
+            let edit_intent = model_choice
+                .as_ref()
+                .and_then(|choice| choice.edit_intent.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let chosen_image_number = chosen_label_index + 1;
+            let model_decision = if coverage_override {
+                "coverage-cut"
+            } else if variety_override {
+                "dynamic-cut"
+            } else if model_requested_hold && held_count_before_update > 0 {
+                "hold"
+            } else if held_count_before_update > 0 {
+                "continue"
+            } else {
+                "cut"
+            };
+            let selected_note = candidates
+                .iter()
+                .find(|candidate| candidate.image_number == chosen_image_number)
+                .and_then(|candidate| candidate.note.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let continuity_plan = model_choice
+                .as_ref()
+                .and_then(|choice| choice.continuity_plan.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let reason = if coverage_override {
+                let model_pick = model_choice.as_ref().map(|choice| choice.choice).unwrap_or(chosen_image_number);
+                let selected_note = selected_note.unwrap_or("the underused alternate angle was readable and active in this window");
+                format!(
+                    "Decision coverage-cut. Image {chosen_image_number} ({}) was selected because this camera had been underused while other active angles were already used. The model's raw pick was image {model_pick}; alternate evidence: {selected_note}",
+                    clip.track_name
+                )
+            } else if variety_override {
+                let model_pick = model_choice.as_ref().map(|choice| choice.choice).unwrap_or(chosen_image_number);
+                let selected_note = selected_note.unwrap_or("the alternate angle was readable and active in this window");
+                format!(
+                    "Decision dynamic-cut. Image {chosen_image_number} ({}) was selected to add needed camera movement after holding the previous angle for {held_count_before_update} window(s). The model's raw pick was image {model_pick}; alternate evidence: {selected_note}",
+                    clip.track_name
+                )
+            } else if let Some(edit_intent) = edit_intent {
+                format!("Decision {model_decision}. Image {chosen_image_number} ({}) for {edit_intent}: {model_reason}", clip.track_name)
+            } else {
+                format!("Decision {model_decision}. Image {chosen_image_number} ({}): {model_reason}", clip.track_name)
+            };
+            let reason = if let Some(plan) = continuity_plan {
+                format!("{reason} Continuity plan: {plan}")
+            } else if let Some(selected_note) = selected_note {
+                format!("{reason} Selected-frame evidence: {selected_note}")
+            } else {
+                reason
+            };
+            let source_offset_seconds = source_offset_ms as f64 / 1000.0;
+            let mut data_provided = vec![
+                format!("Window time: {:.2}s-{:.2}s", cursor as f64 / sample_rate as f64, next as f64 / sample_rate as f64),
+                format!("Sample frame time: {:.2}s", sample as f64 / sample_rate as f64),
+                format!("Interval size: {:.2}s", interval_samples as f64 / sample_rate as f64),
+                match entering_previous_input_index {
+                    Some(previous) => {
+                        let previous_clip = &clips[previous];
+                        format!(
+                            "Previous shot entering decision: {} on track {}, held for {} window(s)",
+                            previous_clip.track_name,
+                            previous_clip.track_index + 1,
+                            held_count_before_update
+                        )
+                    }
+                    None => "Previous shot entering decision: none".into(),
+                },
+                format!("Active selected video candidates: {}", labels.len()),
+                format!("Dynamic hold limit: {MAX_DYNAMIC_HOLD_WINDOWS} window(s) before using a readable alternate"),
+                format!("Coverage rule: after {MIN_WINDOWS_BEFORE_COVERAGE_CUT} windows, use readable underused cameras when their usage trails by {MIN_USAGE_GAP_FOR_COVERAGE_CUT}+"),
+                format!("User instructions: {}", instructions.unwrap_or("none")),
+                format!("Vision model: {vision_model}"),
+                format!("Edit decision model: {edit_model}"),
+                format!("Audio features: {}", audio_features_text(&audio_features)),
+                format!("Frame-analysis summary: {frame_summary}"),
+            ];
+            data_provided.extend(candidates.iter().map(|candidate| {
+                let layout = active
+                    .iter()
+                    .find(|(_, clip)| clip.track_index == candidate.track_index && clip.track_name == candidate.track_name)
+                    .map(|(_, clip)| layout_summary(&clip.layout))
+                    .unwrap_or_else(|| "unavailable".into());
+                format!(
+                    "Image {}: {} on track {} at {:.2}s, canvas layout: {}{}{}",
+                    candidate.image_number,
+                    candidate.track_name,
+                    candidate.track_index + 1,
+                    candidate.timeline_seconds,
+                    layout,
+                    candidate
+                        .angle_label
+                        .as_deref()
+                        .map(|label| format!(", agent label: {label}"))
+                        .unwrap_or_default(),
+                    candidate
+                        .note
+                        .as_deref()
+                        .map(|note| format!(", note: {note}"))
+                        .unwrap_or_default()
+                )
+            }));
+            script.push(AgentVideoScriptEntry {
+                window_index,
+                total_windows,
+                start_seconds: segment_start as f64 / sample_rate as f64,
+                end_seconds: segment_end as f64 / sample_rate as f64,
+                decision: model_decision.into(),
+                candidates,
+                chosen_track_index: Some(clip.track_index),
+                chosen_track_name: Some(clip.track_name.clone()),
+                reason,
+                data_provided,
+                model_choice: model_choice.as_ref().map(|choice| choice.choice),
+                variety_override,
+                source_offset_seconds: Some(source_offset_seconds),
+            });
+            let message = if variety_override {
+                format!(
+                    "Window {window_index}/{total_windows}: switched to selected video track {} for angle variation.",
+                    clip.track_index + 1
+                )
+            } else {
+                format!(
+                    "Window {window_index}/{total_windows}: chose selected video track {}.",
+                    clip.track_index + 1
+                )
+            };
+            emit_agent_progress(
+                app,
+                started,
+                "decision",
+                &message,
+                window_index,
+                total_windows,
+            );
+        }
+        cursor = next;
+    }
+    Ok((segments, script))
+}
+
+fn extract_video_frame(clip: &VideoRenderClip, sample: u64, session: &MixSession, output_path: &Path) -> Result<(), String> {
+    let sample_rate = session.sample_rate;
+    let source_offset = clip.source_offset_ms as f64 / 1000.0
+        + sample.saturating_sub(clip.start_sample) as f64 / sample_rate as f64;
+    let canvas = &session.video_canvas;
+    let output_w = even_dimension(canvas.width.clamp(240, 3840) as i32);
+    let output_h = even_dimension(canvas.height.clamp(240, 3840) as i32);
+    let background = ffmpeg_color(&canvas.background);
+    let (x, y) = centered_layout_position(&clip.layout, output_w, output_h);
+    let suffix = layout_processing_suffix(&clip.layout, output_w, output_h);
+    let filter = format!(
+        "[0:v]setpts=PTS-STARTPTS{suffix}[clip];[1:v][clip]overlay={x}:{y}:eof_action=pass,format=yuv420p[v]"
+    );
+    let output = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-ss")
+        .arg(format!("{source_offset:.3}"))
+        .arg("-i")
+        .arg(&clip.path)
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg(format!("color=c={background}:s={output_w}x{output_h}:d=1"))
+        .arg("-filter_complex")
+        .arg(filter)
+        .arg("-map")
+        .arg("[v]")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-q:v")
+        .arg("3")
+        .arg(output_path)
+        .output()
+        .map_err(|error| format!("Could not extract video frame: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg frame extraction failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+fn candidate_note_rejects_dynamic_cut(note: &str) -> bool {
+    let note = note.to_ascii_lowercase();
+    [
+        "black",
+        "blocked",
+        "empty",
+        "unreadable",
+        "unusable",
+        "no useful",
+        "too dark",
+        "very dark",
+        "blurry",
+        "out of focus",
+        "occluded",
+    ]
+    .iter()
+    .any(|term| note.contains(term))
+}
+
+async fn analyze_agent_window_frames(
+    base_url: &str,
+    model: &str,
+    labels: &[(usize, String)],
+    images: Vec<String>,
+    instructions: Option<&str>,
+) -> Result<AgentWindowFrameAnalysis, String> {
+    let label_text = labels
+        .iter()
+        .enumerate()
+        .map(|(index, (_, label))| format!("{} = {label}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let instruction_note = instructions
+        .map(|value| format!("User edit instructions for context:\n{value}\n"))
+        .unwrap_or_else(|| "User edit instructions: none.\n".to_string());
+    let prompt = format!(
+        "Stage 1 of a two-stage multicam edit. Analyze the visible content of each simultaneous camera frame.\n\
+         {instruction_note}\
+         Do not decide cuts yet. Only describe what is visible and useful for editing.\n\
+         Assign each image a short angle label, such as \"wide room\", \"overhead/top-down\", \"face/profile\", \"guitar hands\", \"fretboard close-up\", \"keyboard hands\", \"drums\", \"dark/weak angle\", or \"blocked/unclear\".\n\
+         For each candidate note, use concrete visible evidence: framing, face/eyes, hands, instrument, gesture, motion, focus, exposure, occlusion, and shot uniqueness. Never write the literal phrase \"concrete note\".\n\
+         Images are in this order:\n{label_text}\n\
+         Reply only as JSON with this shape:\n\
+         {{\"window_summary\":\"one sentence summarizing the available visual choices\", \"candidate_labels\":[\"overhead/top-down\", \"face/profile\"], \"candidate_notes\":[\"Image 1: visible framing/action/quality in 8-14 words\", \"Image 2: visible framing/action/quality in 8-14 words\"]}}"
+    );
+    let parsed = call_ollama_chat(base_url, model, prompt, Some(images)).await?;
+    let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
+    serde_json::from_str::<AgentWindowFrameAnalysis>(&extracted)
+        .map_err(|error| format!("Could not parse frame analysis response: {error}"))
+}
+
+async fn decide_agent_shot(
+    base_url: &str,
+    model: &str,
+    labels: &[(usize, String)],
+    candidates: &[AgentVideoScriptCandidate],
+    audio_features: &AgentAudioWindowFeatures,
+    frame_summary: &str,
+    previous_label: Option<usize>,
+    consecutive_same: u32,
+    instructions: Option<&str>,
+) -> Result<AgentShotChoice, String> {
+    let label_text = labels
+        .iter()
+        .enumerate()
+        .map(|(index, (_, label))| format!("{} = {label}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let continuity_note = previous_label
+        .map(|label| {
+            format!(
+                "Previous chosen image number was {label}, held for {consecutive_same} consecutive edit window(s). You may HOLD it if the current alternatives do not justify a cohesive cut, but if it has held for 3+ windows you should actively look for a readable alternate to create dynamics."
+            )
+        })
+        .unwrap_or_else(|| "No previous shot has been chosen yet.".to_string());
+    let instruction_note = instructions
+        .map(|value| format!("User edit instructions. Treat these as creative guidelines unless they would force a black/unusable shot:\n{value}\n"))
+        .unwrap_or_else(|| "User edit instructions: none.\n".to_string());
+    let candidate_text = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "Image {} = {} (track {}, timeline {:.2}s), label: {}, visual note: {}",
+                candidate.image_number,
+                candidate.track_name,
+                candidate.track_index + 1,
+                candidate.timeline_seconds,
+                candidate.angle_label.as_deref().unwrap_or("unlabeled"),
+                candidate.note.as_deref().unwrap_or("no visual note")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let audio_text = audio_features_text(audio_features);
+    let prompt = format!(
+        "Stage 2 of a two-stage multicam edit. You are deciding whether to HOLD or CUT for a music performance at this exact moment.\n\
+         {instruction_note}\
+         Use the Stage 1 visual analysis plus audio features. Do not invent visual or musical facts beyond the data below.\n\
+         Window visual summary: {frame_summary}\n\
+         Audio features: {audio_text}\n\
+         Candidate frame analysis:\n{candidate_text}\n\
+         CUT only when the new shot creates a coherent edit: a meaningfully different angle, better performance detail, face/reaction, clearer action, or a sensible pacing change. HOLD when changing would feel arbitrary or sudden, but do not park the whole edit on one camera when another usable angle exists.\n\
+         Use audio to support pacing: high transient activity or loud sections can justify a cut; quiet/low-transient sections should favor holds unless the new visual is clearly better.\n\
+         With two or more readable cameras, aim for visual dynamics over the section: after several held windows, prefer a clean alternate angle even if the current angle is still good.\n\
+         {continuity_note}\n\
+         Candidate index mapping:\n{label_text}\n\
+         Reply only as JSON with this shape:\n\
+         {{\"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"hold continuity | wide context | hands detail | face/reaction | motion accent | pacing variation\", \"reason\": \"one specific sentence explaining why this is a hold or cut using visual + audio data\", \"continuity_plan\": \"how this decision supports the surrounding edit\", \"confidence\": \"low|medium|high\"}}"
+    );
+    let parsed = call_ollama_chat(base_url, model, prompt, None).await?;
+    let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
+    let choice = serde_json::from_str::<AgentShotChoice>(&extracted)
+        .map_err(|error| format!("Could not parse agent edit choice: {error}"))?;
+    Ok(choice)
+}
+
+async fn call_ollama_chat(
+    base_url: &str,
+    model: &str,
+    prompt: String,
+    images: Option<Vec<String>>,
+) -> Result<OllamaChatResponse, String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/api/chat"))
+        .json(&OllamaChatRequest {
+            model: model.to_string(),
+            stream: false,
+            messages: vec![OllamaChatMessage {
+                role: "user".into(),
+                content: prompt,
+                images,
+            }],
+        })
+        .send()
+        .await
+        .map_err(|error| format!("Could not call Ollama model: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Ollama model returned {}", response.status()));
+    }
+    response
+        .json::<OllamaChatResponse>()
+        .await
+        .map_err(|error| format!("Could not parse Ollama response: {error}"))
+}
+
+fn build_auto_edit_filter(
+    clips: &[VideoRenderClip],
+    segments: &[AutoEditSegment],
+    session: &MixSession,
+    range_start: u64,
+    range_end: u64,
+) -> String {
+    let canvas = &session.video_canvas;
+    let output_w = even_dimension(canvas.width.clamp(240, 3840) as i32);
+    let output_h = even_dimension(canvas.height.clamp(240, 3840) as i32);
+    let background = ffmpeg_color(&canvas.background);
+    let mut filter = String::new();
+    let mut concat_labels = Vec::new();
+    let mut timeline_cursor = range_start;
+    let mut part_index = 0_usize;
+    let mut sorted_segments = segments.iter().collect::<Vec<_>>();
+    sorted_segments.sort_by_key(|segment| segment.timeline_start);
+
+    for segment in sorted_segments {
+        let segment_start = segment.timeline_start.max(range_start).min(range_end);
+        let segment_end = segment.timeline_end.max(range_start).min(range_end);
+        if segment_end <= segment_start {
+            continue;
+        }
+        if segment_start > timeline_cursor {
+            let duration = segment_start.saturating_sub(timeline_cursor) as f64 / session.sample_rate as f64;
+            if !filter.is_empty() {
+                filter.push(';');
+            }
+            filter.push_str(&format!(
+                "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,format=yuv420p[v{part_index}]"
+            ));
+            concat_labels.push(format!("[v{part_index}]"));
+            part_index += 1;
+            timeline_cursor = segment_start;
+        }
+        let effective_start = segment_start.max(timeline_cursor);
+        if segment_end <= effective_start {
+            continue;
+        }
+        let clip = &clips[segment.input_index];
+        let duration = segment_end.saturating_sub(effective_start) as f64 / session.sample_rate as f64;
+        let source_offset = segment.source_offset_ms as f64 / 1000.0
+            + effective_start.saturating_sub(segment.timeline_start) as f64 / session.sample_rate as f64;
+        let (x, y) = centered_layout_position(&clip.layout, output_w, output_h);
+        let suffix = layout_processing_suffix(&clip.layout, output_w, output_h);
+        if !filter.is_empty() {
+            filter.push(';');
+        }
+        filter.push_str(&format!(
+            "[{}:v]trim=start={source_offset:.3}:duration={duration:.3},setpts=PTS-STARTPTS{suffix}[clip{part_index}];color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1[base{part_index}];[base{part_index}][clip{part_index}]overlay={x}:{y}:eof_action=pass,format=yuv420p[v{part_index}]",
+            segment.input_index
+        ));
+        concat_labels.push(format!("[v{part_index}]"));
+        part_index += 1;
+        timeline_cursor = segment_end;
+    }
+    if range_end > timeline_cursor {
+        let duration = range_end.saturating_sub(timeline_cursor) as f64 / session.sample_rate as f64;
+        if !filter.is_empty() {
+            filter.push(';');
+        }
+        filter.push_str(&format!(
+            "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,format=yuv420p[v{part_index}]"
+        ));
+        concat_labels.push(format!("[v{part_index}]"));
+        part_index += 1;
+    }
+    if filter.is_empty() {
+        let duration = range_end.saturating_sub(range_start) as f64 / session.sample_rate as f64;
+        filter.push_str(&format!(
+            "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,format=yuv420p[v0]"
+        ));
+        concat_labels.push("[v0]".to_string());
+        part_index = 1;
+    }
+    filter.push(';');
+    filter.push_str(&concat_labels.join(""));
+    filter.push_str(&format!("concat=n={part_index}:v=1:a=0[v]"));
     filter
 }
 

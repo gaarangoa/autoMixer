@@ -27,7 +27,9 @@
           "$DATA/automixer/videos/**",
           "$DATA/automixer/recordings/**",
           "$APPDATA/videos/**",
-          "$APPDATA/recordings/**"
+          "$APPDATA/recordings/**",
+          "$HOME/**",
+          "/Volumes/**"
         ]
       }
     }

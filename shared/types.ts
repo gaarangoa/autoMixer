@@ -135,6 +135,31 @@ export type VideoCanvas = {
   background: string;
 };
 
+export type AgentVideoScriptCandidate = {
+  imageNumber: number;
+  trackIndex: number;
+  trackName: string;
+  timelineSeconds: number;
+  angleLabel?: string | null;
+  note?: string | null;
+};
+
+export type AgentVideoScriptEntry = {
+  windowIndex: number;
+  totalWindows: number;
+  startSeconds: number;
+  endSeconds: number;
+  decision: string;
+  candidates: AgentVideoScriptCandidate[];
+  chosenTrackIndex?: number | null;
+  chosenTrackName?: string | null;
+  reason: string;
+  dataProvided: string[];
+  modelChoice?: number | null;
+  varietyOverride: boolean;
+  sourceOffsetSeconds?: number | null;
+};
+
 export type Track = {
   id: Id;
   kind?: "audio" | "video";

@@ -460,6 +460,7 @@ mod tests {
             sample_rate: 48_000,
             bpm: None,
             source_files: Vec::new(),
+            video_source_files: Vec::new(),
             tracks: Vec::new(),
             buses: Vec::new(),
             master: default_master(),
