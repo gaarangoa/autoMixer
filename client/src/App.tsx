@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Camera, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Settings, Square, Trash2, Upload, Video } from "lucide-react";
-import type { AbJudgeResponse, AgentVideoScriptEntry, AssistantResponse, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoLayout } from "../../shared/types";
+import type { AbJudgeResponse, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -107,7 +107,9 @@ export function App() {
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
   const [selectedRegionIds, setSelectedRegionIds] = useState<string[]>([]);
   const [selectedClip, setSelectedClip] = useState<{ trackId: string; clipId: string } | undefined>();
-  const [selectedRange, setSelectedRange] = useState<{ trackId: string; start: number; end: number } | undefined>();
+  const [selectedClips, setSelectedClips] = useState<{ trackId: string; clipId: string }[]>([]);
+  const [clipMenu, setClipMenu] = useState<{ x: number; y: number } | null>(null);
+  const [selectedRange, setSelectedRange] = useState<{ trackId?: string; start: number; end: number } | undefined>();
   const [alignmentGuideSeconds, setAlignmentGuideSeconds] = useState<number | undefined>();
   const [draggingTrackIds, setDraggingTrackIds] = useState<string[]>([]);
   const [trackDropTarget, setTrackDropTarget] = useState<{ trackId: string; position: "before" | "after" } | null>(null);
@@ -135,6 +137,7 @@ export function App() {
   const [bypass, setBypass] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
+  const [addTrackMenuOpen, setAddTrackMenuOpen] = useState(false);
   const [sessionList, setSessionList] = useState<MixSession[]>([]);
   const [renameDraft, setRenameDraft] = useState<string | null>(null);
   const [newDraft, setNewDraft] = useState<string | null>(null);
@@ -147,6 +150,12 @@ export function App() {
   const [agentEditStatus, setAgentEditStatus] = useState<string | null>(null);
   const [agentEditProgress, setAgentEditProgress] = useState<{ stage: string; message: string; current: number; total: number; elapsedSeconds: number } | null>(null);
   const [agentEditScript, setAgentEditScript] = useState<AgentVideoScriptEntry[]>([]);
+  const [agentEditContext, setAgentEditContext] = useState<{ trackId: string; clipId: string; sourceTrackIds: string[] } | null>(null);
+  const [agentEditLook, setAgentEditLook] = useState<VideoFilterPreset>("none");
+  // The plan the agent produced from the last Send. The user reviews/edits it then
+  // clicks Process to actually render. Null = no plan pending.
+  const [agentPlan, setAgentPlan] = useState<AgentVideoScriptEntry[] | null>(null);
+  const [agentPlanContext, setAgentPlanContext] = useState<{ sourceTrackIds: string[]; startSample?: number; endSample?: number; intervalSeconds: number } | null>(null);
   const [, setMainVideoEdit] = useState<MainVideoEdit>({ script: [] });
   const [videoEditHistory, setVideoEditHistory] = useState<VideoEditHistoryItem[]>([]);
   const [videoChatMessages, setVideoChatMessages] = useState<VideoChatMessage[]>([]);
@@ -158,7 +167,7 @@ export function App() {
   const [reasoning, setReasoning] = useState<{ phase: string; text: string; tokens: { prompt: number; response: number; elapsedMs: number } | null }[]>([]);
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const [streamingTurn, setStreamingTurn] = useState<{ phase: string; text: string } | null>(null);
-  const [mode, setMode] = useState<"interactive" | "auto">("interactive");
+  const [mode, setMode] = useState<"interactive" | "auto" | "video">("interactive");
   const [autoMixStages, setAutoMixStages] = useState<{ stageId: string; displayName: string; status: string; actionCount: number; warnings: string[]; error?: string; tokens: number; elapsedMs: number; explanation?: string }[]>([]);
   const [autoMixRunning, setAutoMixRunning] = useState(false);
   const [ollamaUrl, setOllamaUrl] = useState(() => initialOllamaUrlRef.current ?? DEFAULT_OLLAMA_URL);
@@ -379,25 +388,33 @@ export function App() {
       setVideoEditHistory([]);
       setVideoChatMessages([]);
       setMainVideoEdit({ script: [] });
+      setAgentEditScript([]);
+      setAgentEditContext(null);
       setVideoHistoryLoadedSessionId(session.id);
       return;
     }
     try {
-      const parsed = JSON.parse(raw) as { history?: VideoEditHistoryItem[]; chat?: VideoChatMessage[] } | VideoEditHistoryItem[];
+      const parsed = JSON.parse(raw) as { history?: VideoEditHistoryItem[]; chat?: VideoChatMessage[]; context?: typeof agentEditContext } | VideoEditHistoryItem[];
       if (Array.isArray(parsed)) {
         setVideoEditHistory(parsed);
         setVideoChatMessages([]);
         setMainVideoEdit(parsed[0] ? { script: parsed[0].script, outputPath: parsed[0].outputPath, createdAt: parsed[0].createdAt } : { script: [] });
+        setAgentEditScript(parsed[0]?.script ?? []);
+        setAgentEditContext(null);
       } else {
         const history = Array.isArray(parsed.history) ? parsed.history : [];
         setVideoEditHistory(history);
         setVideoChatMessages(Array.isArray(parsed.chat) ? parsed.chat : []);
         setMainVideoEdit(history[0] ? { script: history[0].script, outputPath: history[0].outputPath, createdAt: history[0].createdAt } : { script: [] });
+        setAgentEditScript(history[0]?.script ?? []);
+        setAgentEditContext(parsed.context ?? null);
       }
     } catch {
       setVideoEditHistory([]);
       setVideoChatMessages([]);
       setMainVideoEdit({ script: [] });
+      setAgentEditScript([]);
+      setAgentEditContext(null);
     }
     setVideoHistoryLoadedSessionId(session.id);
   }, [session?.id]);
@@ -406,9 +423,9 @@ export function App() {
     if (!session || videoHistoryLoadedSessionId !== session.id) return;
     localStorage.setItem(
       `autoMixer.videoEditHistory.${session.id}`,
-      JSON.stringify({ history: videoEditHistory.slice(0, 20), chat: videoChatMessages.slice(-80) })
+      JSON.stringify({ history: videoEditHistory.slice(0, 20), chat: videoChatMessages.slice(-80), context: agentEditContext })
     );
-  }, [session?.id, videoHistoryLoadedSessionId, videoEditHistory, videoChatMessages]);
+  }, [session?.id, videoHistoryLoadedSessionId, videoEditHistory, videoChatMessages, agentEditContext]);
 
   useEffect(() => {
     localStorage.setItem("autoMixer.geminiApiKey", geminiApiKey);
@@ -579,11 +596,39 @@ export function App() {
   }, [session, selectedClip]);
 
   useEffect(() => {
-    if (!session || !selectedRange) return;
+    if (!session || !selectedRange || !selectedRange.trackId) return;
     if (!session.tracks.some((track) => track.id === selectedRange.trackId)) {
       setSelectedRange(undefined);
     }
   }, [session, selectedRange]);
+
+  // Drop any multi-selected clips that no longer exist (session switch, deletes, etc.).
+  useEffect(() => {
+    if (!session) {
+      setSelectedClips((prev) => (prev.length === 0 ? prev : []));
+      return;
+    }
+    setSelectedClips((prev) => {
+      const next = prev.filter((ref) => {
+        const track = session.tracks.find((item) => item.id === ref.trackId);
+        if (!track) return false;
+        if (ref.clipId === `legacy-${track.id}`) return track.clips.length === 0;
+        const clips = track.kind === "video" ? (track.videoClips ?? []) : track.clips;
+        return clips.some((clip) => clip.id === ref.clipId);
+      });
+      return next.length === prev.length ? prev : next;
+    });
+  }, [session]);
+
+  // Close the clip context menu on Escape.
+  useEffect(() => {
+    if (!clipMenu) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setClipMenu(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [clipMenu]);
 
   const duration = useMemo(() => {
     if (!session) return 0;
@@ -648,9 +693,15 @@ export function App() {
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (event.key !== "Delete" && event.key !== "Backspace") return;
       const target = event.target as HTMLElement | null;
-      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) return;
+      const inField = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable);
+      if (event.key === "Escape" && !inField && selectedRange) {
+        event.preventDefault();
+        setSelectedRange(undefined);
+        return;
+      }
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      if (inField) return;
       if (!session || busy) return;
       if (selectedRange) {
         event.preventDefault();
@@ -872,10 +923,10 @@ export function App() {
     }
   }
 
-  async function addRecordingTrack() {
+  async function addRecordingTrack(channels: 1 | 2 = 1) {
     if (!session) return;
     try {
-      const updated = await api.createRecordingTrack(session.id);
+      const updated = await api.createRecordingTrack(session.id, channels);
       setProject(updated);
       const added = updated.session.tracks[updated.session.tracks.length - 1];
       if (added) {
@@ -1391,6 +1442,60 @@ export function App() {
     setSelectedClip({ trackId, clipId });
   }
 
+  // Start sample of a clip (or the track itself for the legacy whole-track clip).
+  function clipStartSample(ref: { trackId: string; clipId: string }): number | undefined {
+    if (!session) return undefined;
+    const track = session.tracks.find((item) => item.id === ref.trackId);
+    if (!track) return undefined;
+    if (ref.clipId === `legacy-${track.id}`) return track.startSample;
+    const clips = track.kind === "video" ? (track.videoClips ?? []) : track.clips;
+    return clips.find((clip) => clip.id === ref.clipId)?.startSample;
+  }
+
+  // Shift every selected clip so its left edge matches the reference clip's start, as one undo step.
+  async function alignClipsLeft(refTrackId: string, refClipId: string) {
+    if (!session) return;
+    const refStart = clipStartSample({ trackId: refTrackId, clipId: refClipId });
+    if (refStart === undefined) return;
+    const forward: JsonPatch[] = [];
+    const inverse: JsonPatch[] = [];
+    const arrayEdits = new Map<number, { field: "clips" | "videoClips"; before: (ClipRegion | VideoClipRegion)[]; next: (ClipRegion | VideoClipRegion)[] }>();
+    for (const ref of selectedClips) {
+      if (ref.trackId === refTrackId && ref.clipId === refClipId) continue;
+      const trackIndex = session.tracks.findIndex((item) => item.id === ref.trackId);
+      if (trackIndex < 0) continue;
+      const track = session.tracks[trackIndex];
+      if (ref.clipId === `legacy-${track.id}`) {
+        if (track.startSample === refStart) continue;
+        forward.push({ op: "replace", path: `/tracks/${trackIndex}/startSample`, value: refStart });
+        inverse.push({ op: "replace", path: `/tracks/${trackIndex}/startSample`, value: track.startSample });
+        continue;
+      }
+      const field = track.kind === "video" ? "videoClips" : "clips";
+      const before = (track.kind === "video" ? track.videoClips : track.clips) ?? [];
+      let edit = arrayEdits.get(trackIndex);
+      if (!edit) {
+        edit = { field, before, next: [...before] };
+        arrayEdits.set(trackIndex, edit);
+      }
+      edit.next = edit.next.map((clip) => clip.id === ref.clipId
+        ? { ...clip, startSample: refStart, endSample: refStart + (clip.endSample - clip.startSample) }
+        : clip
+      );
+    }
+    for (const [trackIndex, edit] of arrayEdits) {
+      forward.push({ op: "replace", path: `/tracks/${trackIndex}/${edit.field}`, value: edit.next });
+      inverse.push({ op: "replace", path: `/tracks/${trackIndex}/${edit.field}`, value: edit.before });
+    }
+    if (forward.length === 0) return;
+    try {
+      const updated = await api.applyPatch(session.id, forward, inverse, "Left-aligned clips");
+      setProject(updated);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
   async function updateVideoClipLayout(event: CameraPreviewLayoutEvent) {
     if (!session) return;
     const trackIndex = session.tracks.findIndex((track) => track.id === event.trackId);
@@ -1495,8 +1600,8 @@ export function App() {
     }
   }
 
-  async function deleteClipRange(range: { trackId: string; start: number; end: number }) {
-    if (!session) return;
+  async function deleteClipRange(range: { trackId?: string; start: number; end: number }) {
+    if (!session || !range.trackId) return;
     const track = session.tracks.find((item) => item.id === range.trackId);
     if (!track) return;
     const start = Math.max(0, Math.min(range.start, range.end));
@@ -1586,6 +1691,19 @@ export function App() {
         : response.message;
       setMessages((items) => [...items, { role: "system", text }]);
     }
+  }
+
+  // Stop a running/mistaken agent run by restarting the app. Flush the conversation
+  // first so the debounced chat save can't be cut off by the immediate restart.
+  async function stopAndRestart() {
+    if (session) {
+      try {
+        await api.saveChatMessages(session.id, messages);
+      } catch {
+        // best effort; restart anyway
+      }
+    }
+    await api.restartApp();
   }
 
   async function doUndo() {
@@ -2013,7 +2131,9 @@ export function App() {
     }
   }
 
-  async function renderAgentVideoEdit(sampleIntervalSeconds: number) {
+  // Send produces a PLAN (the script of cuts) for the user to review/edit. Nothing
+  // is rendered yet — the user clicks Process to render from the (possibly edited) plan.
+  async function renderAgentVideoEdit(sampleIntervalSeconds: number, instructionsOverride?: string) {
     if (!session) return;
     const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video"));
     if (selectedVideoTrackIds.length === 0) {
@@ -2028,45 +2148,224 @@ export function App() {
     }
     const visionModel = agentVideoModel.trim() || DEFAULT_AGENT_VIDEO_MODEL;
     const editModel = agentVideoEditModel.trim() || ollamaModel.trim() || DEFAULT_OLLAMA_MODEL;
+    const instructions = (instructionsOverride ?? agentVideoInstructions).trim();
     const range = selectedRange
       ? {
           startSample: Math.round(Math.max(0, Math.min(selectedRange.start, selectedRange.end)) * session.sampleRate),
           endSample: Math.round(Math.max(0, Math.max(selectedRange.start, selectedRange.end)) * session.sampleRate),
         }
       : undefined;
-    const outputPath = await save({
-      defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}_agent_edit.mp4`,
-      filters: [{ name: "MP4", extensions: ["mp4"] }]
-    });
-    if (!outputPath) return;
     setBusy(true);
     setAgentEditScript([]);
-    setAgentEditProgress({ stage: "starting", message: "Starting Agent Video Edit...", current: 0, total: 1, elapsedSeconds: 0 });
-    setAgentEditStatus(`Running ${visionModel} for vision and ${editModel} for edit decisions...`);
+    setAgentPlan(null);
+    setAgentPlanContext(null);
+    setAgentEditProgress({ stage: "starting", message: "Planning agent video edit...", current: 0, total: 1, elapsedSeconds: 0 });
+    setAgentEditStatus(`Running ${visionModel} + ${editModel} to plan cuts...`);
     try {
-      const result = await api.renderAgentVideoEdit(session.id, outputPath, range?.startSample, range?.endSample, selectedVideoTrackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, agentVideoInstructions.trim());
+      // planOnly = true: backend runs vision + edit models and returns the script,
+      // skipping the ffmpeg render step. The user reviews/edits the plan, then clicks
+      // Process to render.
+      const result = await api.renderAgentVideoEdit(session.id, undefined, range?.startSample, range?.endSample, selectedVideoTrackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, instructions, true);
       const rangeText = range ? ` (${formatTime(range.startSample / session.sampleRate)}-${formatTime(range.endSample / session.sampleRate)})` : "";
       setAgentEditScript(result.script);
-      setVideoEditHistory((items) => [{
-        id: `${Date.now()}`,
-        createdAt: new Date().toISOString(),
-        outputPath,
-        visionModel,
-        editModel,
+      setAgentPlan(result.script);
+      setAgentPlanContext({
+        sourceTrackIds: selectedVideoTrackIds,
+        startSample: range?.startSample,
+        endSample: range?.endSample,
         intervalSeconds: sampleIntervalSeconds,
-        instructions: agentVideoInstructions.trim(),
-        script: result.script,
-      }, ...items].slice(0, 20));
+      });
       setVideoChatMessages((items) => [...items, {
         role: "agent",
-        text: `Rendered ${result.script.length} decisions with ${visionModel} + ${editModel}${rangeText}.`,
+        text: `Planned ${result.script.length} shots${rangeText}. Review the plan and click Process to render.`,
         createdAt: new Date().toISOString(),
       }]);
-      setMessages((items) => [...items, { role: "system", text: `Agent Video Edit rendered with vision ${visionModel} and edit ${editModel} every ${sampleIntervalSeconds}s${rangeText} ${result.path}` }]);
-      setAgentEditStatus(`Done: ${result.path}`);
+      setAgentEditStatus(`Plan ready — ${result.script.length} shots. Review and click Process.`);
     } catch (error) {
       pushSystem(error);
       setAgentEditStatus(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Change which camera/track a single shot (script window) uses while reviewing the plan.
+  function setPlanShot(windowIndex: number, trackIndex: number) {
+    setAgentPlan((plan) => plan?.map((entry) => entry.windowIndex === windowIndex
+      ? { ...entry, chosenTrackIndex: trackIndex, chosenTrackName: entry.candidates.find((c) => c.trackIndex === trackIndex)?.trackName ?? entry.chosenTrackName }
+      : entry) ?? null);
+  }
+
+  // Render the approved plan into an mp4 and attach it as the agent-edit track
+  // (replacing the current one if it exists). No LLM calls — pure ffmpeg.
+  async function processPlan() {
+    if (!session || !agentPlan || !agentPlanContext) {
+      pushSystem("No plan to process. Send a prompt first.");
+      return;
+    }
+    setBusy(true);
+    setAgentEditProgress({ stage: "rendering", message: "Rendering the approved plan...", current: 0, total: 1, elapsedSeconds: 0 });
+    setAgentEditStatus("Rendering plan…");
+    try {
+      const result = await api.renderVideoFromScript(
+        session.id,
+        agentPlanContext.sourceTrackIds,
+        agentPlanContext.startSample,
+        agentPlanContext.endSample,
+        agentPlan,
+      );
+      const existingTrack = agentEditContext
+        ? session.tracks.find((track) => track.id === agentEditContext.trackId)
+        : undefined;
+      if (agentEditContext && existingTrack) {
+        const withTrack = await api.replaceRenderedVideoTrack(session.id, agentEditContext.trackId, agentEditContext.clipId, result.path, result.durationMs);
+        setProject(withTrack);
+        setVideoChatMessages((items) => [...items, {
+          role: "agent",
+          text: `Updated "${existingTrack.name}" with the new edit.`,
+          createdAt: new Date().toISOString(),
+        }]);
+      } else {
+        const startSample = agentPlanContext.startSample ?? 0;
+        const existingAgentTracks = session.tracks.filter((track) => (track.name ?? "").startsWith("Agent Edit")).length;
+        const trackName = `Agent Edit ${existingAgentTracks + 1}`;
+        const withTrack = await api.addRenderedVideoTrack(session.id, result.path, trackName, startSample, result.durationMs);
+        setProject(withTrack);
+        const newTrack = withTrack.session.tracks[withTrack.session.tracks.length - 1];
+        if (newTrack) setSelectedTrackIds((ids) => ids.includes(newTrack.id) ? ids : [...ids, newTrack.id]);
+        const newClip = newTrack?.videoClips?.[0];
+        if (newTrack && newClip) {
+          setAgentEditContext({ trackId: newTrack.id, clipId: newClip.id, sourceTrackIds: agentPlanContext.sourceTrackIds });
+        }
+        setVideoChatMessages((items) => [...items, {
+          role: "agent",
+          text: `Added "${trackName}" as a new video track.`,
+          createdAt: new Date().toISOString(),
+        }]);
+      }
+      setAgentEditStatus("Rendered.");
+      setAgentPlan(null);
+      setAgentPlanContext(null);
+    } catch (error) {
+      pushSystem(error);
+      setAgentEditStatus(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Re-render the agent edit from the current (edited) script — no vision/edit LLM run.
+  // Picks up the current canvas, layouts and selected range, and updates the agent-edit track in place.
+  // Optional `lookOverride` applies a global color/grade look to every cut.
+  async function rerenderEdit(lookOverride?: VideoFilterPreset) {
+    if (!session || !agentEditContext || agentEditScript.length === 0) return;
+    const range = selectedRange
+      ? {
+          startSample: Math.round(Math.max(0, Math.min(selectedRange.start, selectedRange.end)) * session.sampleRate),
+          endSample: Math.round(Math.max(0, Math.max(selectedRange.start, selectedRange.end)) * session.sampleRate),
+        }
+      : undefined;
+    const look = lookOverride ?? agentEditLook;
+    setBusy(true);
+    setAgentEditStatus(`Re-rendering${look && look !== "none" ? ` with ${look} look` : ""} (no agent)...`);
+    try {
+      const updated = await api.rerenderAgentEdit(
+        session.id,
+        agentEditContext.trackId,
+        agentEditContext.clipId,
+        agentEditContext.sourceTrackIds,
+        range?.startSample,
+        range?.endSample,
+        agentEditScript,
+        look && look !== "none" ? look : undefined,
+      );
+      setProject(updated);
+      setAgentEditStatus("Re-rendered the edit.");
+      setVideoChatMessages((items) => [...items, {
+        role: "agent",
+        text: "Re-rendered the edit from the current script (no agent run).",
+        createdAt: new Date().toISOString(),
+      }]);
+    } catch (error) {
+      pushSystem(error);
+      setAgentEditStatus(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Save the current agent-edit video to a file the user picks. Just copies the existing
+  // rendered mp4 — no re-encode.
+  async function downloadAgentEdit() {
+    if (!session || !agentEditContext) {
+      pushSystem("No agent edit to download. Run the agent first.");
+      return;
+    }
+    const track = session.tracks.find((item) => item.id === agentEditContext.trackId);
+    const clip = track?.videoClips?.find((item) => item.id === agentEditContext.clipId);
+    const sourceId = clip?.videoSourceFileId;
+    const sourcePath = sourceId ? session.videoSourceFiles?.find((item) => item.id === sourceId)?.path : undefined;
+    if (!sourcePath) {
+      pushSystem("Could not find the rendered file for the current agent edit.");
+      return;
+    }
+    const outputPath = await save({
+      defaultPath: `${(track?.name ?? "agent_edit").replace(/[^a-z0-9-]+/gi, "_")}.mp4`,
+      filters: [{ name: "MP4", extensions: ["mp4"] }],
+    });
+    if (!outputPath) return;
+    try {
+      const result = await api.exportRenderedVideo(sourcePath, outputPath);
+      pushSystem(`Saved ${result.path}`);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
+  // Clear manual processing (crop, color, PiP position/size) from every video clip but
+  // KEEP rotation so an upside-down camera stays right-side-up. Undoable via Cmd+Z.
+  async function resetVideoProcessing() {
+    if (!session) return;
+    const forward: JsonPatch[] = [];
+    const inverse: JsonPatch[] = [];
+    session.tracks.forEach((track, index) => {
+      if (track.kind !== "video") return;
+      const before = track.videoClips ?? [];
+      if (!before.some((clip) => clip.layout)) return;
+      const next = before.map((clip) => {
+        if (!clip.layout) return clip;
+        const rotation = clip.layout.rotation ?? 0;
+        if (!rotation) {
+          // Nothing worth preserving — drop the layout entirely.
+          const { layout: _drop, ...rest } = clip;
+          return rest;
+        }
+        // Default full-frame layout, but carry over the rotation correction.
+        return {
+          ...clip,
+          layout: {
+            x: 0, y: 0, width: 100, height: 100,
+            cropTop: 0, cropRight: 0, cropBottom: 0, cropLeft: 0,
+            opacity: 1, rotation, zIndex: 0,
+            brightness: 1, contrast: 1, saturation: 1, blur: 0,
+            preset: "none" as const,
+          },
+        };
+      });
+      forward.push({ op: "replace", path: `/tracks/${index}/videoClips`, value: next });
+      inverse.push({ op: "replace", path: `/tracks/${index}/videoClips`, value: before });
+    });
+    if (forward.length === 0) {
+      pushSystem("No manual video processing to reset.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const updated = await api.applyPatch(session.id, forward, inverse, "Reset video processing");
+      setProject(updated);
+      pushSystem("Reset manual video processing (crop, color, PiP position). Rotation kept. Undo to restore.");
+    } catch (error) {
+      pushSystem(error);
     } finally {
       setBusy(false);
     }
@@ -2076,17 +2375,21 @@ export function App() {
     const text = videoChatDraft.trim();
     if (!text) return;
     const now = new Date().toISOString();
-    setVideoChatMessages((items) => [
-      ...items,
-      { role: "user", text, createdAt: now },
-      {
-        role: "agent",
-        text: "Added to the edit guidelines. Run Agent Edit again to apply it to the script and export.",
-        createdAt: now,
-      },
-    ]);
+    setVideoChatMessages((items) => [...items, { role: "user", text, createdAt: now }]);
     setAgentVideoInstructions((current) => current.trim() ? `${current.trim()}\n${text}` : text);
     setVideoChatDraft("");
+  }
+
+  async function runAgentVideoEditFromDraft() {
+    const draft = videoChatDraft.trim();
+    const currentInstructions = agentVideoInstructions.trim();
+    const instructions = draft ? (currentInstructions ? `${currentInstructions}\n${draft}` : draft) : currentInstructions;
+    if (draft) {
+      setAgentVideoInstructions(instructions);
+      setVideoChatMessages((items) => [...items, { role: "user", text: draft, createdAt: new Date().toISOString() }]);
+      setVideoChatDraft("");
+    }
+    await renderAgentVideoEdit(Number(agentIntervalSeconds), instructions);
   }
 
   function pushSystem(error: unknown) {
@@ -2123,6 +2426,25 @@ export function App() {
   const videoEditorEndSeconds = Math.max(selectedRange ? explicitRangeEndSeconds : duration, scriptEndSeconds, clipEndSeconds, 1);
   const videoEditorSpanSeconds = Math.max(1, videoEditorEndSeconds - videoEditorStartSeconds);
   const videoCanvas = normalizeVideoCanvas(session.videoCanvas);
+  const editorVideoSourceById = new Map((session.videoSourceFiles ?? []).map((source) => [source.id, source]));
+  const assistantVideoPreviewClips = selectedVideoTracksForEditor.flatMap((track) => (track.videoClips ?? []).flatMap((clip) => {
+    const source = editorVideoSourceById.get(clip.videoSourceFileId);
+    if (!source) return [];
+    const startSeconds = clip.startSample / session.sampleRate;
+    const endSeconds = clip.endSample / session.sampleRate;
+    const sourceOffsetSeconds = Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000);
+    return [{
+      id: clip.id,
+      name: clip.name ?? source.originalName ?? track.name,
+      trackName: track.name,
+      color: track.color,
+      src: source.path,
+      startSeconds,
+      endSeconds,
+      localTime: Math.max(0, sourceOffsetSeconds + (playhead >= startSeconds && playhead <= endSeconds ? playhead - startSeconds : 0)),
+    }];
+  }));
+  const assistantVideoPreviewClip = assistantVideoPreviewClips.find((clip) => playhead >= clip.startSeconds && playhead <= clip.endSeconds) ?? assistantVideoPreviewClips[0];
 
   return (
     <main className="app">
@@ -2233,9 +2555,23 @@ export function App() {
           </div>
           <div className="transport">
             <button onClick={() => void togglePlay()} title={playing ? "Pause" : "Play"}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
-            <button onClick={() => void addRecordingTrack()} disabled={busy} title="Add recording track">
-              <Plus size={18} />
-            </button>
+            <div className="add-track-picker">
+              <button
+                onClick={() => setAddTrackMenuOpen((open) => !open)}
+                disabled={busy}
+                title="Add recording track (choose mono or stereo)"
+                aria-haspopup="menu"
+                aria-expanded={addTrackMenuOpen}
+              >
+                <Plus size={18} />
+              </button>
+              {addTrackMenuOpen ? (
+                <div className="add-track-menu" onMouseLeave={() => setAddTrackMenuOpen(false)} role="menu">
+                  <button onClick={() => { setAddTrackMenuOpen(false); void addRecordingTrack(1); }} role="menuitem">Mono</button>
+                  <button onClick={() => { setAddTrackMenuOpen(false); void addRecordingTrack(2); }} role="menuitem">Stereo</button>
+                </div>
+              ) : null}
+            </div>
             <button onClick={() => void addVideoTrack()} disabled={busy} title="Add video track">
               <Camera size={18} />
             </button>
@@ -2259,21 +2595,7 @@ export function App() {
             >
               All AI
             </button>
-            <button
-              onClick={() => void judgeCurrentMixAb()}
-              disabled={busy || session.tracks.length === 0}
-              title="Use Gemini Flash to judge ORIG versus MIX on a short representative clip"
-            >
-              <GitCompareArrows size={18} />
-              <span>A/B</span>
-            </button>
             <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={18} /></button>
-            <button
-              onClick={() => void openVideoEditorWindow()}
-              title="Open Video Editor"
-            >
-              <Video size={18} />
-            </button>
             <button className="upload" onClick={() => void importFiles()} title="Import audio">
               <Upload size={18} />
             </button>
@@ -2313,7 +2635,7 @@ export function App() {
                 <button type="button" onClick={() => void renderAutoVideoEdit()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
                   Quick Edit
                 </button>
-                <button type="button" className="primary" onClick={() => void renderAgentVideoEdit(Number(agentIntervalSeconds))} disabled={busy || selectedVideoTracksForEditor.length === 0}>
+                <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
                   Run Agent Edit
                 </button>
                 <button type="button" className="video-editor-close" onClick={() => setVideoEditorOpen(false)}>×</button>
@@ -2466,8 +2788,44 @@ export function App() {
               </section>
 
               <aside className="video-editor-side">
-                <div className="video-editor-card">
-                  <strong>Agent setup</strong>
+                <div className="video-editor-card video-editor-chat">
+                  <strong>Video agent</strong>
+                  <label className="video-editor-command">
+                    Instructions
+                    <textarea
+                      value={videoChatDraft}
+                      onChange={(event) => setVideoChatDraft(event.target.value)}
+                      onKeyDown={(event) => {
+                        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                          event.preventDefault();
+                          void runAgentVideoEditFromDraft();
+                        }
+                      }}
+                      placeholder="Example: use the overhead view during dense guitar parts, hold closeups through phrases, and avoid sudden cuts unless the music changes."
+                    />
+                  </label>
+                  <div className="video-editor-command-actions">
+                    <button type="button" onClick={sendVideoEditorChat} disabled={!videoChatDraft.trim()}>
+                      Add instruction
+                    </button>
+                    <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
+                      Run Agent Edit
+                    </button>
+                  </div>
+                  <div className="video-editor-chat-log">
+                    {videoChatMessages.length === 0 ? (
+                      <span className="video-editor-empty">Select tracks, choose a range, then describe the edit in plain language.</span>
+                    ) : videoChatMessages.map((message, index) => (
+                      <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
+                        <span>{message.role}</span>
+                        <p>{message.text}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="video-editor-card video-editor-settings">
+                  <strong>Agent settings</strong>
                   <label>
                     Interval
                     <input value={agentIntervalSeconds} onChange={(event) => setAgentIntervalSeconds(event.target.value)} inputMode="decimal" />
@@ -2484,38 +2842,6 @@ export function App() {
                       {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
                     </select>
                   </label>
-                  <label>
-                    Guidelines
-                    <textarea
-                      value={agentVideoInstructions}
-                      onChange={(event) => setAgentVideoInstructions(event.target.value)}
-                      placeholder="Use the overhead angle when it adds information, hold shots through phrases, cut on musical changes."
-                    />
-                  </label>
-                </div>
-
-                <div className="video-editor-card video-editor-chat">
-                  <strong>Agent chat</strong>
-                  <div className="video-editor-chat-log">
-                    {videoChatMessages.length === 0 ? (
-                      <span className="video-editor-empty">Tell the editor what to change, then run Agent Edit.</span>
-                    ) : videoChatMessages.map((message, index) => (
-                      <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
-                        <span>{message.role}</span>
-                        <p>{message.text}</p>
-                      </div>
-                    ))}
-                  </div>
-                  <form
-                    className="video-editor-chat-form"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      sendVideoEditorChat();
-                    }}
-                  >
-                    <textarea value={videoChatDraft} onChange={(event) => setVideoChatDraft(event.target.value)} placeholder="Example: use Video 8 more for the overhead view during dense parts." />
-                    <button type="submit">Add</button>
-                  </form>
                 </div>
 
                 <div className="video-editor-card video-editor-history">
@@ -2601,6 +2927,31 @@ export function App() {
               aria-multiselectable="true"
               onKeyDown={handleTrackLaneKeyDown}
             >
+              <TimeRuler
+                duration={duration}
+                playhead={playhead}
+                selection={selectedRange}
+                onSeek={(seconds) => seekTo(seconds)}
+                onSelect={(start, end) => {
+                  trackLanesRef.current?.focus({ preventScroll: true });
+                  playbackAnchorRef.current = Math.max(0, Math.min(start, end));
+                  setSelectedClip(undefined);
+                  setSelectedClips([]);
+                  setSelectedRange({ start: Math.min(start, end), end: Math.max(start, end) });
+                }}
+                onClear={() => setSelectedRange(undefined)}
+              />
+              {selectedRange && !selectedRange.trackId && duration > 0 && Math.abs(selectedRange.end - selectedRange.start) > 0.02 ? (
+                <div className="lane-region-overlay" aria-hidden="true">
+                  <div
+                    className="lane-region-band"
+                    style={{
+                      left: `${(Math.min(selectedRange.start, selectedRange.end) / duration) * 100}%`,
+                      width: `${(Math.abs(selectedRange.end - selectedRange.start) / duration) * 100}%`,
+                    }}
+                  />
+                </div>
+              ) : null}
               {session.sections && session.sections.length > 0 && duration > 0 ? (
                 <SectionRibbon
                   sections={session.sections}
@@ -2690,6 +3041,7 @@ export function App() {
                       alignmentGuideSeconds={alignmentGuideSeconds}
                       clips={clips}
                       selectedClipId={selectedClip?.trackId === track.id ? selectedClip.clipId : undefined}
+                      selectedClipIds={selectedClips.filter((ref) => ref.trackId === track.id).map((ref) => ref.clipId)}
                       selectedRange={selectedRange?.trackId === track.id ? selectedRange : undefined}
                       recording={isVideo ? videoRecordingTrackIds.includes(track.id) : recordingTrackId === track.id}
                       recordingStarting={recordingTrackId === track.id && recordingStarting}
@@ -2704,14 +3056,29 @@ export function App() {
                             : undefined
                       }
                       onToggleSelect={() => toggleTrackSelection(track.id)}
-                      onClipSelect={(clipId) => {
+                      onClipSelect={(clipId, additive) => {
                         trackLanesRef.current?.focus({ preventScroll: true });
                         const clip = clips.find((item) => item.id === clipId);
                         const anchor = clip?.startSeconds ?? playhead;
                         playbackAnchorRef.current = anchor;
                         setSelectedRange(undefined);
                         setSelectedClip({ trackId: track.id, clipId });
-                        seekTo(anchor, { updateAnchor: false });
+                        if (additive) {
+                          setSelectedClips((prev) => prev.some((ref) => ref.trackId === track.id && ref.clipId === clipId)
+                            ? prev.filter((ref) => !(ref.trackId === track.id && ref.clipId === clipId))
+                            : [...prev, { trackId: track.id, clipId }]);
+                        } else {
+                          setSelectedClips([{ trackId: track.id, clipId }]);
+                          seekTo(anchor, { updateAnchor: false });
+                        }
+                      }}
+                      onClipContextMenu={(clipId, event) => {
+                        event.preventDefault();
+                        setSelectedClips((prev) => prev.some((ref) => ref.trackId === track.id && ref.clipId === clipId)
+                          ? prev
+                          : [{ trackId: track.id, clipId }]);
+                        setSelectedClip({ trackId: track.id, clipId });
+                        setClipMenu({ x: event.clientX, y: event.clientY });
                       }}
                       onClipMove={(clipId, deltaSeconds) => void moveClip(track.id, clipId, deltaSeconds)}
                       onAlignmentGuideChange={setAlignmentGuideSeconds}
@@ -2719,11 +3086,15 @@ export function App() {
                         trackLanesRef.current?.focus({ preventScroll: true });
                         playbackAnchorRef.current = Math.max(0, Math.min(start, end));
                         setSelectedClip(undefined);
+                        setSelectedClips([]);
                         setSelectedRange({ trackId: track.id, start: Math.min(start, end), end: Math.max(start, end) });
                       }}
                       onRangeClear={() => {
-                        setSelectedRange(undefined);
+                        // A click on a track's wave area only clears the selection if it's
+                        // a per-track one. Global ruler selections (no trackId) stick around.
+                        setSelectedRange((current) => (current && !current.trackId ? current : undefined));
                         setSelectedClip(undefined);
+                        setSelectedClips([]);
                       }}
                       onArm={() => {
                         if (isVideo) {
@@ -2757,15 +3128,27 @@ export function App() {
         <div className="assistant-head">
           <div className="assistant-title">
             <MessageSquare size={18} />
-            <strong>Mix engineer</strong>
             <div className="mode-toggle">
               <button className={mode === "interactive" ? "active" : ""} onClick={() => setMode("interactive")}>Chat</button>
               <button className={mode === "auto" ? "active" : ""} onClick={() => setMode("auto")}>Auto-mix</button>
+              <button className={mode === "video" ? "active" : ""} onClick={() => setMode("video")}>Video</button>
             </div>
           </div>
-          <button onClick={() => setSettingsOpen((open) => !open)} title="LLM settings">
-            <Settings size={18} />
-          </button>
+          <div className="assistant-head-actions">
+            {busy ? (
+              <button
+                className="chat-stop"
+                onClick={() => void stopAndRestart()}
+                title="Stop the current agent run by restarting the app"
+              >
+                <Square size={14} />
+                <span>Stop</span>
+              </button>
+            ) : null}
+            <button onClick={() => setSettingsOpen((open) => !open)} title="LLM settings">
+              <Settings size={18} />
+            </button>
+          </div>
         </div>
         {settingsOpen ? (
           <div className="llm-settings">
@@ -2812,6 +3195,23 @@ export function App() {
               const current = profilePresets.find((p) => p.id === (session.mixerProfile?.presetId ?? "balanced"));
               return current ? <div className="profile-summary">{current.summary}</div> : null;
             })()}
+            <div className="llm-settings-section-title">Video agent</div>
+            <label>
+              Edit interval
+              <input value={agentIntervalSeconds} onChange={(event) => setAgentIntervalSeconds(event.target.value)} inputMode="decimal" />
+            </label>
+            <label>
+              Vision model
+              <select value={agentVideoModel} onChange={(event) => setAgentVideoModel(event.target.value)}>
+                {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
+              </select>
+            </label>
+            <label>
+              Edit model
+              <select value={agentVideoEditModel} onChange={(event) => setAgentVideoEditModel(event.target.value)}>
+                {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
+              </select>
+            </label>
           </div>
         ) : null}
         <div className={`reasoning-panel ${reasoningOpen ? "open" : ""}`}>
@@ -2866,6 +3266,149 @@ export function App() {
               void api.startAutoMix(session.id, stageIds, ollamaUrl, ollamaModel);
             }}
           />
+        ) : mode === "video" ? (
+          <div className="assistant-video-panel">
+            <div className="assistant-video-preview-card">
+              <div className="assistant-video-preview">
+                {assistantVideoPreviewClip ? (
+                  <TimelineVideo
+                    src={assistantVideoPreviewClip.src}
+                    color={assistantVideoPreviewClip.color}
+                    active={playhead >= assistantVideoPreviewClip.startSeconds && playhead <= assistantVideoPreviewClip.endSeconds}
+                    localTime={assistantVideoPreviewClip.localTime}
+                    playing={playing}
+                  />
+                ) : (
+                  <div className="assistant-video-preview-empty">
+                    <Video size={24} />
+                    <span>Select video tracks to preview.</span>
+                  </div>
+                )}
+              </div>
+              <div className="assistant-video-preview-meta">
+                <span>
+                  {assistantVideoPreviewClip
+                    ? `${assistantVideoPreviewClip.trackName} · ${formatTime(assistantVideoPreviewClip.startSeconds)}-${formatTime(assistantVideoPreviewClip.endSeconds)}`
+                    : selectedRange
+                      ? `${formatTime(videoEditorStartSeconds)}-${formatTime(videoEditorEndSeconds)}`
+                      : "Full timeline"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void downloadAgentEdit()}
+                  disabled={busy || !agentEditContext}
+                  title={agentEditContext ? "Save the current agent edit to a file" : "Run the agent once first"}
+                >
+                  Download
+                </button>
+                <button
+                  type="button"
+                  className="icon-only"
+                  onClick={() => void openCameraPreviewWindow(buildCameraPreviewTracks(), true)}
+                  disabled={selectedVideoTracksForEditor.length === 0}
+                  title={selectedVideoTracksForEditor.length === 0 ? "Select video tracks first" : "Open the live multi-camera view"}
+                  aria-label="Open camera view"
+                >
+                  <Camera size={16} />
+                </button>
+              </div>
+            </div>
+
+            {agentEditProgress ? (
+              <div className={`agent-editor-progress compact stage-${agentEditProgress.stage}`}>
+                <div className="agent-editor-progress-row">
+                  <strong>{agentEditProgress.stage}</strong>
+                  <span>{agentEditProgress.current}/{agentEditProgress.total}</span>
+                  <em>{Math.round(agentEditProgress.elapsedSeconds)}s</em>
+                </div>
+                <div className="agent-editor-progress-bar">
+                  <span style={{ width: `${Math.max(3, Math.min(100, (agentEditProgress.current / Math.max(1, agentEditProgress.total)) * 100))}%` }} />
+                </div>
+                <div className="agent-editor-status">{agentEditProgress.message}</div>
+              </div>
+            ) : agentEditStatus ? <div className="agent-editor-status compact">{agentEditStatus}</div> : null}
+
+            <div className="video-history">
+              {videoChatMessages.length === 0 ? (
+                <span className="video-history-empty">Prompts you send to the video agent appear here.</span>
+              ) : (
+                videoChatMessages.map((message, index) => (
+                  <div className={`video-history-msg ${message.role}`} key={`${message.createdAt}-${index}`}>
+                    <span className="video-history-role">{message.role === "user" ? "You" : message.role === "agent" ? "Agent" : "System"}</span>
+                    <p>{message.text}</p>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {agentPlan && agentPlan.length > 0 ? (
+              <div className="plan-view">
+                <div className="plan-head">
+                  <strong>Plan · {agentPlan.length} shots</strong>
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => void processPlan()}
+                    disabled={busy}
+                    title="Render the (possibly edited) plan into a video and attach it to the session"
+                  >
+                    Process
+                  </button>
+                </div>
+                <p className="plan-hint">Adjust any shot's camera, then click Process to render. No agent run.</p>
+                <div className="plan-list">
+                  {agentPlan.map((entry) => {
+                    const candidates = Array.from(new Map(entry.candidates.map((c) => [c.trackIndex, c])).values());
+                    return (
+                      <div className="plan-row" key={entry.windowIndex}>
+                        <span className="plan-time">{formatTime(entry.startSeconds)}–{formatTime(entry.endSeconds)}</span>
+                        {candidates.length > 0 ? (
+                          <select
+                            value={entry.chosenTrackIndex ?? ""}
+                            onChange={(event) => setPlanShot(entry.windowIndex, Number(event.target.value))}
+                          >
+                            {entry.chosenTrackIndex == null ? <option value="">(none)</option> : null}
+                            {candidates.map((candidate) => (
+                              <option key={candidate.trackIndex} value={candidate.trackIndex}>
+                                {candidate.trackName}{candidate.angleLabel ? ` · ${candidate.angleLabel}` : ""}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span className="plan-fixed">{entry.chosenTrackName ?? "—"}</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+
+            <form
+              className="assistant-video-command"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void runAgentVideoEditFromDraft();
+              }}
+            >
+              <textarea
+                aria-label="Tell the video agent what to do"
+                value={videoChatDraft}
+                onChange={(event) => setVideoChatDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    void runAgentVideoEditFromDraft();
+                  }
+                }}
+                placeholder="Tell the video agent what to do..."
+              />
+              <button type="submit" className="primary" disabled={busy || selectedVideoTracksForEditor.length === 0}>
+                Send
+              </button>
+            </form>
+
+          </div>
         ) : (
           <>
             <div className="chat-log" ref={chatLogRef}>
@@ -2958,7 +3501,171 @@ export function App() {
           </>
         )}
       </aside>
+      {clipMenu ? (
+        <>
+          <div
+            className="context-menu-backdrop"
+            onPointerDown={() => setClipMenu(null)}
+            onContextMenu={(event) => { event.preventDefault(); setClipMenu(null); }}
+          />
+          <div className="clip-context-menu" style={{ left: clipMenu.x, top: clipMenu.y }}>
+            {selectedClips.length >= 2 ? (
+              <>
+                <div className="context-menu-header">Left align to</div>
+                {selectedClips.map((ref) => {
+                  const refTrack = session.tracks.find((item) => item.id === ref.trackId);
+                  if (!refTrack) return null;
+                  const clip = ref.clipId === `legacy-${refTrack.id}`
+                    ? undefined
+                    : (refTrack.kind === "video" ? (refTrack.videoClips ?? []) : refTrack.clips).find((item) => item.id === ref.clipId);
+                  const clipName = clip?.name;
+                  return (
+                    <button
+                      key={`${ref.trackId}:${ref.clipId}`}
+                      className="context-menu-item"
+                      onClick={() => { void alignClipsLeft(ref.trackId, ref.clipId); setClipMenu(null); }}
+                    >
+                      <span className="context-menu-track">{refTrack.name}</span>
+                      {clipName && clipName !== refTrack.name ? <span className="context-menu-sub">{clipName}</span> : null}
+                    </button>
+                  );
+                })}
+              </>
+            ) : (
+              <div className="context-menu-empty">⌘-click clips on 2+ tracks to align them</div>
+            )}
+          </div>
+        </>
+      ) : null}
     </main>
+  );
+}
+
+// Pick "nice" tick marks (1/2/5/10/15/30/60... seconds) so the ruler shows ~6-10 labels.
+function buildRulerTicks(duration: number): number[] {
+  if (!(duration > 0)) return [];
+  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  const target = duration / 8;
+  const step = steps.find((value) => value >= target) ?? Math.ceil(target / 60) * 60;
+  const ticks: number[] = [];
+  for (let t = 0; t <= duration + 0.001; t += step) ticks.push(Math.round(t * 1000) / 1000);
+  return ticks;
+}
+
+// DAW-style time ruler at the top of the timeline. Drag to select a region, click to seek.
+function TimeRuler({
+  duration,
+  playhead,
+  selection,
+  onSeek,
+  onSelect,
+  onClear,
+}: {
+  duration: number;
+  playhead: number;
+  selection?: { start: number; end: number };
+  onSeek: (seconds: number) => void;
+  onSelect: (start: number, end: number) => void;
+  onClear: () => void;
+}) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ start: number; moved: boolean } | null>(null);
+  const resizeRef = useRef<{ anchor: number } | null>(null);
+  const secondsFromClientX = (clientX: number) => {
+    const rect = wrapRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return 0;
+    return Math.max(0, Math.min(duration, ((clientX - rect.left) / rect.width) * duration));
+  };
+  // Drag a selection edge: keep the opposite edge fixed and move this one to the pointer.
+  const handleEdgeDown = (edge: "start" | "end", event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || !selection) return;
+    event.stopPropagation();
+    resizeRef.current = { anchor: edge === "start" ? Math.max(selection.start, selection.end) : Math.min(selection.start, selection.end) };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const handleEdgeMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const resize = resizeRef.current;
+    if (!resize) return;
+    event.stopPropagation();
+    onSelect(resize.anchor, secondsFromClientX(event.clientX));
+  };
+  const handleEdgeUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizeRef.current) return;
+    resizeRef.current = null;
+    event.stopPropagation();
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    dragRef.current = { start: secondsFromClientX(event.clientX), moved: false };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const seconds = secondsFromClientX(event.clientX);
+    if (Math.abs(seconds - drag.start) > 0.02) {
+      drag.moved = true;
+      onSelect(drag.start, seconds);
+    }
+  };
+  const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    dragRef.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    const seconds = secondsFromClientX(event.clientX);
+    if (drag.moved) {
+      onSelect(drag.start, seconds);
+    } else {
+      // Click without drag = just move the playhead. The selection persists until the
+      // user explicitly drags a new one (or presses Escape).
+      onSeek(seconds);
+    }
+  };
+  const ticks = buildRulerTicks(duration);
+  const cursorPct = duration > 0 ? Math.max(0, Math.min(100, (playhead / duration) * 100)) : 0;
+  const selStart = selection ? Math.min(selection.start, selection.end) : 0;
+  const selEnd = selection ? Math.max(selection.start, selection.end) : 0;
+  const selLeftPct = duration > 0 ? (selStart / duration) * 100 : 0;
+  const selWidthPct = duration > 0 ? ((selEnd - selStart) / duration) * 100 : 0;
+  return (
+    <div className="time-ruler">
+      <div className="time-ruler-spacer" />
+      <div
+        ref={wrapRef}
+        className="time-ruler-track"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        title="Drag to select a region. Click to set the playhead."
+      >
+        {ticks.map((tick) => (
+          <div key={tick} className="time-ruler-tick" style={{ left: `${duration > 0 ? (tick / duration) * 100 : 0}%` }}>
+            <span>{formatTime(tick)}</span>
+          </div>
+        ))}
+        {selection && selWidthPct > 0.05 ? (
+          <div className="time-ruler-selection" style={{ left: `${selLeftPct}%`, width: `${selWidthPct}%` }}>
+            <div
+              className="time-ruler-handle start"
+              onPointerDown={(event) => handleEdgeDown("start", event)}
+              onPointerMove={handleEdgeMove}
+              onPointerUp={handleEdgeUp}
+              title="Drag to move the region start"
+            />
+            <div
+              className="time-ruler-handle end"
+              onPointerDown={(event) => handleEdgeDown("end", event)}
+              onPointerMove={handleEdgeMove}
+              onPointerUp={handleEdgeUp}
+              title="Drag to move the region end"
+            />
+          </div>
+        ) : null}
+        <div className="time-ruler-playhead" style={{ left: `${cursorPct}%` }} />
+      </div>
+    </div>
   );
 }
 
@@ -3506,7 +4213,7 @@ export function VideoEditorWindowApp() {
     }
   }
 
-  async function renderAgentVideoEdit(sampleIntervalSeconds: number) {
+  async function renderAgentVideoEdit(sampleIntervalSeconds: number, instructionsOverride?: string) {
     if (!session) return;
     const trackIds = selectedVideoTrackIds();
     if (trackIds.length === 0) {
@@ -3519,6 +4226,7 @@ export function VideoEditorWindowApp() {
     }
     const visionModel = agentVideoModel.trim() || DEFAULT_AGENT_VIDEO_MODEL;
     const editModel = agentVideoEditModel.trim() || ollamaModel.trim() || DEFAULT_OLLAMA_MODEL;
+    const instructions = (instructionsOverride ?? agentVideoInstructions).trim();
     const range = renderRangeSamples();
     const outputPath = await save({
       defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}_agent_edit.mp4`,
@@ -3530,7 +4238,7 @@ export function VideoEditorWindowApp() {
     setAgentEditProgress({ stage: "starting", message: "Starting Agent Video Edit...", current: 0, total: 1, elapsedSeconds: 0 });
     setStatus(`Running ${visionModel} for vision and ${editModel} for edit decisions...`);
     try {
-      const result = await api.renderAgentVideoEdit(session.id, outputPath, range?.startSample, range?.endSample, trackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, agentVideoInstructions.trim());
+      const result = await api.renderAgentVideoEdit(session.id, outputPath, range?.startSample, range?.endSample, trackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, instructions);
       const createdAt = new Date().toISOString();
       const rangeStartSeconds = range ? range.startSample / session.sampleRate : 0;
       setAgentEditScript(result.script);
@@ -3542,7 +4250,7 @@ export function VideoEditorWindowApp() {
         visionModel,
         editModel,
         intervalSeconds: sampleIntervalSeconds,
-        instructions: agentVideoInstructions.trim(),
+        instructions,
         script: result.script,
       }, ...items].slice(0, 20));
       setVideoChatMessages((items) => [...items, {
@@ -3562,13 +4270,21 @@ export function VideoEditorWindowApp() {
     const text = videoChatDraft.trim();
     if (!text) return;
     const now = new Date().toISOString();
-    setVideoChatMessages((items) => [
-      ...items,
-      { role: "user", text, createdAt: now },
-      { role: "agent", text: "Added to the edit guidelines. Run Agent Edit again to apply it.", createdAt: now },
-    ]);
+    setVideoChatMessages((items) => [...items, { role: "user", text, createdAt: now }]);
     setAgentVideoInstructions((current) => current.trim() ? `${current.trim()}\n${text}` : text);
     setVideoChatDraft("");
+  }
+
+  async function runAgentVideoEditFromDraft() {
+    const draft = videoChatDraft.trim();
+    const currentInstructions = agentVideoInstructions.trim();
+    const instructions = draft ? (currentInstructions ? `${currentInstructions}\n${draft}` : draft) : currentInstructions;
+    if (draft) {
+      setAgentVideoInstructions(instructions);
+      setVideoChatMessages((items) => [...items, { role: "user", text: draft, createdAt: new Date().toISOString() }]);
+      setVideoChatDraft("");
+    }
+    await renderAgentVideoEdit(Number(agentIntervalSeconds), instructions);
   }
 
   function cycleProgramPreviewSize() {
@@ -3633,7 +4349,7 @@ export function VideoEditorWindowApp() {
             <button type="button" onClick={() => void renderAutoVideoEdit()} disabled={busy || selectedTracks.length === 0}>
               Quick Edit
             </button>
-            <button type="button" className="primary" onClick={() => void renderAgentVideoEdit(Number(agentIntervalSeconds))} disabled={busy || selectedTracks.length === 0}>
+            <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedTracks.length === 0}>
               Run Agent Edit
             </button>
           </div>
@@ -3894,8 +4610,44 @@ export function VideoEditorWindowApp() {
               ))}
             </div>
 
-            <div className="video-editor-card">
-              <strong>Agent setup</strong>
+            <div className="video-editor-card video-editor-chat">
+              <strong>Video agent</strong>
+              <label className="video-editor-command">
+                Instructions
+                <textarea
+                  value={videoChatDraft}
+                  onChange={(event) => setVideoChatDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                      event.preventDefault();
+                      void runAgentVideoEditFromDraft();
+                    }
+                  }}
+                  placeholder="Example: use the overhead view during dense guitar parts, hold closeups through phrases, and avoid sudden cuts unless the music changes."
+                />
+              </label>
+              <div className="video-editor-command-actions">
+                <button type="button" onClick={sendVideoEditorChat} disabled={!videoChatDraft.trim()}>
+                  Add instruction
+                </button>
+                <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedTracks.length === 0}>
+                  Run Agent Edit
+                </button>
+              </div>
+              <div className="video-editor-chat-log">
+                {videoChatMessages.length === 0 ? (
+                  <span className="video-editor-empty">Select tracks, choose a range, then describe the edit in plain language.</span>
+                ) : videoChatMessages.map((message, index) => (
+                  <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
+                    <span>{message.role}</span>
+                    <p>{message.text}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="video-editor-card video-editor-settings">
+              <strong>Agent settings</strong>
               <label>
                 Interval
                 <input value={agentIntervalSeconds} onChange={(event) => setAgentIntervalSeconds(event.target.value)} inputMode="decimal" />
@@ -3912,38 +4664,6 @@ export function VideoEditorWindowApp() {
                   {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
                 </select>
               </label>
-              <label>
-                Guidelines
-                <textarea
-                  value={agentVideoInstructions}
-                  onChange={(event) => setAgentVideoInstructions(event.target.value)}
-                  placeholder="Use overhead shots when they add information, hold through phrases, cut on musical changes."
-                />
-              </label>
-            </div>
-
-            <div className="video-editor-card video-editor-chat">
-              <strong>Agent chat</strong>
-              <div className="video-editor-chat-log">
-                {videoChatMessages.length === 0 ? (
-                  <span className="video-editor-empty">Tell the editor what to change, then run Agent Edit.</span>
-                ) : videoChatMessages.map((message, index) => (
-                  <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
-                    <span>{message.role}</span>
-                    <p>{message.text}</p>
-                  </div>
-                ))}
-              </div>
-              <form
-                className="video-editor-chat-form"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  sendVideoEditorChat();
-                }}
-              >
-                <textarea value={videoChatDraft} onChange={(event) => setVideoChatDraft(event.target.value)} placeholder="Example: use Video 8 more for the overhead view during dense parts." />
-                <button type="submit">Add</button>
-              </form>
             </div>
 
             <div className="video-editor-card video-editor-history">
@@ -4051,44 +4771,41 @@ export function CameraPreviewApp() {
   };
   const canvasRatio = canvas.width / Math.max(1, canvas.height);
 
+  // Avoid 'unused' warnings on the canvas-design helpers we no longer use in this
+  // simplified view. They stay because they're still referenced by other window types.
+  void canvasRatio;
+  void selectedLayer;
+  void selectedLayerId;
+  void setSelectedLayerId;
+  void updateLayerLayout;
+  void updateCanvas;
+
   return (
     <main className="camera-preview-window">
       <header className="camera-preview-header">
-        <strong>Video Canvas</strong>
-        <span>{tracks.length ? `${tracks.length} selected video ${tracks.length === 1 ? "track" : "tracks"}` : "No selected video tracks"}</span>
+        <strong>Cameras</strong>
+        <span>{tracks.length ? `${tracks.length} ${tracks.length === 1 ? "camera" : "cameras"}` : "No selected video tracks"}</span>
       </header>
       {tracks.length === 0 ? (
         <div className="camera-preview-empty">Select one or more video tracks in AutoMixer.</div>
       ) : (
-        <div className="video-canvas-workspace">
-          <div className="video-canvas-stage">
-            <div
-              className="video-canvas"
-              style={{
-                aspectRatio: `${canvas.width} / ${canvas.height}`,
-                background: canvas.background,
-                width: `min(100%, calc((100vh - 64px) * ${canvasRatio}))`,
-              }}
-            >
-              {layers.map((layer) => (
-                <CameraCanvasLayer
-                  key={layer.id}
-                  layer={layer}
-                  selected={selectedLayer?.id === layer.id}
-                  onSelect={() => setSelectedLayerId(layer.id)}
-                  onCommit={(layout) => layer.clip && updateLayerLayout(layer.track.id, layer.clip.id, layout, 0)}
-                />
-              ))}
+        <div className="camera-stack">
+          {layers.map((layer) => (
+            <div className="camera-stack-panel" key={layer.id}>
+              <div className="camera-stack-head">
+                <span className="camera-stack-color" style={{ background: layer.track.color }} aria-hidden="true" />
+                <strong>{layer.track.name}</strong>
+                {layer.live ? <span className={`camera-stack-state ${layer.track.recording ? "rec" : layer.track.armed ? "arm" : "live"}`}>
+                  {layer.track.recording ? "REC" : layer.track.armed ? "ARM" : "LIVE"}
+                </span> : null}
+              </div>
+              <div className="camera-stack-video">
+                {layer.clip
+                  ? <RecordedVideoFeed clip={layer.clip} playing={layer.track.transportPlaying} />
+                  : <CameraLiveFeed track={layer.track} />}
+              </div>
             </div>
-          </div>
-          <VideoCanvasInspector
-            layer={selectedLayer}
-            onSelect={(id) => setSelectedLayerId(id)}
-            layers={layers}
-            canvas={canvas}
-            onCanvasChange={updateCanvas}
-            onChange={(layout) => selectedLayer?.clip && updateLayerLayout(selectedLayer.track.id, selectedLayer.clip.id, layout)}
-          />
+          ))}
         </div>
       )}
     </main>
@@ -4160,7 +4877,7 @@ function CameraCanvasLayer({
         opacity: layout.opacity,
         transform: `rotate(${layout.rotation}deg)`,
         zIndex: 20 + layout.zIndex,
-        borderColor: layer.track.color,
+        ["--track-color" as string]: layer.track.color,
       }}
       onPointerDown={(event) => beginDrag("move", event)}
       onPointerMove={moveDrag}
@@ -4335,6 +5052,12 @@ function videoFilterCss(layout: VideoLayout) {
     mono: "grayscale(1)",
     punch: "contrast(1.16) saturate(1.18)",
     dream: "sepia(0.12) saturate(0.82) brightness(1.08)",
+    cinema: "contrast(1.10) saturate(1.05) sepia(0.10) hue-rotate(-4deg)",
+    noir: "grayscale(1) contrast(1.28)",
+    moody: "brightness(0.92) contrast(1.18) saturate(0.85) hue-rotate(8deg)",
+    vintage: "sepia(0.35) saturate(0.72) contrast(0.94)",
+    golden: "sepia(0.18) saturate(1.12) brightness(1.04) hue-rotate(-6deg)",
+    cold: "hue-rotate(18deg) saturate(0.92) contrast(1.05)",
   }[layout.preset];
   return `brightness(${layout.brightness}) contrast(${layout.contrast}) saturate(${layout.saturation}) blur(${layout.blur}px) ${preset}`;
 }
@@ -4610,6 +5333,7 @@ function TrackRow({
   armed,
   clips,
   selectedClipId,
+  selectedClipIds,
   selectedRange,
   recording,
   recordingStarting,
@@ -4624,6 +5348,7 @@ function TrackRow({
   alignmentGuideSeconds,
   onToggleSelect,
   onClipSelect,
+  onClipContextMenu,
   onClipMove,
   onAlignmentGuideChange,
   onRangeSelect,
@@ -4639,6 +5364,7 @@ function TrackRow({
   armed: boolean;
   clips: { id: string; kind?: "audio" | "video"; name: string; startSeconds: number; sourceSeconds: number; peaks?: number[]; src?: string }[];
   selectedClipId?: string;
+  selectedClipIds: string[];
   selectedRange?: { start: number; end: number };
   recording: boolean;
   recordingStarting: boolean;
@@ -4652,7 +5378,8 @@ function TrackRow({
   alignmentCandidates: number[];
   alignmentGuideSeconds?: number;
   onToggleSelect: () => void;
-  onClipSelect: (clipId: string) => void;
+  onClipSelect: (clipId: string, additive?: boolean) => void;
+  onClipContextMenu: (clipId: string, event: React.MouseEvent) => void;
   onClipMove: (clipId: string, deltaSeconds: number) => void;
   onAlignmentGuideChange: (seconds: number | undefined) => void;
   onRangeSelect: (start: number, end: number) => void;
@@ -4687,7 +5414,12 @@ function TrackRow({
   const handleClipPointerDown = (clipId: string, event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     event.stopPropagation();
-    onClipSelect(clipId);
+    // Cmd/Ctrl-click toggles the clip into the multi-selection without starting a drag.
+    if (event.metaKey || event.ctrlKey) {
+      onClipSelect(clipId, true);
+      return;
+    }
+    onClipSelect(clipId, false);
     const clipStart = clips.find((item) => item.id === clipId)?.startSeconds ?? 0;
     dragRef.current = { start: secondsFromClientX(event.clientX), moved: false, clipId, clipStart, previewStart: clipStart };
     setMovePreview({ clipId, startSeconds: clipStart, aligned: false });
@@ -4721,7 +5453,7 @@ function TrackRow({
       const targetStart = drag.previewStart ?? Math.max(0, (drag.clipStart ?? 0) + seconds - drag.start);
       onClipMove(drag.clipId, targetStart - (drag.clipStart ?? targetStart));
     } else {
-      onClipSelect(drag.clipId);
+      onClipSelect(drag.clipId, false);
       onSeek(seconds);
     }
   };
@@ -4760,7 +5492,7 @@ function TrackRow({
     : 0;
   return (
     <div
-      className={`track ${selected ? "selected" : ""} ${armed ? "armed" : ""}`}
+      className={`track ${selected ? "selected" : ""} ${armed ? "armed" : ""} ${recording ? "recording" : ""} ${track.muted ? "muted" : ""}`}
       onDragOver={onDragOver}
       onDrop={onDrop}
       role="option"
@@ -4808,15 +5540,16 @@ function TrackRow({
             <div
               key={clip.id}
               data-clip-id={clip.id}
-              className={`wave-clip ${clip.kind === "video" ? "video-clip" : ""} ${selectedClipId === clip.id ? "selected" : ""} ${preview ? "moving" : ""} ${preview?.aligned ? "aligned" : ""}`}
+              className={`wave-clip ${clip.kind === "video" ? "video-clip" : ""} ${selectedClipId === clip.id || selectedClipIds.includes(clip.id) ? "selected" : ""} ${preview ? "moving" : ""} ${preview?.aligned ? "aligned" : ""}`}
               style={{ left: `${clipLeftPct}%`, width: `${clipWidthPct}%`, borderLeftColor: track.color }}
               title={clip.name}
               onPointerDown={(event) => handleClipPointerDown(clip.id, event)}
               onPointerMove={handleClipPointerMove}
               onPointerUp={handleClipPointerUp}
+              onContextMenu={(event) => onClipContextMenu(clip.id, event)}
             >
               {clip.kind === "video"
-                ? <TimelineVideo src={clip.src} color={track.color} active={playhead >= clip.startSeconds && playhead <= clip.startSeconds + clip.sourceSeconds} localTime={Math.max(0, playhead - clip.startSeconds)} playing={transportPlaying} />
+                ? <VideoStrip color={track.color} />
                 : <Waveform peaks={clip.peaks} color={track.color} />}
               <span className="clip-label">{clip.name}</span>
             </div>
@@ -4876,7 +5609,10 @@ function TimelineVideo({ src, color, active, localTime, playing }: { src?: strin
   useEffect(() => {
     const video = ref.current;
     if (!video || !url) return;
-    if (Number.isFinite(localTime) && Math.abs(video.currentTime - localTime) > 0.18) {
+    // Only re-sync when the playhead is clearly out of sync (>0.6s). At play time the
+    // browser's media clock advances on its own; constant re-seeks on small drift make
+    // playback stutter and feel slow.
+    if (Number.isFinite(localTime) && Math.abs(video.currentTime - localTime) > 0.6) {
       video.currentTime = localTime;
     }
     if (active && playing) {

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AbJudgeResponse, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog } from "../../shared/types";
+import type { AbJudgeResponse, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog, VideoFilterPreset } from "../../shared/types";
 
 function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {
@@ -18,6 +18,7 @@ export type LlmStatsEvent = { phase: string; promptTokens: number; responseToken
 
 export const api = {
   config: () => tauriInvoke<{ ollamaBaseUrl: string; ollamaModel: string }>("get_config"),
+  restartApp: () => tauriInvoke<void>("restart_app"),
   ollamaModels: (baseUrl: string) => tauriInvoke<{ models: string[] }>("list_ollama_models", { baseUrl }),
   inputDevices: () => tauriInvoke<{ devices: string[] }>("list_input_devices"),
   skills: () => tauriInvoke<SkillCatalog>("get_skill_catalog"),
@@ -25,8 +26,12 @@ export const api = {
   createSession: (name: string) => tauriInvoke<MixProject>("create_session", { name }),
   getSession: (id: string) => tauriInvoke<MixProject>("get_project", { sessionId: id }),
   importFiles: (sessionId: string, paths: string[]) => tauriInvoke<MixProject>("import_audio_files", { sessionId, paths }),
-  createRecordingTrack: (sessionId: string) => tauriInvoke<MixProject>("create_recording_track", { sessionId }),
+  createRecordingTrack: (sessionId: string, channels: 1 | 2 = 1) => tauriInvoke<MixProject>("create_recording_track", { sessionId, channels }),
   createVideoTrack: (sessionId: string) => tauriInvoke<MixProject>("create_video_track", { sessionId }),
+  addRenderedVideoTrack: (sessionId: string, videoPath: string, name: string, startSample: number, durationMs: number) =>
+    tauriInvoke<MixProject>("add_rendered_video_track", { sessionId, videoPath, name, startSample, durationMs }),
+  replaceRenderedVideoTrack: (sessionId: string, trackId: string, clipId: string, videoPath: string, durationMs: number) =>
+    tauriInvoke<MixProject>("replace_rendered_video_track", { sessionId, trackId, clipId, videoPath, durationMs }),
   applyActions: (sessionId: string, actions: MixAction[], explanation?: string) =>
     tauriInvoke<MixProject>("apply_mix_actions", { sessionId, actions, explanation }),
   undo: (sessionId: string) => tauriInvoke<MixProject>("undo_mix_action", { sessionId }),
@@ -76,8 +81,13 @@ export const api = {
     tauriInvoke<{ path: string }>("export_rendered_video", { sourcePath, outputPath }),
   renderAutoVideoEdit: (sessionId: string, outputPath: string, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number) =>
     tauriInvoke<{ path: string }>("render_auto_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds }),
-  renderAgentVideoEdit: (sessionId: string, outputPath: string, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number, ollamaBaseUrl: string, visionModel: string, editModel: string, instructions: string) =>
-    tauriInvoke<{ path: string; script: AgentVideoScriptEntry[] }>("render_agent_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds, ollamaBaseUrl, visionModel, editModel, instructions }),
+  renderAgentVideoEdit: (sessionId: string, outputPath: string | undefined, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number, ollamaBaseUrl: string, visionModel: string, editModel: string, instructions: string, planOnly?: boolean) =>
+    tauriInvoke<{ path: string; script: AgentVideoScriptEntry[] }>("render_agent_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds, ollamaBaseUrl, visionModel, editModel, instructions, planOnly }),
+  renderVideoFromScript: (sessionId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset) =>
+    tauriInvoke<{ path: string; durationMs: number }>("render_video_from_script", { sessionId, sourceTrackIds, startSample, endSample, script, lookPreset }),
+  rerenderAgentEdit: (sessionId: string, trackId: string, clipId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset) =>
+    tauriInvoke<MixProject>("rerender_agent_edit", { sessionId, trackId, clipId, sourceTrackIds, startSample, endSample, script, lookPreset }),
+  fitCanvasToFootage: (sessionId: string) => tauriInvoke<MixProject>("fit_canvas_to_footage", { sessionId }),
   judgeMixAb: (sessionId: string, apiKey: string, model = "gemini-flash-latest") =>
     tauriInvoke<AbJudgeResponse>("judge_mix_ab", { sessionId, options: { provider: "gemini", model, apiKey } }),
   judgeMixAbLocal: (sessionId: string) =>

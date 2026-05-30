@@ -9,7 +9,7 @@ use crate::{
     actions::record_patch,
     defaults::{default_master, make_track},
     engine::source::{import_to_session_rate, write_to_cache, ImportedAudio},
-    model::{ClipRegion, HistorySource, JsonPatchOp, MixProject, MixSession, SourceFile, TrackAnalysis, TrackKind, VideoClipRegion, VideoSourceFile},
+    model::{ClipRegion, HistorySource, JsonPatchOp, MixProject, MixSession, SourceFile, TrackAnalysis, TrackKind, VideoClipRegion, VideoLayout, VideoSourceFile},
 };
 
 pub struct SessionStore {
@@ -104,11 +104,13 @@ impl SessionStore {
         Ok(project)
     }
 
-    pub fn create_recording_track(&self, session_id: &str) -> Result<MixProject, String> {
+    pub fn create_recording_track(&self, session_id: &str, channels: u16) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
-        let source = self.create_silent_source(project.session.sample_rate, "Recording")?;
+        let source = self.create_silent_source(project.session.sample_rate, "Recording", channels)?;
         let source_id = source.id.clone();
-        let track = make_track(source_id, format!("Recording {}", project.session.tracks.len() + 1), project.session.tracks.len());
+        let track_index = project.session.tracks.len();
+        let label = if channels >= 2 { "Stereo Recording" } else { "Recording" };
+        let track = make_track(source_id, format!("{} {}", label, track_index + 1), track_index);
         project.session.source_files.push(source);
         project.session.tracks.push(track);
         self.save(&project)?;
@@ -117,7 +119,7 @@ impl SessionStore {
 
     pub fn create_video_track(&self, session_id: &str) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
-        let source = self.create_silent_source(project.session.sample_rate, "Video Placeholder")?;
+        let source = self.create_silent_source(project.session.sample_rate, "Video Placeholder", 1)?;
         let source_id = source.id.clone();
         let mut track = make_track(source_id, format!("Video {}", project.session.tracks.len() + 1), project.session.tracks.len());
         track.kind = TrackKind::Video;
@@ -126,6 +128,113 @@ impl SessionStore {
         track.record_camera_audio = true;
         project.session.source_files.push(source);
         project.session.tracks.push(track);
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    /// Create a new video track holding a video file rendered by the agent edit.
+    /// The track carries a silent audio placeholder (the rendered mp4's audio is the
+    /// baked mix, played only as a muted preview), so it does not double the engine output.
+    pub fn add_rendered_video_track(
+        &self,
+        session_id: &str,
+        video_path: &Path,
+        name: String,
+        start_sample: u64,
+        duration_ms: u64,
+    ) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let placeholder = self.create_silent_source(project.session.sample_rate, &name, 1)?;
+        let placeholder_id = placeholder.id.clone();
+        let mut track = make_track(placeholder_id, name.clone(), project.session.tracks.len());
+        track.kind = TrackKind::Video;
+        track.role = Some("video".into());
+        track.solo = false;
+        track.record_camera_audio = false;
+
+        let source_id = Uuid::new_v4().to_string();
+        let extension = video_path.extension().and_then(|item| item.to_str()).unwrap_or("mp4");
+        let destination = self.videos_dir().join(format!("{source_id}.{extension}"));
+        fs::copy(video_path, &destination)
+            .map_err(|error| format!("Could not store rendered video: {error}"))?;
+        let original_name = video_path
+            .file_name()
+            .and_then(|item| item.to_str())
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| name.clone());
+        let source = VideoSourceFile {
+            id: source_id.clone(),
+            original_name,
+            path: destination.to_string_lossy().to_string(),
+            mime_type: "video/mp4".into(),
+            duration_ms,
+        };
+        let duration_samples = ((duration_ms as f64 / 1000.0) * project.session.sample_rate as f64).round() as u64;
+        track.video_clips.push(VideoClipRegion {
+            id: Uuid::new_v4().to_string(),
+            video_source_file_id: source_id.clone(),
+            name: Some(name.clone()),
+            start_sample,
+            end_sample: start_sample + duration_samples.max(1),
+            source_offset_ms: 0,
+            // The agent edit is a finished, full-frame composite — fill the canvas
+            // rather than falling back to a small picture-in-picture default.
+            layout: Some(VideoLayout::default()),
+        });
+        project.session.source_files.push(placeholder);
+        project.session.video_source_files.push(source);
+        project.session.tracks.push(track);
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    /// Swap the video file behind an existing clip in place (keeps the clip id, start
+    /// position and layout). Used to update an agent-edit track after a no-agent re-render.
+    pub fn replace_track_video(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        clip_id: &str,
+        video_path: &Path,
+        duration_ms: u64,
+    ) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let sample_rate = project.session.sample_rate;
+        let track = project
+            .session
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        let clip = track
+            .video_clips
+            .iter_mut()
+            .find(|clip| clip.id == clip_id)
+            .ok_or_else(|| format!("Unknown video clip {clip_id}"))?;
+
+        let source_id = Uuid::new_v4().to_string();
+        let extension = video_path.extension().and_then(|item| item.to_str()).unwrap_or("mp4");
+        let destination = self.videos_dir().join(format!("{source_id}.{extension}"));
+        fs::copy(video_path, &destination)
+            .map_err(|error| format!("Could not store rendered video: {error}"))?;
+
+        let duration_samples = ((duration_ms as f64 / 1000.0) * sample_rate as f64).round() as u64;
+        clip.video_source_file_id = source_id.clone();
+        clip.source_offset_ms = 0;
+        clip.end_sample = clip.start_sample + duration_samples.max(1);
+
+        let original_name = video_path
+            .file_name()
+            .and_then(|item| item.to_str())
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| "Agent Edit".to_string());
+        project.session.video_source_files.push(VideoSourceFile {
+            id: source_id,
+            original_name,
+            path: destination.to_string_lossy().to_string(),
+            mime_type: "video/mp4".into(),
+            duration_ms,
+        });
         self.save(&project)?;
         Ok(project)
     }
@@ -614,10 +723,10 @@ impl SessionStore {
         self.data_dir.join("peaks")
     }
 
-    fn create_silent_source(&self, sample_rate: u32, original_name: &str) -> Result<SourceFile, String> {
+    fn create_silent_source(&self, sample_rate: u32, original_name: &str, channels: u16) -> Result<SourceFile, String> {
         let source_id = Uuid::new_v4().to_string();
         let frames = sample_rate as u64;
-        let channels = 1_u16;
+        let channels = channels.max(1).min(2);
         let samples = vec![0.0_f32; frames as usize * channels as usize];
         let cache_path = self.sources_dir().join(format!("{source_id}.f32cache"));
         crate::engine::source::cache::write_cache(

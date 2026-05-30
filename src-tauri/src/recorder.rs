@@ -114,6 +114,7 @@ pub fn start_recording(
     start_sample: u64,
     target_track_id: Option<String>,
     input_device: Option<String>,
+    target_channels: u16,
 ) -> Result<RecordingHandle, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -128,7 +129,7 @@ pub fn start_recording(
     std::thread::Builder::new()
         .name("automixer-recorder".into())
         .spawn(move || {
-            let result = run_recording_thread(thread_path.clone(), input_device, stop_rx, ready_tx.clone(), meter_tx);
+            let result = run_recording_thread(thread_path.clone(), input_device, target_channels, stop_rx, ready_tx.clone(), meter_tx);
             if let Err(error) = &result {
                 let _ = ready_tx.try_send(Err(error.clone()));
             }
@@ -162,6 +163,7 @@ pub fn start_input_monitor(input_device: Option<String>) -> Result<InputMonitorH
 fn run_recording_thread(
     path: PathBuf,
     input_device: Option<String>,
+    target_channels: u16,
     stop_rx: Receiver<()>,
     ready_tx: Sender<Result<(), String>>,
     meter_tx: Sender<RecordingMeter>,
@@ -182,15 +184,16 @@ fn run_recording_thread(
         .map_err(|e| format!("Could not query default input config: {e}"))?;
     let sample_format = default_config.sample_format();
     let config: StreamConfig = default_config.config();
+    let target_channels = target_channels.max(1).min(2);
     let spec = WavSpec {
-        channels: 2,
+        channels: target_channels,
         sample_rate: config.sample_rate.0,
         bits_per_sample: 32,
         sample_format: WavSampleFormat::Float,
     };
     let writer = WavWriter::create(&path, spec).map_err(|e| format!("Could not create recording WAV: {e}"))?;
     let writer = Arc::new(Mutex::new(Some(writer)));
-    let stream = build_input_stream(&device, &config, sample_format, writer.clone(), meter_tx)?;
+    let stream = build_input_stream(&device, &config, sample_format, target_channels, writer.clone(), meter_tx)?;
 
     stream.play().map_err(|e| format!("Could not start input stream: {e}"))?;
     let _ = ready_tx.send(Ok(()));
@@ -241,6 +244,7 @@ fn build_input_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     format: SampleFormat,
+    target_channels: u16,
     writer: Arc<Mutex<Option<WavWriter<std::io::BufWriter<std::fs::File>>>>>,
     meter_tx: Sender<RecordingMeter>,
 ) -> Result<cpal::Stream, String> {
@@ -253,11 +257,12 @@ fn build_input_stream(
             let writer = writer.clone();
             let meter_tx = meter_tx.clone();
             let channels = config.channels as usize;
+            let target = target_channels as usize;
             device
                 .build_input_stream(
                     config,
                     move |data: &[f32], _| {
-                        write_centered_stereo_samples(data, channels, &writer);
+                        write_recording_samples(data, channels, target, &writer);
                         emit_meter(data.iter().copied(), &meter_tx);
                     },
                     err,
@@ -269,12 +274,13 @@ fn build_input_stream(
             let writer = writer.clone();
             let meter_tx = meter_tx.clone();
             let channels = config.channels as usize;
+            let target = target_channels as usize;
             device
                 .build_input_stream(
                     config,
                     move |data: &[i16], _| {
                         let converted: Vec<f32> = data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
-                        write_centered_stereo_samples(&converted, channels, &writer);
+                        write_recording_samples(&converted, channels, target, &writer);
                         emit_meter(converted.iter().copied(), &meter_tx);
                     },
                     err,
@@ -286,6 +292,7 @@ fn build_input_stream(
             let writer = writer.clone();
             let meter_tx = meter_tx.clone();
             let channels = config.channels as usize;
+            let target = target_channels as usize;
             device
                 .build_input_stream(
                     config,
@@ -294,7 +301,7 @@ fn build_input_stream(
                             .iter()
                             .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0)
                             .collect();
-                        write_centered_stereo_samples(&converted, channels, &writer);
+                        write_recording_samples(&converted, channels, target, &writer);
                         emit_meter(converted.iter().copied(), &meter_tx);
                     },
                     err,
@@ -364,29 +371,42 @@ where
     let _ = meter_tx.try_send(RecordingMeter { peak: peak.clamp(0.0, 1.0) });
 }
 
-fn write_centered_stereo_samples(samples: &[f32], channels: usize, writer: &Arc<Mutex<Option<WavWriter<std::io::BufWriter<std::fs::File>>>>>) {
+fn write_recording_samples(
+    samples: &[f32],
+    input_channels: usize,
+    target_channels: usize,
+    writer: &Arc<Mutex<Option<WavWriter<std::io::BufWriter<std::fs::File>>>>>,
+) {
     let Ok(mut guard) = writer.lock() else {
         return;
     };
     let Some(writer) = guard.as_mut() else {
         return;
     };
-    let channels = channels.max(1);
-    for frame in samples.chunks(channels) {
-        let mut sum = 0.0;
-        let mut count = 0;
-        for sample in frame.iter().copied() {
-            if sample.abs() > 0.000001 {
-                sum += sample;
-                count += 1;
+    let input_channels = input_channels.max(1);
+    let target_channels = target_channels.max(1).min(2);
+    for frame in samples.chunks(input_channels) {
+        if frame.is_empty() {
+            continue;
+        }
+        match target_channels {
+            1 => {
+                // Mono target: unconditional average of every input channel. A constant
+                // denominator (no per-sample thresholding) avoids the zipper noise that
+                // sounded like sibilance / "ssss".
+                let sum: f32 = frame.iter().copied().sum();
+                let mono = (sum / frame.len() as f32).clamp(-1.0, 1.0);
+                let _ = writer.write_sample(mono);
+            }
+            _ => {
+                // Stereo target: preserve L/R from the input. A mono input is duplicated
+                // to both channels. Inputs with more than two channels keep their first
+                // two (avoids mixing in unused/floor-noise channels).
+                let l = frame.first().copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                let r = frame.get(1).copied().unwrap_or(l).clamp(-1.0, 1.0);
+                let _ = writer.write_sample(l);
+                let _ = writer.write_sample(r);
             }
         }
-        if count == 0 {
-            sum = frame.iter().copied().sum();
-            count = frame.len();
-        }
-        let mono = (sum / count.max(1) as f32).clamp(-1.0, 1.0);
-        let _ = writer.write_sample(mono);
-        let _ = writer.write_sample(mono);
     }
 }

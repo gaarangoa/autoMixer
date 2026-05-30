@@ -186,6 +186,30 @@ pub struct VideoLayout {
     pub preset: VideoFilterPreset,
 }
 
+impl Default for VideoLayout {
+    /// A full-frame layer: fills the canvas with no crop or color adjustments.
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            crop_top: 0.0,
+            crop_right: 0.0,
+            crop_bottom: 0.0,
+            crop_left: 0.0,
+            opacity: 1.0,
+            rotation: 0.0,
+            z_index: 0,
+            brightness: 1.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            blur: 0.0,
+            preset: VideoFilterPreset::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoCanvas {
@@ -213,6 +237,18 @@ pub enum VideoFilterPreset {
     Mono,
     Punch,
     Dream,
+    /// Cinematic teal-orange grade.
+    Cinema,
+    /// High-contrast black & white.
+    Noir,
+    /// Dark, contrasty, slightly cool — "sad / moody".
+    Moody,
+    /// Sepia-leaning vintage / film look.
+    Vintage,
+    /// Warm golden-hour push.
+    Golden,
+    /// Strong cool blue tint.
+    Cold,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -58,7 +58,7 @@ pub struct AgentVideoEditResponse {
     script: Vec<AgentVideoScriptEntry>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentVideoScriptCandidate {
     image_number: usize,
@@ -69,7 +69,7 @@ pub struct AgentVideoScriptCandidate {
     note: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentVideoScriptEntry {
     window_index: u32,
@@ -227,12 +227,12 @@ pub fn import_audio_files(state: State<'_, AppState>, session_id: String, paths:
 }
 
 #[tauri::command]
-pub fn create_recording_track(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+pub fn create_recording_track(state: State<'_, AppState>, session_id: String, channels: Option<u16>) -> Result<MixProject, String> {
     let project = state
         .store
         .lock()
         .map_err(|error| error.to_string())?
-        .create_recording_track(&session_id)?;
+        .create_recording_track(&session_id, channels.unwrap_or(1))?;
     if let Ok(mut audio) = state.audio.lock() {
         audio.bind_session_sources(&project.session)?;
         sync_session_to_engine(&mut audio, &project.session);
@@ -254,6 +254,61 @@ pub fn create_video_track(state: State<'_, AppState>, session_id: String) -> Res
         audio.publish_automation(&project.session);
     }
     Ok(project)
+}
+
+/// Swap the rendered video file behind an existing agent-edit track's clip in place.
+/// Keeps the track id, clip id, layout and start position — only the underlying source
+/// file (and clip length) changes.
+#[tauri::command]
+pub fn replace_rendered_video_track(
+    state: State<'_, AppState>,
+    session_id: String,
+    track_id: String,
+    clip_id: String,
+    video_path: String,
+    duration_ms: u64,
+) -> Result<MixProject, String> {
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .replace_track_video(&session_id, &track_id, &clip_id, Path::new(&video_path), duration_ms.max(1))?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn add_rendered_video_track(
+    state: State<'_, AppState>,
+    session_id: String,
+    video_path: String,
+    name: String,
+    start_sample: u64,
+    duration_ms: u64,
+) -> Result<MixProject, String> {
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .add_rendered_video_track(&session_id, Path::new(&video_path), name, start_sample, duration_ms)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
+}
+
+/// Hard-restart the whole app. Used as a "stop" for a mistaken or stuck agent run:
+/// relaunching the process kills any in-flight LLM call or video render. The last
+/// saved session is reloaded on startup. This call never returns.
+#[tauri::command]
+pub fn restart_app(app: AppHandle) {
+    app.restart();
 }
 
 #[tauri::command]
@@ -453,7 +508,15 @@ pub fn start_recording(
             return Err(format!("Unknown target track {track_id}"));
         }
     }
-    let handle = crate::recorder::start_recording(path, safe_start, target_track_id, input_device)?;
+    // Take the target track's preferred channel count (1 = mono, 2 = stereo) from the
+    // placeholder source created at track-add time. Falls back to mono.
+    let target_channels: u16 = target_track_id
+        .as_deref()
+        .and_then(|track_id| session.tracks.iter().find(|track| track.id == track_id))
+        .and_then(|track| session.source_files.iter().find(|source| source.id == track.source_file_id))
+        .map(|source| source.channels.max(1).min(2))
+        .unwrap_or(1);
+    let handle = crate::recorder::start_recording(path, safe_start, target_track_id, input_device, target_channels)?;
     if let Err(error) = handle.wait_until_ready(Duration::from_secs(3)) {
         let _ = handle.stop();
         return Err(error);
@@ -1205,7 +1268,7 @@ pub fn render_auto_video_edit(
         .arg("-i")
         .arg(&audio_path);
 
-    let filter = build_auto_edit_filter(&video_inputs, &segments, &project.session, range_start, range_end);
+    let filter = build_auto_edit_filter(&video_inputs, &segments, &project.session, range_start, range_end, None);
     command
         .arg("-filter_complex")
         .arg(filter)
@@ -1237,7 +1300,7 @@ pub async fn render_agent_video_edit(
     app: AppHandle,
     state: State<'_, AppState>,
     session_id: String,
-    output_path: String,
+    output_path: Option<String>,
     start_sample: Option<u64>,
     end_sample: Option<u64>,
     track_ids: Vec<String>,
@@ -1247,11 +1310,24 @@ pub async fn render_agent_video_edit(
     vision_model: Option<String>,
     edit_model: Option<String>,
     instructions: Option<String>,
+    // When true, run the agent's decision phase only and return the script — no ffmpeg
+    // render. The frontend uses this to show a plan that the user can review/edit before
+    // clicking Process to actually render.
+    plan_only: Option<bool>,
 ) -> Result<AgentVideoEditResponse, String> {
     let started = std::time::Instant::now();
     emit_agent_progress(&app, &started, "starting", "Preparing Agent Video Edit...", 0, 1);
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
-    let path = normalize_mp4_path(PathBuf::from(output_path));
+    // No save dialog by default — render straight to the renders folder. The frontend
+    // adds the result as a new video track; the Download button lets the user export later.
+    let path = match output_path.filter(|value| !value.trim().is_empty()) {
+        Some(value) => normalize_mp4_path(PathBuf::from(value)),
+        None => {
+            let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+            std::fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
+            renders_dir.join(format!("agent-edit-{}.mp4", uuid::Uuid::new_v4()))
+        }
+    };
     let full_end = session_duration_samples(&project.session);
     let range_start = start_sample.unwrap_or(0).min(full_end);
     let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
@@ -1340,23 +1416,50 @@ pub async fn render_agent_video_edit(
         return Err("Agent Video Edit could not find visible selected clips in the edit range.".into());
     }
 
-    emit_agent_progress(&app, &started, "audio", "Using analyzed mix audio for video export...", total_windows, total_windows);
+    if plan_only.unwrap_or(false) {
+        emit_agent_progress(&app, &started, "done", "Plan ready for review.", total_windows, total_windows);
+        return Ok(AgentVideoEditResponse { path: String::new(), script });
+    }
 
+    emit_agent_progress(&app, &started, "audio", "Using analyzed mix audio for video export...", total_windows, total_windows);
+    emit_agent_progress(&app, &started, "rendering", &format!("Rendering {} selected cuts to MP4...", segments.len()), total_windows, total_windows);
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &path, None)
+        .map_err(|error| {
+            emit_agent_progress(&app, &started, "error", "ffmpeg failed while rendering the agent edit.", total_windows, total_windows);
+            error
+        })?;
+    emit_agent_progress(&app, &started, "done", "Agent Video Edit complete.", total_windows, total_windows);
+    Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script })
+}
+
+/// Render a sequence of edit segments (each picking one source clip for a time span)
+/// to an MP4 over the supplied mix audio. Shared by the agent edit and the no-agent
+/// re-render from an edited script.
+fn render_segments_ffmpeg(
+    session: &MixSession,
+    video_inputs: &[VideoRenderClip],
+    segments: &[AutoEditSegment],
+    audio_path: &Path,
+    range_start: u64,
+    range_end: u64,
+    output_path: &Path,
+    look_override: Option<crate::model::VideoFilterPreset>,
+) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
-    for clip in &video_inputs {
+    for clip in video_inputs {
         command.arg("-i").arg(&clip.path);
     }
     if range_start > 0 {
-        command.arg("-ss").arg(format!("{:.3}", range_start as f64 / project.session.sample_rate as f64));
+        command.arg("-ss").arg(format!("{:.3}", range_start as f64 / session.sample_rate as f64));
     }
     command
         .arg("-t")
-        .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64))
+        .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / session.sample_rate as f64))
         .arg("-i")
-        .arg(&audio_path);
+        .arg(audio_path);
 
-    let filter = build_auto_edit_filter(&video_inputs, &segments, &project.session, range_start, range_end);
+    let filter = build_auto_edit_filter(video_inputs, segments, session, range_start, range_end, look_override);
     command
         .arg("-filter_complex")
         .arg(filter)
@@ -1365,25 +1468,256 @@ pub async fn render_agent_video_edit(
         .arg("-map")
         .arg(format!("{}:a:0", video_inputs.len()));
 
-    emit_agent_progress(&app, &started, "rendering", &format!("Rendering {} selected cuts to MP4...", segments.len()), total_windows, total_windows);
     let output = command
         .arg("-c:v")
         .arg("libx264")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-r")
+        .arg("30")
+        // Force a keyframe every 30 frames (1s) so the player can seek anywhere quickly
+        // and the playhead-driven `<video>.currentTime = ...` calls don't have to decode
+        // a long GOP just to display a single frame.
+        .arg("-g")
+        .arg("30")
+        .arg("-keyint_min")
+        .arg("30")
+        .arg("-sc_threshold")
+        .arg("0")
         .arg("-pix_fmt")
         .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+faststart")
         .arg("-c:a")
         .arg("aac")
         .arg("-shortest")
-        .arg(&path)
+        .arg(output_path)
         .output()
         .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        emit_agent_progress(&app, &started, "error", "ffmpeg failed while rendering the agent edit.", total_windows, total_windows);
-        return Err(format!("ffmpeg agent video edit failed: {}", stderr.trim()));
+        return Err(format!("ffmpeg video edit failed: {}", stderr.trim()));
     }
-    emit_agent_progress(&app, &started, "done", "Agent Video Edit complete.", total_windows, total_windows);
-    Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script })
+    Ok(())
+}
+
+/// Build render segments from an (edited) agent script, reusing each window's chosen
+/// track instead of re-running the vision/edit models.
+fn build_segments_from_script(
+    clips: &[VideoRenderClip],
+    script: &[AgentVideoScriptEntry],
+    range_start: u64,
+    range_end: u64,
+    sample_rate: u32,
+) -> Vec<AutoEditSegment> {
+    let mut segments = Vec::new();
+    for entry in script {
+        let Some(track_index) = entry.chosen_track_index else { continue };
+        let window_start = ((entry.start_seconds * sample_rate as f64).round() as u64).max(range_start);
+        let window_end = ((entry.end_seconds * sample_rate as f64).round() as u64).min(range_end);
+        if window_end <= window_start {
+            continue;
+        }
+        let Some((input_index, clip)) = clips
+            .iter()
+            .enumerate()
+            .find(|(_, clip)| clip.track_index == track_index && clip.start_sample < window_end && clip.end_sample > window_start)
+        else {
+            continue;
+        };
+        let segment_start = window_start.max(clip.start_sample);
+        let segment_end = window_end.min(clip.end_sample);
+        if segment_end <= segment_start {
+            continue;
+        }
+        let source_offset_ms = clip.source_offset_ms.saturating_add(
+            (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64) * 1000.0).round() as u64,
+        );
+        segments.push(AutoEditSegment {
+            input_index,
+            timeline_start: segment_start,
+            timeline_end: segment_end,
+            source_offset_ms,
+        });
+    }
+    segments
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderFromScriptResponse {
+    path: String,
+    duration_ms: u64,
+}
+
+/// Render a video edit from a script — no vision/edit LLMs. Returns the rendered mp4
+/// path and duration; the frontend then attaches it to a session as a new track or
+/// replaces an existing track's clip.
+#[tauri::command]
+pub fn render_video_from_script(
+    state: State<'_, AppState>,
+    session_id: String,
+    source_track_ids: Vec<String>,
+    start_sample: Option<u64>,
+    end_sample: Option<u64>,
+    script: Vec<AgentVideoScriptEntry>,
+    look_preset: Option<crate::model::VideoFilterPreset>,
+) -> Result<RenderFromScriptResponse, String> {
+    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let full_end = session_duration_samples(&project.session);
+    let range_start = start_sample.unwrap_or(0).min(full_end);
+    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let selected_track_ids = source_track_ids
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect::<HashSet<_>>();
+    if selected_track_ids.is_empty() {
+        return Err("No source video tracks to render from.".into());
+    }
+    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    if video_inputs.is_empty() {
+        return Err("The source video tracks have no clips in the edit range.".into());
+    }
+    let mut segments = build_segments_from_script(&video_inputs, &script, range_start, range_end, project.session.sample_rate);
+    if segments.is_empty() {
+        let interval_samples = (project.session.sample_rate as u64).max(1);
+        segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
+    }
+    if segments.is_empty() {
+        return Err("No visible source clips in the edit range.".into());
+    }
+
+    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
+    let audio_path = renders_dir.join(format!("{session_id}.video-edit.wav"));
+    audio::render_mix(&project.session, &audio_path)?;
+    let output_path = renders_dir.join(format!("agent-edit-{}.mp4", uuid::Uuid::new_v4()));
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset)?;
+
+    let duration_ms = (((range_end.saturating_sub(range_start)) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64;
+    Ok(RenderFromScriptResponse {
+        path: output_path.to_string_lossy().to_string(),
+        duration_ms: duration_ms.max(1),
+    })
+}
+
+/// Re-render the agent edit from an (optionally edited) script without invoking the
+/// vision/edit models, then replace the clip on the existing agent-edit track in place.
+/// `source_track_ids` are the original camera tracks the script refers to.
+#[tauri::command]
+pub fn rerender_agent_edit(
+    state: State<'_, AppState>,
+    session_id: String,
+    track_id: String,
+    clip_id: String,
+    source_track_ids: Vec<String>,
+    start_sample: Option<u64>,
+    end_sample: Option<u64>,
+    script: Vec<AgentVideoScriptEntry>,
+    look_preset: Option<crate::model::VideoFilterPreset>,
+) -> Result<MixProject, String> {
+    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let full_end = session_duration_samples(&project.session);
+    let range_start = start_sample.unwrap_or(0).min(full_end);
+    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let selected_track_ids = source_track_ids
+        .into_iter()
+        .filter(|id| !id.trim().is_empty() && id != &track_id)
+        .collect::<HashSet<_>>();
+    if selected_track_ids.is_empty() {
+        return Err("No source video tracks to re-render from.".into());
+    }
+    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    if video_inputs.is_empty() {
+        return Err("The source video tracks have no clips in the edit range.".into());
+    }
+    let mut segments = build_segments_from_script(&video_inputs, &script, range_start, range_end, project.session.sample_rate);
+    if segments.is_empty() {
+        // No usable per-window choices in the script; fall back to automatic 1s cuts.
+        let interval_samples = (project.session.sample_rate as u64).max(1);
+        segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
+    }
+    if segments.is_empty() {
+        return Err("No visible source clips in the edit range.".into());
+    }
+
+    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
+    let audio_path = renders_dir.join(format!("{session_id}.video-edit.wav"));
+    audio::render_mix(&project.session, &audio_path)?;
+    let output_path = renders_dir.join(format!("rerender-{}.mp4", uuid::Uuid::new_v4()));
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset)?;
+
+    let duration_ms = (((range_end.saturating_sub(range_start)) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64;
+    let updated = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .replace_track_video(&session_id, &track_id, &clip_id, &output_path, duration_ms.max(1))?;
+    let _ = fs::remove_file(&output_path);
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&updated.session)?;
+        sync_session_to_engine(&mut audio, &updated.session);
+        audio.publish_automation(&updated.session);
+    }
+    Ok(updated)
+}
+
+/// Read a video file's pixel dimensions via ffprobe.
+fn probe_video_dimensions(path: &Path) -> Result<(u32, u32), String> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Could not run ffprobe. Install ffmpeg/ffprobe: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("ffprobe failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next().unwrap_or("").trim();
+    let mut parts = line.split('x');
+    let width: u32 = parts.next().and_then(|value| value.trim().parse().ok()).ok_or("Could not read video width")?;
+    let height: u32 = parts.next().and_then(|value| value.trim().parse().ok()).ok_or("Could not read video height")?;
+    if width == 0 || height == 0 {
+        return Err("Video reported zero dimensions".into());
+    }
+    Ok((width, height))
+}
+
+/// Set the session's video canvas to match the source footage resolution, so cut-style
+/// edits render close to 1:1 instead of upscaling a small camera into a huge frame.
+/// Uses the smallest-area source (the camera footage, not a previously rendered edit).
+#[tauri::command]
+pub fn fit_canvas_to_footage(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    let mut project = store.get_project(&session_id)?;
+    let by_id: std::collections::HashMap<&str, &crate::model::VideoSourceFile> =
+        project.session.video_source_files.iter().map(|source| (source.id.as_str(), source)).collect();
+    let mut best: Option<(u32, u32)> = None;
+    for track in &project.session.tracks {
+        if track.kind != crate::model::TrackKind::Video {
+            continue;
+        }
+        for clip in &track.video_clips {
+            if let Some(source) = by_id.get(clip.video_source_file_id.as_str()) {
+                if let Ok((width, height)) = probe_video_dimensions(Path::new(&source.path)) {
+                    if best.map_or(true, |(bw, bh)| (width as u64 * height as u64) < (bw as u64 * bh as u64)) {
+                        best = Some((width, height));
+                    }
+                }
+            }
+        }
+    }
+    let (width, height) = best.ok_or("No readable video footage found to size the canvas.")?;
+    project.session.video_canvas.width = even_dimension((width as i32).clamp(240, 3840)) as u32;
+    project.session.video_canvas.height = even_dimension((height as i32).clamp(240, 3840)) as u32;
+    store.save(&project)?;
+    Ok(project)
 }
 
 #[tauri::command]
@@ -1612,6 +1946,12 @@ fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_sta
             VideoFilterPreset::Mono => chain.push_str(",hue=s=0"),
             VideoFilterPreset::Punch => chain.push_str(",eq=contrast=1.12:saturation=1.14"),
             VideoFilterPreset::Dream => chain.push_str(",boxblur=1:1,eq=brightness=0.04:saturation=0.82"),
+            VideoFilterPreset::Cinema => chain.push_str(",eq=contrast=1.10:saturation=1.05,colorchannelmixer=rr=1.08:gg=0.98:bb=0.90"),
+            VideoFilterPreset::Noir => chain.push_str(",eq=contrast=1.28,hue=s=0"),
+            VideoFilterPreset::Moody => chain.push_str(",eq=brightness=-0.06:contrast=1.18:saturation=0.85,colorchannelmixer=rr=0.93:gg=0.97:bb=1.08"),
+            VideoFilterPreset::Vintage => chain.push_str(",eq=contrast=0.94:saturation=0.70,colorchannelmixer=rr=1.06:gg=0.98:bb=0.86"),
+            VideoFilterPreset::Golden => chain.push_str(",eq=brightness=0.04:saturation=1.12,colorchannelmixer=rr=1.10:gg=1.02:bb=0.82"),
+            VideoFilterPreset::Cold => chain.push_str(",eq=contrast=1.05:saturation=0.92,colorchannelmixer=rr=0.84:gg=0.95:bb=1.16"),
             VideoFilterPreset::None => {}
         }
         if layout.blur >= 0.5 {
@@ -1665,6 +2005,12 @@ fn layout_processing_suffix(layout: &VideoLayout, reference_w: i32, reference_h:
         VideoFilterPreset::Mono => suffix.push_str(",hue=s=0"),
         VideoFilterPreset::Punch => suffix.push_str(",eq=contrast=1.12:saturation=1.14"),
         VideoFilterPreset::Dream => suffix.push_str(",boxblur=1:1,eq=brightness=0.04:saturation=0.82"),
+        VideoFilterPreset::Cinema => suffix.push_str(",eq=contrast=1.10:saturation=1.05,colorchannelmixer=rr=1.08:gg=0.98:bb=0.90"),
+        VideoFilterPreset::Noir => suffix.push_str(",eq=contrast=1.28,hue=s=0"),
+        VideoFilterPreset::Moody => suffix.push_str(",eq=brightness=-0.06:contrast=1.18:saturation=0.85,colorchannelmixer=rr=0.93:gg=0.97:bb=1.08"),
+        VideoFilterPreset::Vintage => suffix.push_str(",eq=contrast=0.94:saturation=0.70,colorchannelmixer=rr=1.06:gg=0.98:bb=0.86"),
+        VideoFilterPreset::Golden => suffix.push_str(",eq=brightness=0.04:saturation=1.12,colorchannelmixer=rr=1.10:gg=1.02:bb=0.82"),
+        VideoFilterPreset::Cold => suffix.push_str(",eq=contrast=1.05:saturation=0.92,colorchannelmixer=rr=0.84:gg=0.95:bb=1.16"),
         VideoFilterPreset::None => {}
     }
     if layout.blur >= 0.5 {
@@ -2638,6 +2984,7 @@ fn build_auto_edit_filter(
     session: &MixSession,
     range_start: u64,
     range_end: u64,
+    look_override: Option<crate::model::VideoFilterPreset>,
 ) -> String {
     let canvas = &session.video_canvas;
     let output_w = even_dimension(canvas.width.clamp(240, 3840) as i32);
@@ -2662,7 +3009,7 @@ fn build_auto_edit_filter(
                 filter.push(';');
             }
             filter.push_str(&format!(
-                "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,format=yuv420p[v{part_index}]"
+                "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,fps=30,format=yuv420p[v{part_index}]"
             ));
             concat_labels.push(format!("[v{part_index}]"));
             part_index += 1;
@@ -2676,13 +3023,32 @@ fn build_auto_edit_filter(
         let duration = segment_end.saturating_sub(effective_start) as f64 / session.sample_rate as f64;
         let source_offset = segment.source_offset_ms as f64 / 1000.0
             + effective_start.saturating_sub(segment.timeline_start) as f64 / session.sample_rate as f64;
-        let (x, y) = centered_layout_position(&clip.layout, output_w, output_h);
-        let suffix = layout_processing_suffix(&clip.layout, output_w, output_h);
+        // A cut-style edit shows one camera at a time, so each shot fills the whole canvas.
+        // Force the box to full-frame (drop the picture-in-picture position/size used for the
+        // multi-cam composition) but KEEP the per-track crop (the user's framing, e.g. cropping
+        // the face out), rotation (to un-flip cameras) and color grading. The kept (cropped)
+        // region is then scaled to cover the whole canvas.
+        let mut fill_layout = clip.layout.clone();
+        fill_layout.x = 0.0;
+        fill_layout.y = 0.0;
+        fill_layout.width = 100.0;
+        fill_layout.height = 100.0;
+        fill_layout.opacity = 1.0;
+        // A user-picked "look" overrides the per-clip preset so a single look
+        // applies uniformly across every cut without modifying the source layouts.
+        if let Some(preset) = look_override.clone() {
+            fill_layout.preset = preset;
+        }
+        let (x, y) = centered_layout_position(&fill_layout, output_w, output_h);
+        let suffix = layout_processing_suffix(&fill_layout, output_w, output_h);
         if !filter.is_empty() {
             filter.push(';');
         }
         filter.push_str(&format!(
-            "[{}:v]trim=start={source_offset:.3}:duration={duration:.3},setpts=PTS-STARTPTS{suffix}[clip{part_index}];color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1[base{part_index}];[base{part_index}][clip{part_index}]overlay={x}:{y}:eof_action=pass,format=yuv420p[v{part_index}]",
+            // Normalise the source's frame rate first — webcam captures often report bogus
+            // r_frame_rate values (e.g. 600/1) which propagate through trim and confuse the
+            // concat timing, producing stuttery/slow playback.
+            "[{}:v]fps=30,trim=start={source_offset:.3}:duration={duration:.3},setpts=PTS-STARTPTS{suffix}[clip{part_index}];color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1[base{part_index}];[base{part_index}][clip{part_index}]overlay={x}:{y}:eof_action=pass,fps=30,format=yuv420p[v{part_index}]",
             segment.input_index
         ));
         concat_labels.push(format!("[v{part_index}]"));
@@ -2695,7 +3061,7 @@ fn build_auto_edit_filter(
             filter.push(';');
         }
         filter.push_str(&format!(
-            "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,format=yuv420p[v{part_index}]"
+            "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,fps=30,format=yuv420p[v{part_index}]"
         ));
         concat_labels.push(format!("[v{part_index}]"));
         part_index += 1;
@@ -2703,7 +3069,7 @@ fn build_auto_edit_filter(
     if filter.is_empty() {
         let duration = range_end.saturating_sub(range_start) as f64 / session.sample_rate as f64;
         filter.push_str(&format!(
-            "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,format=yuv420p[v0]"
+            "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,fps=30,format=yuv420p[v0]"
         ));
         concat_labels.push("[v0]".to_string());
         part_index = 1;
@@ -2760,10 +3126,21 @@ fn even_dimension(value: i32) -> i32 {
 }
 
 fn ffmpeg_color(value: &str) -> String {
-    if value.len() == 7 && value.starts_with('#') && value.chars().skip(1).all(|c| c.is_ascii_hexdigit()) {
-        format!("0x{}", &value[1..])
-    } else {
-        "black".into()
+    let trimmed = value.trim();
+    let is_hex = trimmed.len() == 7
+        && trimmed.starts_with('#')
+        && trimmed.chars().skip(1).all(|c| c.is_ascii_hexdigit());
+    if !is_hex {
+        return "black".into();
+    }
+    // Prefer named colors when possible (some ffmpeg builds misparse "0x000000" as
+    // 0 and fall back to a default that isn't black — which is where the green
+    // background in rendered edits was coming from).
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "#000000" => "black".into(),
+        "#ffffff" => "white".into(),
+        _ => lower, // ffmpeg accepts "#RRGGBB" directly in the color filter
     }
 }
 

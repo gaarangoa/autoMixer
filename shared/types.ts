@@ -108,7 +108,7 @@ export type VideoClipRegion = {
   layout?: VideoLayout;
 };
 
-export type VideoFilterPreset = "none" | "warm" | "cool" | "mono" | "punch" | "dream";
+export type VideoFilterPreset = "none" | "warm" | "cool" | "mono" | "punch" | "dream" | "cinema" | "noir" | "moody" | "vintage" | "golden" | "cold";
 
 export type VideoLayout = {
   x: number;
