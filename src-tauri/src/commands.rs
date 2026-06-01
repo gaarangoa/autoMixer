@@ -44,6 +44,9 @@ pub struct InputDevicesResponse {
 #[serde(rename_all = "camelCase")]
 pub struct RecordingMetersResponse {
     peaks: Vec<f32>,
+    /// Most recent per-channel peaks, used to show a live L/R meter in the inspector.
+    /// Empty when no meter has been received yet.
+    channel_peaks: Vec<f32>,
 }
 
 #[derive(Serialize)]
@@ -202,6 +205,11 @@ pub fn list_input_devices() -> Result<InputDevicesResponse, String> {
 }
 
 #[tauri::command]
+pub fn list_input_device_channels(input_device: Option<String>) -> Result<u32, String> {
+    Ok(crate::recorder::input_device_channel_count(input_device)?)
+}
+
+#[tauri::command]
 pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<MixSession>, String> {
     state.store.lock().map_err(|error| error.to_string())?.list_sessions()
 }
@@ -323,7 +331,12 @@ pub fn apply_mix_actions(
     apply_actions(&mut project, &actions, HistorySource::User, explanation)?;
     store.save(&project)?;
     push_engine_commands(&state, &project.session, &actions);
-    if let Ok(audio) = state.audio.lock() {
+    if let Ok(mut audio) = state.audio.lock() {
+        // Defensive re-sync: makes sure the engine's per-slot gain/mute/pan/etc. mirror the
+        // saved project regardless of which actions were in the batch (e.g. a `rename_track`
+        // has no engine command of its own; without this, the slot's controls drift if a
+        // previous batch was missed).
+        sync_session_to_engine(&mut audio, &project.session);
         audio.publish_automation(&project.session);
     }
     Ok(project)
@@ -479,6 +492,8 @@ pub fn start_recording(
     start_sample: u64,
     target_track_id: Option<String>,
     input_device: Option<String>,
+    input_gain_db: Option<f32>,
+    input_channels: Option<Vec<u16>>,
 ) -> Result<(), String> {
     let session = state
         .store
@@ -516,7 +531,10 @@ pub fn start_recording(
         .and_then(|track| session.source_files.iter().find(|source| source.id == track.source_file_id))
         .map(|source| source.channels.max(1).min(2))
         .unwrap_or(1);
-    let handle = crate::recorder::start_recording(path, safe_start, target_track_id, input_device, target_channels)?;
+    // dB -> linear gain factor. Clamp to a sane range so we can't massively boost noise.
+    let gain_db = input_gain_db.unwrap_or(0.0).clamp(-60.0, 24.0);
+    let gain_factor = 10f32.powf(gain_db / 20.0);
+    let handle = crate::recorder::start_recording(path, safe_start, target_track_id, input_device, target_channels, gain_factor, input_channels)?;
     if let Err(error) = handle.wait_until_ready(Duration::from_secs(3)) {
         let _ = handle.stop();
         return Err(error);
@@ -532,11 +550,13 @@ pub fn poll_recording_meters(state: State<'_, AppState>) -> Result<RecordingMete
         let _ = recorder.take();
         return Err(error);
     }
-    let peaks = recorder
+    let drained = recorder
         .as_ref()
-        .map(|handle| handle.drain_meters().into_iter().map(|meter| meter.peak).collect())
+        .map(|handle| handle.drain_meters())
         .unwrap_or_default();
-    Ok(RecordingMetersResponse { peaks })
+    let channel_peaks = drained.last().map(|m| m.channel_peaks.clone()).unwrap_or_default();
+    let peaks = drained.into_iter().map(|meter| meter.peak).collect();
+    Ok(RecordingMetersResponse { peaks, channel_peaks })
 }
 
 #[tauri::command]
@@ -589,11 +609,13 @@ pub fn poll_input_monitor_meters(state: State<'_, AppState>) -> Result<Recording
         let _ = monitor.take();
         return Err(error);
     }
-    let peaks = monitor
+    let drained = monitor
         .as_ref()
-        .map(|handle| handle.drain_meters().into_iter().map(|meter| meter.peak).collect())
+        .map(|handle| handle.drain_meters())
         .unwrap_or_default();
-    Ok(RecordingMetersResponse { peaks })
+    let channel_peaks = drained.last().map(|m| m.channel_peaks.clone()).unwrap_or_default();
+    let peaks = drained.into_iter().map(|meter| meter.peak).collect();
+    Ok(RecordingMetersResponse { peaks, channel_peaks })
 }
 
 #[tauri::command]

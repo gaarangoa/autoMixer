@@ -278,6 +278,11 @@ pub struct Track {
     pub solo: bool,
     #[serde(default)]
     pub ai_generated: bool,
+    /// Recording latency compensation in milliseconds. When a recording is finalised on
+    /// this track, the placed clip's start is shifted earlier by this many ms so what was
+    /// recorded lines up with what was playing. Default 0.
+    #[serde(default)]
+    pub input_latency_ms: i32,
     pub color: String,
     pub chain: TrackChain,
     pub sends: Sends,

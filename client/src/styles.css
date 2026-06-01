@@ -1266,40 +1266,112 @@ button:disabled {
   align-items: center;
 }
 
-.add-track-picker {
-  position: relative;
-  display: inline-flex;
+.transport button.active {
+  border-color: rgba(244, 211, 94, 0.55);
+  background: rgba(244, 211, 94, 0.18);
+  color: #f4d35e;
 }
 
-.add-track-menu {
+/* Cut tool: dashed crosshair cursor in lanes, and a vertical guide line across all
+   track lanes following the mouse so the user can see exactly where the split lands. */
+.wave-wrap.cut-mode,
+.wave-wrap.cut-mode .wave-clip { cursor: crosshair; }
+
+.lane-cut-cursor {
   position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  z-index: 50;
-  display: grid;
-  gap: 2px;
-  min-width: 110px;
-  padding: 4px;
-  border: 1px solid #303943;
-  border-radius: 8px;
-  background: #11161b;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1px dashed #f4d35e;
+  box-shadow: 0 0 6px rgba(244, 211, 94, 0.45);
+  pointer-events: none;
+  z-index: 4;
 }
 
-.add-track-menu button {
-  height: 28px;
-  padding: 0 10px;
-  text-align: left;
+.add-track-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: grid;
+  place-items: center;
+  background: rgba(5, 8, 11, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.add-track-modal {
+  width: min(560px, calc(100% - 32px));
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid #2a323c;
+  border-radius: 12px;
+  background: #11161b;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+}
+
+.add-track-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 14px;
+}
+
+.add-track-modal-close {
+  width: 26px;
+  height: 26px;
+  padding: 0;
   border: none;
   border-radius: 6px;
   background: transparent;
-  color: #e8edf2;
-  font-size: 12px;
+  color: #8d9aa8;
+  font-size: 18px;
   cursor: pointer;
 }
 
-.add-track-menu button:hover {
+.add-track-modal-close:hover {
   background: #1f262f;
+  color: #e8edf2;
+}
+
+.add-track-modal-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 600px) {
+  .add-track-modal-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.add-track-card {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 6px;
+  min-height: 130px;
+  padding: 14px;
+  border: 1px solid #2a323c;
+  border-radius: 10px;
+  background: #161c22;
+  color: #e8edf2;
+  cursor: pointer;
+}
+
+.add-track-card:hover {
+  background: #1f262f;
+  border-color: #3d4854;
+}
+
+.add-track-card strong {
+  font-size: 13px;
+}
+
+.add-track-card span {
+  font-size: 11px;
+  color: #8d9aa8;
+  text-align: center;
 }
 
 .bypass-toggle {
@@ -1364,7 +1436,7 @@ button:disabled {
   position: relative;
   /* Width of each track's left header column. The time ruler and region overlay
      read this so they stay aligned with the clip/wave area below. */
-  --lane-head-w: 22px;
+  --lane-head-w: 36px;
   min-width: 0;
   outline: none;
 }
@@ -1380,6 +1452,10 @@ button:disabled {
   border-radius: 8px;
   overflow: hidden;
   background: #12181e;
+  /* Drag-to-select is a region drag, not a browser text-selection — keep the time
+     labels from being highlighted while the user drags the region. */
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .time-ruler-spacer {
@@ -1418,10 +1494,22 @@ button:disabled {
   position: absolute;
   top: 0;
   bottom: 0;
-  background: rgba(127, 180, 255, 0.26);
+  background: rgba(127, 180, 255, 0.20);
   border-left: 1px solid rgba(127, 180, 255, 0.85);
   border-right: 1px solid rgba(127, 180, 255, 0.85);
-  pointer-events: none;
+  /* Click on the band toggles the loop; drag redraws the region. */
+  pointer-events: auto;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.time-ruler-selection.active {
+  background: rgba(127, 180, 255, 0.55);
+  border-left-color: #aed1ff;
+  border-right-color: #aed1ff;
+  box-shadow:
+    inset 0 0 0 1px rgba(174, 209, 255, 0.4),
+    0 0 14px rgba(127, 180, 255, 0.45);
 }
 
 .time-ruler-handle {
@@ -1473,6 +1561,12 @@ button:disabled {
   background: rgba(127, 180, 255, 0.08);
   border-left: 1px solid rgba(127, 180, 255, 0.5);
   border-right: 1px solid rgba(127, 180, 255, 0.5);
+}
+
+.lane-region-band.active {
+  background: rgba(127, 180, 255, 0.18);
+  border-left-color: rgba(174, 209, 255, 0.9);
+  border-right-color: rgba(174, 209, 255, 0.9);
 }
 
 .track-lanes:focus-visible {
@@ -1587,6 +1681,39 @@ button:disabled {
   object-fit: contain;
   display: block;
 }
+
+/* Free-form crop overlay sitting on top of each camera-preview panel. */
+.crop-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.crop-dim {
+  position: absolute;
+  background: rgba(0, 0, 0, 0.42);
+}
+
+.crop-handle {
+  position: absolute;
+  background: rgba(244, 211, 94, 0.85);
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.crop-handle.horizontal {
+  height: 5px;
+  margin-top: -2px;
+  cursor: ns-resize;
+}
+
+.crop-handle.vertical {
+  width: 5px;
+  margin-left: -2px;
+  cursor: ew-resize;
+}
+
+.crop-handle:hover { background: #f4d35e; }
 
 .video-canvas-workspace {
   display: grid;
@@ -2081,6 +2208,22 @@ button:disabled {
   text-transform: uppercase;
 }
 
+.input-meter {
+  flex: 1 1 auto;
+  height: 6px;
+  border-radius: 3px;
+  background: #1a2129;
+  overflow: hidden;
+  margin-left: 6px;
+}
+
+.input-meter > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #6ee7a8 0%, #f4d35e 70%, #ff8a8a 100%);
+  transition: width 60ms linear;
+}
+
 .inspector-field {
   display: grid;
   grid-template-columns: 44px minmax(0, 1fr) 56px;
@@ -2311,7 +2454,7 @@ button:disabled {
 .track {
   position: relative;
   display: grid;
-  grid-template-columns: 96px minmax(260px, 1fr);
+  grid-template-columns: var(--lane-head-w, 200px) minmax(260px, 1fr);
   min-height: 50px;
   margin-bottom: 4px;
   border: 1px solid #252d35;
@@ -2562,9 +2705,14 @@ button:disabled {
   z-index: 2;
   border-left: 2px solid;
   background: #11161b;
-  cursor: grab;
+  /* Plain click just selects. Hold Shift to drag-move (cursor changes to grab below). */
+  cursor: pointer;
   overflow: hidden;
   pointer-events: auto;
+}
+
+.wave-wrap:has(.wave-clip:active) .wave-clip {
+  cursor: grabbing;
 }
 
 .wave-clip:active {
@@ -3972,7 +4120,9 @@ textarea {
 }
 
 .timeline {
-  padding: 14px;
+  /* No top padding so the sticky time ruler sits flush with the very top of the
+     scroll viewport instead of floating below a 14px gap. */
+  padding: 0 14px 14px;
   background:
     linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
     var(--bg-main);
@@ -4058,8 +4208,8 @@ textarea {
 }
 
 .track {
-  grid-template-columns: 22px minmax(280px, 1fr);
-  min-height: 48px;
+  grid-template-columns: var(--lane-head-w, 200px) minmax(280px, 1fr);
+  min-height: 64px;
   margin-bottom: 0;
   border-color: var(--line-soft);
   border-radius: var(--radius);
@@ -4987,7 +5137,7 @@ textarea {
   }
 
   .track {
-    grid-template-columns: 22px minmax(260px, 1fr);
+    grid-template-columns: var(--lane-head-w, 200px) minmax(260px, 1fr);
   }
 
   .video-editor-body {
@@ -5020,7 +5170,7 @@ textarea {
   }
 
   .track {
-    grid-template-columns: 22px minmax(0, 1fr);
+    grid-template-columns: var(--lane-head-w, 200px) minmax(0, 1fr);
   }
 
   .track-head {
@@ -5031,3 +5181,74 @@ textarea {
     justify-content: center;
   }
 }
+
+/* ============================================================
+ * Track head: narrow column with three small round buttons stacked
+ * vertically (R / M / S). The track name lives only in the wave lane.
+ * ============================================================ */
+
+.track-head {
+  display: flex !important;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-height: 64px;
+  padding: 4px 2px !important;
+  border: 0;
+  border-left: 4px solid var(--track-color, transparent) !important;
+  background: #10141a !important;
+  opacity: 1 !important;
+}
+
+/* The inspector-focused track gets a subtle yellow inner outline so it's distinct
+   from S-group membership (which uses the blue `.selected` highlight). */
+.track.focused {
+  box-shadow: inset 0 0 0 1px rgba(244, 211, 94, 0.55);
+}
+
+.track-head > button {
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid #2a323c;
+  border-radius: 50%;
+  background: #1a2129;
+  color: #8d9aa8;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.track-head > button:hover {
+  background: #232c36;
+  color: #c2ccd6;
+}
+
+.track-head > .record-arm.active {
+  border-color: #d96b6b;
+  background: #3a1a1a;
+  color: #ffb8b8;
+}
+
+.track-head > .mute-btn.active {
+  border-color: #f4d35e;
+  background: #3a3018;
+  color: #f4d35e;
+}
+
+.track-head > .solo-btn.active {
+  border-color: #6ee7a8;
+  background: #173427;
+  color: #6ee7a8;
+}
+
+/* The wave area gets a subtle track-color tint and a top-left name label, GarageBand-style. */
+.wave-wrap {
+  background:
+    linear-gradient(0deg, color-mix(in srgb, var(--track-color, #2a3038) 12%, #0d1115) 0%,
+                          color-mix(in srgb, var(--track-color, #2a3038) 8%, #0d1115) 100%) !important;
+}
+

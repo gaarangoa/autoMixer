@@ -289,6 +289,15 @@ impl SessionStore {
             .iter_mut()
             .find(|track| track.id == track_id)
             .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        // Latency compensation: shift the new clip earlier by the configured ms so the
+        // recorded transient lands where it was actually played, not when the buffer
+        // arrived. Positive ms => earlier; negative => later.
+        let offset_samples = (track.input_latency_ms as f64 * session_rate as f64 / 1000.0).round() as i64;
+        let adjusted_start = if offset_samples >= 0 {
+            start_sample.saturating_sub(offset_samples as u64)
+        } else {
+            start_sample.saturating_add((-offset_samples) as u64)
+        };
         if track.clips.is_empty() {
             if let Some(existing) = existing_source.as_ref().filter(|source| source.original_name != "Recording") {
                 track.clips.push(ClipRegion {
@@ -306,8 +315,8 @@ impl SessionStore {
             id: Uuid::new_v4().to_string(),
             source_file_id: Some(source_id.clone()),
             name: Some(clip_name),
-            start_sample,
-            end_sample: start_sample + duration,
+            start_sample: adjusted_start,
+            end_sample: adjusted_start + duration,
             source_offset_sample: 0,
             gain_db: 0.0,
         });
@@ -351,12 +360,19 @@ impl SessionStore {
         };
         let playable_ms = duration_ms.saturating_sub(source_offset_ms).max(1);
         let duration_samples = ((playable_ms as f64 / 1000.0) * project.session.sample_rate as f64).round() as u64;
+        // Latency compensation (see add_recording_clip).
+        let offset_samples = (track.input_latency_ms as f64 * project.session.sample_rate as f64 / 1000.0).round() as i64;
+        let adjusted_start = if offset_samples >= 0 {
+            start_sample.saturating_sub(offset_samples as u64)
+        } else {
+            start_sample.saturating_add((-offset_samples) as u64)
+        };
         track.video_clips.push(VideoClipRegion {
             id: Uuid::new_v4().to_string(),
             video_source_file_id: source_id.clone(),
             name: Some(strip_extension(&original_name)),
-            start_sample,
-            end_sample: start_sample + duration_samples.max(1),
+            start_sample: adjusted_start,
+            end_sample: adjusted_start + duration_samples.max(1),
             source_offset_ms,
             layout: None,
         });

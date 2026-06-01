@@ -85,6 +85,7 @@ pub fn run() {
             commands::get_skill_catalog,
             commands::list_ollama_models,
             commands::list_input_devices,
+            commands::list_input_device_channels,
             commands::list_sessions,
             commands::create_session,
             commands::get_project,

@@ -21,6 +21,7 @@ export const api = {
   restartApp: () => tauriInvoke<void>("restart_app"),
   ollamaModels: (baseUrl: string) => tauriInvoke<{ models: string[] }>("list_ollama_models", { baseUrl }),
   inputDevices: () => tauriInvoke<{ devices: string[] }>("list_input_devices"),
+  inputDeviceChannelCount: (inputDevice?: string) => tauriInvoke<number>("list_input_device_channels", { inputDevice }),
   skills: () => tauriInvoke<SkillCatalog>("get_skill_catalog"),
   sessions: () => tauriInvoke<MixSession[]>("list_sessions"),
   createSession: (name: string) => tauriInvoke<MixProject>("create_session", { name }),
@@ -44,12 +45,12 @@ export const api = {
   pause: () => tauriInvoke<void>("transport_pause"),
   stop: () => tauriInvoke<void>("transport_stop"),
   seek: (sample: number) => tauriInvoke<void>("transport_seek", { sample }),
-  startRecording: (sessionId: string, startSample: number, targetTrackId?: string, inputDevice?: string) =>
-    tauriInvoke<void>("start_recording", { sessionId, startSample, targetTrackId, inputDevice }),
-  recordingMeters: () => tauriInvoke<{ peaks: number[] }>("poll_recording_meters"),
+  startRecording: (sessionId: string, startSample: number, targetTrackId?: string, inputDevice?: string, inputGainDb?: number, inputChannels?: number[]) =>
+    tauriInvoke<void>("start_recording", { sessionId, startSample, targetTrackId, inputDevice, inputGainDb, inputChannels }),
+  recordingMeters: () => tauriInvoke<{ peaks: number[]; channelPeaks: number[] }>("poll_recording_meters"),
   stopRecording: (sessionId: string) => tauriInvoke<MixProject>("stop_recording", { sessionId }),
   startInputMonitor: (inputDevice?: string) => tauriInvoke<void>("start_input_monitor", { inputDevice }),
-  inputMonitorMeters: () => tauriInvoke<{ peaks: number[] }>("poll_input_monitor_meters"),
+  inputMonitorMeters: () => tauriInvoke<{ peaks: number[]; channelPeaks: number[] }>("poll_input_monitor_meters"),
   stopInputMonitor: () => tauriInvoke<void>("stop_input_monitor"),
   deleteClip: (sessionId: string, trackId: string, clipId: string) =>
     tauriInvoke<MixProject>("delete_clip", { sessionId, trackId, clipId }),

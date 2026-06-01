@@ -172,6 +172,7 @@ export type Track = {
   muted: boolean;
   solo: boolean;
   aiGenerated?: boolean;
+  inputLatencyMs?: number;
   color: string;
   chain: TrackChain;
   sends: Sends;

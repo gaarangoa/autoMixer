@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { Camera, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Settings, Square, Trash2, Upload, Video } from "lucide-react";
+import { Camera, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, Square, Trash2, Upload, Video } from "lucide-react";
 import type { AbJudgeResponse, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -97,6 +97,9 @@ export function App() {
   const initialGeminiKeyRef = useRef(localStorage.getItem("autoMixer.geminiApiKey"));
   const playStartedAtRef = useRef(0);
   const pausedAtRef = useRef(0);
+  // When recording was started with a ruler region active, this is the region's right
+  // edge (seconds) — playback tick stops the recording automatically on reaching it.
+  const recordingPunchOutRef = useRef<number | undefined>(undefined);
   const playbackAnchorRef = useRef<number | undefined>(undefined);
   const togglePlayRef = useRef<() => void | Promise<void>>(() => undefined);
   const videoRecordersRef = useRef<Record<string, { recorder: MediaRecorder; stream: MediaStream; previewElement: HTMLVideoElement; chunks: Blob[]; startSample: number; startedAt: number; mimeType: string; createAudioTrack: boolean; transportOffsetMs: number }>>({});
@@ -105,6 +108,9 @@ export function App() {
   const trackLanesRef = useRef<HTMLDivElement>(null);
   const [project, setProject] = useState<MixProject>();
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
+  // Inspector "focus" — single track selected by clicking its lane. Decoupled from the
+  // group selection (selectedTrackIds), which is for batch operations and S-clicks.
+  const [focusedTrackId, setFocusedTrackId] = useState<string | undefined>();
   const [selectedRegionIds, setSelectedRegionIds] = useState<string[]>([]);
   const [selectedClip, setSelectedClip] = useState<{ trackId: string; clipId: string } | undefined>();
   const [selectedClips, setSelectedClips] = useState<{ trackId: string; clipId: string }[]>([]);
@@ -123,10 +129,22 @@ export function App() {
   const [recordingStarting, setRecordingStarting] = useState(false);
   const [recordingTrackId, setRecordingTrackId] = useState<string | undefined>();
   const [recordingStartSeconds, setRecordingStartSeconds] = useState<number | undefined>();
-  const [armedTrackId, setArmedTrackId] = useState<string | undefined>();
+  // Audio tracks currently armed (R-on). All show the R indicator; the first one
+  // is the actual target when transport+record fires (engine records one stream).
+  const [armedAudioTrackIds, setArmedAudioTrackIds] = useState<string[]>([]);
+  const armedTrackId = armedAudioTrackIds[0];
+  const setArmedTrackId = (next: string | undefined | ((current: string | undefined) => string | undefined)) => {
+    setArmedAudioTrackIds((current) => {
+      const resolved = typeof next === "function" ? (next as (c: string | undefined) => string | undefined)(current[0]) : next;
+      return resolved ? [resolved] : [];
+    });
+  };
   const [inputMonitoring, setInputMonitoring] = useState(false);
   const [inputMonitorStarting, setInputMonitorStarting] = useState(false);
   const [inputMonitorPeaks, setInputMonitorPeaks] = useState<number[]>([]);
+  // Latest per-channel peaks from the input monitor / live recording — drives the
+  // L/R meters in the inspector so the user can verify the right channel is hot.
+  const [inputChannelLevels, setInputChannelLevels] = useState<number[]>([]);
   const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
   const [trackCameraDevices, setTrackCameraDevices] = useState<Record<string, string>>({});
   const [trackCameraAudio, setTrackCameraAudio] = useState<Record<string, boolean>>({});
@@ -138,6 +156,11 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [addTrackMenuOpen, setAddTrackMenuOpen] = useState(false);
+  // When true, clicking on a clip splits it at the click position instead of selecting.
+  const [cutToolActive, setCutToolActive] = useState(false);
+  // Live cursor position (seconds) shown as a vertical guide while the cut tool is on.
+  const [cutCursorSeconds, setCutCursorSeconds] = useState<number | undefined>();
+  useEffect(() => { if (!cutToolActive) setCutCursorSeconds(undefined); }, [cutToolActive]);
   const [sessionList, setSessionList] = useState<MixSession[]>([]);
   const [renameDraft, setRenameDraft] = useState<string | null>(null);
   const [newDraft, setNewDraft] = useState<string | null>(null);
@@ -178,6 +201,11 @@ export function App() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [inputDevices, setInputDevices] = useState<string[]>([]);
   const [trackInputDevices, setTrackInputDevices] = useState<Record<string, string>>({});
+  // Per-track input gain in dB (applied to the recorded signal before it hits disk).
+  const [trackInputGains, setTrackInputGains] = useState<Record<string, number>>({});
+  // Per-track input channel indices (0-based) — which channel(s) of the interface to record.
+  // For mono tracks: [chIdx]. For stereo: [leftIdx, rightIdx]. Empty/undefined = default 0/0+1.
+  const [trackInputChannels, setTrackInputChannels] = useState<Record<string, number[]>>({});
   const [liveRecordingPeaks, setLiveRecordingPeaks] = useState<number[]>([]);
 
   const session = project?.session;
@@ -436,13 +464,19 @@ export function App() {
     const raw = localStorage.getItem(`autoMixer.trackInputDevices.${session.id}`);
     if (!raw) {
       setTrackInputDevices({});
+      setTrackInputGains({});
+      setTrackInputChannels({});
       return;
     }
     try {
       const parsed = JSON.parse(raw);
       setTrackInputDevices(parsed.devices ?? parsed);
+      setTrackInputGains(parsed.gains ?? {});
+      setTrackInputChannels(parsed.channels ?? {});
     } catch {
       setTrackInputDevices({});
+      setTrackInputGains({});
+      setTrackInputChannels({});
     }
   }, [session?.id]);
 
@@ -450,9 +484,9 @@ export function App() {
     if (!session) return;
     localStorage.setItem(
       `autoMixer.trackInputDevices.${session.id}`,
-      JSON.stringify({ devices: trackInputDevices })
+      JSON.stringify({ devices: trackInputDevices, gains: trackInputGains, channels: trackInputChannels })
     );
-  }, [trackInputDevices, session?.id]);
+  }, [trackInputDevices, trackInputGains, trackInputChannels, session?.id]);
 
   useEffect(() => {
     if (!recording) {
@@ -467,6 +501,9 @@ export function App() {
         if (!cancelled && result.peaks.length > 0) {
           setRecordingStarting(false);
           setLiveRecordingPeaks((items) => [...items, ...result.peaks].slice(-512));
+        }
+        if (!cancelled && result.channelPeaks?.length) {
+          setInputChannelLevels(result.channelPeaks);
         }
       } catch (error) {
         if (!cancelled) {
@@ -514,6 +551,9 @@ export function App() {
         if (!cancelled && result.peaks.length > 0) {
           setInputMonitorStarting(false);
           setInputMonitorPeaks((items) => [...items, ...result.peaks].slice(-512));
+        }
+        if (!cancelled && result.channelPeaks?.length) {
+          setInputChannelLevels(result.channelPeaks);
         }
       } catch (error) {
         if (!cancelled) {
@@ -650,6 +690,15 @@ export function App() {
     const tick = () => {
       if (playing) {
         const elapsed = Math.max(0, (performance.now() - playStartedAtRef.current) / 1000);
+        // Region-bounded recording: stop the moment we hit the region's right edge.
+        if (
+          recordingPunchOutRef.current !== undefined
+          && (recording || videoRecordingTrackIds.length > 0 || Object.keys(videoRecordersRef.current).length > 0)
+          && elapsed >= recordingPunchOutRef.current
+        ) {
+          recordingPunchOutRef.current = undefined;
+          void stop();
+        }
         if (loopSection && elapsed >= loopSection.end) {
           const next = loopSection.start;
           pausedAtRef.current = next;
@@ -673,7 +722,7 @@ export function App() {
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [playing, duration, loopSection, session?.sampleRate]);
+  }, [playing, duration, loopSection, session?.sampleRate, recording, videoRecordingTrackIds]);
 
   useEffect(() => {
     togglePlayRef.current = togglePlay;
@@ -700,23 +749,58 @@ export function App() {
         setSelectedRange(undefined);
         return;
       }
+      // M and R: toggle Mute / Record-arm on the S-group (or the focused track if no group).
+      // First hit selects (mutes/arms), second hit deselects (unmutes/disarms).
+      if ((event.key === "m" || event.key === "M" || event.key === "r" || event.key === "R") && !inField && session && !busy) {
+        const targetIds = selectedTrackIds.length > 0 ? selectedTrackIds : (focusedTrackId ? [focusedTrackId] : []);
+        if (targetIds.length === 0) return;
+        const targetTracks = session.tracks.filter((t) => targetIds.includes(t.id));
+        if (event.key === "m" || event.key === "M") {
+          event.preventDefault();
+          const allMuted = targetTracks.every((t) => t.muted);
+          const nextMuted = !allMuted;
+          for (const t of targetTracks) if (t.muted !== nextMuted) void updateTrack(t, { muted: nextMuted });
+          return;
+        }
+        if (event.key === "r" || event.key === "R") {
+          event.preventDefault();
+          const videoTargets = targetTracks.filter((t) => t.kind === "video").map((t) => t.id);
+          if (videoTargets.length > 0) {
+            const allArmed = videoTargets.every((id) => armedVideoTrackIds.includes(id));
+            setArmedVideoTrackIds((ids) => allArmed
+              ? ids.filter((id) => !videoTargets.includes(id))
+              : Array.from(new Set([...ids, ...videoTargets])));
+          }
+          const audioTargets = targetTracks.filter((t) => t.kind !== "video").map((t) => t.id);
+          if (audioTargets.length > 0) {
+            const allArmed = audioTargets.every((id) => armedAudioTrackIds.includes(id));
+            setArmedAudioTrackIds((ids) => allArmed
+              ? ids.filter((id) => !audioTargets.includes(id))
+              : Array.from(new Set([...ids, ...audioTargets])));
+          }
+          return;
+        }
+      }
       if (event.key !== "Delete" && event.key !== "Backspace") return;
       if (inField) return;
       if (!session || busy) return;
-      if (selectedRange) {
-        event.preventDefault();
-        void deleteClipRange(selectedRange);
-        return;
-      }
+      // Prefer deleting a selected clip — a global ruler region is just a marker,
+      // not a target for deletion. Only fall through to range-delete when it is a
+      // per-track range (has a trackId) AND no clip is selected.
       if (selectedClip) {
         event.preventDefault();
         void deleteClip(selectedClip.trackId, selectedClip.clipId);
         return;
       }
+      if (selectedRange && selectedRange.trackId) {
+        event.preventDefault();
+        void deleteClipRange(selectedRange);
+        return;
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [session, selectedClip, selectedRange, busy, recording, recordingTrackId]);
+  }, [session, selectedClip, selectedRange, selectedTrackIds, focusedTrackId, armedTrackId, armedVideoTrackIds, busy, recording, recordingTrackId]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -1211,8 +1295,33 @@ export function App() {
     });
   }
 
+  // Persist a track's input-latency offset (ms). Direct JSON patch — there's no mix
+  // action for this field since it only affects placement of *future* recordings.
+  async function setTrackInputLatency(track: Track, latencyMs: number) {
+    if (!session) return;
+    const trackIndex = session.tracks.findIndex((t) => t.id === track.id);
+    if (trackIndex < 0) return;
+    const value = Math.round(Math.max(-200, Math.min(500, latencyMs)));
+    if ((track.inputLatencyMs ?? 0) === value) return;
+    try {
+      const updated = await api.applyPatch(
+        session.id,
+        [{ op: "replace", path: `/tracks/${trackIndex}/inputLatencyMs`, value }],
+        [{ op: "replace", path: `/tracks/${trackIndex}/inputLatencyMs`, value: track.inputLatencyMs ?? 0 }],
+        `Set input latency on ${track.name}`,
+      );
+      setProject(updated);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
   async function updateTrack(track: Track, patch: Partial<Track>) {
     if (!session) return;
+    // Input latency offset has no mix action — persist it through a direct JSON patch.
+    if (patch.inputLatencyMs !== undefined) {
+      await setTrackInputLatency(track, patch.inputLatencyMs);
+    }
     const actions = [];
     if (patch.name !== undefined && patch.name.trim() && patch.name.trim() !== track.name) {
       actions.push({ tool: "rename_track" as const, trackId: track.id, name: patch.name.trim() });
@@ -1232,7 +1341,8 @@ export function App() {
 
   function toggleTrackSelection(trackId: string) {
     setSelectedClip(undefined);
-    setSelectedRange(undefined);
+    // Keep a global ruler region — only per-track ranges (with trackId) get cleared.
+    setSelectedRange((current) => (current && !current.trackId ? current : undefined));
     setSelectedTrackIds((current) => {
       return current.includes(trackId)
         ? current.filter((id) => id !== trackId)
@@ -1245,7 +1355,7 @@ export function App() {
     const selectedIds = selectedTrackIds.includes(trackId) ? selectedTrackIds : [trackId];
     setSelectedTrackIds(selectedIds);
     setSelectedClip(undefined);
-    setSelectedRange(undefined);
+    setSelectedRange((current) => (current && !current.trackId ? current : undefined));
     setDraggingTrackIds(selectedIds);
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("text/plain", selectedIds.join(","));
@@ -1330,7 +1440,7 @@ export function App() {
       setProject(updated);
       setSelectedTrackIds([]);
       setSelectedClip(undefined);
-      setSelectedRange(undefined);
+      setSelectedRange((current) => (current && !current.trackId ? current : undefined));
       setArmedTrackId((id) => id && tracks.some((track) => track.id === id) ? undefined : id);
       setArmedVideoTrackIds((ids) => ids.filter((id) => !tracks.some((track) => track.id === id)));
     } catch (error) {
@@ -1363,7 +1473,7 @@ export function App() {
         setSelectedTrackIds([nextId]);
       }
       setSelectedClip(undefined);
-      setSelectedRange(undefined);
+      setSelectedRange((current) => (current && !current.trackId ? current : undefined));
     };
 
     if (event.key === "ArrowUp" || event.key === "ArrowDown") {
@@ -1394,6 +1504,94 @@ export function App() {
   async function moveSelectedClip(deltaSeconds: number) {
     if (!selectedClip) return;
     await moveClip(selectedClip.trackId, selectedClip.clipId, deltaSeconds);
+  }
+
+  // Split an audio or video clip at a timeline position into two clips. The right half
+  // gets a new id; both halves still reference the same source. Routed through applyPatch
+  // for a single undoable step. Handles "legacy" whole-track playback (where the track
+  // has no clips yet, just a single source file) by materialising real clips first.
+  async function splitClip(trackId: string, clipId: string, splitSeconds: number) {
+    if (!session) return;
+    const trackIndex = session.tracks.findIndex((t) => t.id === trackId);
+    if (trackIndex < 0) return;
+    const track = session.tracks[trackIndex];
+    const splitSample = Math.round(Math.max(0, splitSeconds) * session.sampleRate);
+    const newId = (): string => (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+      ? crypto.randomUUID()
+      : `clip-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    if (track.kind === "video") {
+      const before = track.videoClips ?? [];
+      const clip = before.find((item) => item.id === clipId);
+      if (!clip || splitSample <= clip.startSample + 1 || splitSample >= clip.endSample - 1) return;
+      const offsetMs = (clip.sourceOffsetMs ?? 0) + Math.round((splitSample - clip.startSample) / session.sampleRate * 1000);
+      const next = before.flatMap((item) => item.id === clipId
+        ? [
+            { ...item, endSample: splitSample },
+            { ...item, id: newId(), startSample: splitSample, sourceOffsetMs: offsetMs },
+          ]
+        : [item]);
+      try {
+        const updated = await api.applyPatch(
+          session.id,
+          [{ op: "replace", path: `/tracks/${trackIndex}/videoClips`, value: next }],
+          [{ op: "replace", path: `/tracks/${trackIndex}/videoClips`, value: before }],
+          `Split ${clip.name ?? "video clip"}`
+        );
+        setProject(updated);
+      } catch (error) {
+        pushSystem(error);
+      }
+      return;
+    }
+
+    // Audio split — including the synthetic `legacy-<trackId>` clip used to render a
+    // single imported source as one big clip. For legacy, materialise it as a real
+    // ClipRegion first, then split that.
+    const before = track.clips;
+    if (clipId === `legacy-${track.id}`) {
+      const source = session.sourceFiles.find((src) => src.id === track.sourceFileId);
+      if (!source) { pushSystem("Track has no source file to split."); return; }
+      const trackStart = track.startSample;
+      const trackEnd = trackStart + (source.durationSamples ?? 0);
+      if (splitSample <= trackStart + 1 || splitSample >= trackEnd - 1) return;
+      const nextClips = [
+        { id: newId(), sourceFileId: source.id, name: track.name, startSample: trackStart, endSample: splitSample, sourceOffsetSample: 0, gainDb: 0 },
+        { id: newId(), sourceFileId: source.id, name: track.name, startSample: splitSample, endSample: trackEnd, sourceOffsetSample: splitSample - trackStart, gainDb: 0 },
+      ];
+      try {
+        const updated = await api.applyPatch(
+          session.id,
+          [{ op: "replace", path: `/tracks/${trackIndex}/clips`, value: nextClips }],
+          [{ op: "replace", path: `/tracks/${trackIndex}/clips`, value: before }],
+          `Split ${track.name}`
+        );
+        setProject(updated);
+      } catch (error) {
+        pushSystem(error);
+      }
+      return;
+    }
+
+    const clip = before.find((item) => item.id === clipId);
+    if (!clip || splitSample <= clip.startSample + 1 || splitSample >= clip.endSample - 1) return;
+    const sourceOffset = (clip.sourceOffsetSample ?? 0) + (splitSample - clip.startSample);
+    const next = before.flatMap((item) => item.id === clipId
+      ? [
+          { ...item, endSample: splitSample },
+          { ...item, id: newId(), startSample: splitSample, sourceOffsetSample: sourceOffset },
+        ]
+      : [item]);
+    try {
+      const updated = await api.applyPatch(
+        session.id,
+        [{ op: "replace", path: `/tracks/${trackIndex}/clips`, value: next }],
+        [{ op: "replace", path: `/tracks/${trackIndex}/clips`, value: before }],
+        `Split ${clip.name ?? "audio clip"}`
+      );
+      setProject(updated);
+    } catch (error) {
+      pushSystem(error);
+    }
   }
 
   async function moveClip(trackId: string, clipId: string, deltaSeconds: number) {
@@ -1756,17 +1954,12 @@ export function App() {
 
   function selectedPlaybackStartSeconds() {
     if (!session) return undefined;
-    if (playbackAnchorRef.current !== undefined) {
-      return playbackAnchorRef.current;
-    }
-    if (selectedRange) {
-      return Math.max(0, Math.min(selectedRange.start, selectedRange.end));
-    }
-    if (selectedClip) {
-      const track = session.tracks.find((item) => item.id === selectedClip.trackId);
-      const clip = track?.clips.find((item) => item.id === selectedClip.clipId);
-      if (clip) return clip.startSample / session.sampleRate;
-      if (track && selectedClip.clipId === `legacy-${track.id}`) return track.startSample / session.sampleRate;
+    // Only the ruler region wins, and only when its loop is active (the band is bright).
+    // Otherwise play resumes from the current playhead (pausedAtRef in togglePlay).
+    if (loopSection && selectedRange
+      && Math.abs(loopSection.start - Math.min(selectedRange.start, selectedRange.end)) < 0.01
+      && Math.abs(loopSection.end - Math.max(selectedRange.start, selectedRange.end)) < 0.01) {
+      return loopSection.start;
     }
     return undefined;
   }
@@ -1782,7 +1975,16 @@ export function App() {
       pausedAtRef.current = Math.max(0, (performance.now() - playStartedAtRef.current) / 1000);
       setPlaying(false);
     } else {
-      const start = selectedPlaybackStartSeconds() ?? pausedAtRef.current;
+      // Region-bounded recording: when armed AND a ruler region exists, start at the
+      // region's left edge and remember the right edge so we can auto-stop there.
+      const armed = armedVideoTrackIds.length > 0 || !!armedTrackId;
+      const regionLo = selectedRange ? Math.min(selectedRange.start, selectedRange.end) : undefined;
+      const regionHi = selectedRange ? Math.max(selectedRange.start, selectedRange.end) : undefined;
+      const useRegionForRecording = armed && regionLo !== undefined && regionHi !== undefined && regionHi - regionLo > 0.02;
+      const start = useRegionForRecording
+        ? regionLo!
+        : (selectedPlaybackStartSeconds() ?? pausedAtRef.current);
+      recordingPunchOutRef.current = useRegionForRecording ? regionHi! : undefined;
       pausedAtRef.current = Math.max(0, Math.min(duration, start));
       setPlayhead(pausedAtRef.current);
       await api.seek(Math.round(pausedAtRef.current * session.sampleRate)).catch(() => undefined);
@@ -1827,7 +2029,7 @@ export function App() {
       setRecordingStarting(true);
       setRecordingTrackId(targetTrackId);
       setRecordingStartSeconds(Math.max(0, startSeconds));
-      await api.startRecording(session.id, startSample, targetTrackId, inputDevice);
+      await api.startRecording(session.id, startSample, targetTrackId, inputDevice, trackInputGains[targetTrackId] ?? 0, trackInputChannels[targetTrackId]);
       return true;
     } catch (error) {
       setRecording(false);
@@ -2555,25 +2757,22 @@ export function App() {
           </div>
           <div className="transport">
             <button onClick={() => void togglePlay()} title={playing ? "Pause" : "Play"}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
-            <div className="add-track-picker">
-              <button
-                onClick={() => setAddTrackMenuOpen((open) => !open)}
-                disabled={busy}
-                title="Add recording track (choose mono or stereo)"
-                aria-haspopup="menu"
-                aria-expanded={addTrackMenuOpen}
-              >
-                <Plus size={18} />
-              </button>
-              {addTrackMenuOpen ? (
-                <div className="add-track-menu" onMouseLeave={() => setAddTrackMenuOpen(false)} role="menu">
-                  <button onClick={() => { setAddTrackMenuOpen(false); void addRecordingTrack(1); }} role="menuitem">Mono</button>
-                  <button onClick={() => { setAddTrackMenuOpen(false); void addRecordingTrack(2); }} role="menuitem">Stereo</button>
-                </div>
-              ) : null}
-            </div>
-            <button onClick={() => void addVideoTrack()} disabled={busy} title="Add video track">
-              <Camera size={18} />
+            <button
+              onClick={() => setAddTrackMenuOpen(true)}
+              disabled={busy}
+              title="Add a track"
+              aria-haspopup="dialog"
+            >
+              <Plus size={18} />
+            </button>
+            <button
+              className={cutToolActive ? "active" : ""}
+              onClick={() => setCutToolActive((on) => !on)}
+              disabled={busy}
+              title={cutToolActive ? "Cut tool active. Click again to disable." : "Cut tool — click a clip to split it"}
+              aria-pressed={cutToolActive}
+            >
+              <Scissors size={18} />
             </button>
             <button onClick={() => void stop()} title="Stop"><Square size={18} /></button>
             <button
@@ -2873,17 +3072,22 @@ export function App() {
         <div className="timeline">
           <div className="daw-workspace">
             <TrackInspector
-              track={selectedTrackIds.length === 1 ? session.tracks.find((track) => track.id === selectedTrackIds[0]) : undefined}
-              source={selectedTrackIds.length === 1 ? session.sourceFiles.find((source) => source.id === session.tracks.find((track) => track.id === selectedTrackIds[0])?.sourceFileId) : undefined}
+              track={focusedTrackId ? session.tracks.find((track) => track.id === focusedTrackId) : undefined}
+              source={focusedTrackId ? session.sourceFiles.find((source) => source.id === session.tracks.find((track) => track.id === focusedTrackId)?.sourceFileId) : undefined}
               sampleRate={session.sampleRate}
               inputDevices={inputDevices}
-              inputDevice={selectedTrackIds.length === 1 ? trackInputDevices[selectedTrackIds[0]] ?? "" : ""}
+              inputDevice={focusedTrackId ? trackInputDevices[focusedTrackId] ?? "" : ""}
+              inputGainDb={focusedTrackId ? trackInputGains[focusedTrackId] ?? 0 : 0}
+              inputChannels={focusedTrackId ? trackInputChannels[focusedTrackId] ?? [] : []}
+              inputChannelLevels={inputChannelLevels}
               cameraDevices={cameraDevices}
-              cameraDevice={selectedTrackIds.length === 1 ? trackCameraDevices[selectedTrackIds[0]] ?? session.tracks.find((track) => track.id === selectedTrackIds[0])?.cameraDeviceId ?? "" : ""}
-              cameraAudio={selectedTrackIds.length === 1 ? trackCameraAudio[selectedTrackIds[0]] ?? !!session.tracks.find((track) => track.id === selectedTrackIds[0])?.recordCameraAudio : false}
-              selectionCount={selectedTrackIds.length}
+              cameraDevice={focusedTrackId ? trackCameraDevices[focusedTrackId] ?? session.tracks.find((track) => track.id === focusedTrackId)?.cameraDeviceId ?? "" : ""}
+              cameraAudio={focusedTrackId ? trackCameraAudio[focusedTrackId] ?? !!session.tracks.find((track) => track.id === focusedTrackId)?.recordCameraAudio : false}
+              selectionCount={focusedTrackId ? 1 : 0}
               onChange={(track, patch) => void updateTrack(track, patch)}
               onInputDeviceChange={(trackId, device) => setTrackInputDevices((current) => ({ ...current, [trackId]: device }))}
+              onInputGainChange={(trackId, gainDb) => setTrackInputGains((current) => ({ ...current, [trackId]: gainDb }))}
+              onInputChannelsChange={(trackId, channels) => setTrackInputChannels((current) => ({ ...current, [trackId]: channels }))}
               onRefreshInputDevices={() => void api.inputDevices().then((result) => setInputDevices(result.devices)).catch(pushSystem)}
               onCameraDeviceChange={(trackId, device) => {
                 setTrackCameraDevices((current) => ({ ...current, [trackId]: device }));
@@ -2931,6 +3135,9 @@ export function App() {
                 duration={duration}
                 playhead={playhead}
                 selection={selectedRange}
+                loopActive={!!(loopSection && selectedRange &&
+                  Math.abs(loopSection.start - Math.min(selectedRange.start, selectedRange.end)) < 0.01 &&
+                  Math.abs(loopSection.end - Math.max(selectedRange.start, selectedRange.end)) < 0.01)}
                 onSeek={(seconds) => seekTo(seconds)}
                 onSelect={(start, end) => {
                   trackLanesRef.current?.focus({ preventScroll: true });
@@ -2938,17 +3145,41 @@ export function App() {
                   setSelectedClip(undefined);
                   setSelectedClips([]);
                   setSelectedRange({ start: Math.min(start, end), end: Math.max(start, end) });
+                  // A fresh region replaces any previous loop — re-click the band to activate.
+                  setLoopSection(null);
                 }}
-                onClear={() => setSelectedRange(undefined)}
+                onClear={() => { setSelectedRange(undefined); setLoopSection(null); }}
+                onToggleLoop={() => {
+                  if (!selectedRange) return;
+                  const lo = Math.min(selectedRange.start, selectedRange.end);
+                  const hi = Math.max(selectedRange.start, selectedRange.end);
+                  if (hi - lo < 0.02) return;
+                  setLoopSection((current) => current
+                    && Math.abs(current.start - lo) < 0.01
+                    && Math.abs(current.end - hi) < 0.01
+                    ? null
+                    : { start: lo, end: hi });
+                }}
               />
               {selectedRange && !selectedRange.trackId && duration > 0 && Math.abs(selectedRange.end - selectedRange.start) > 0.02 ? (
                 <div className="lane-region-overlay" aria-hidden="true">
                   <div
-                    className="lane-region-band"
+                    className={`lane-region-band ${loopSection
+                      && Math.abs(loopSection.start - Math.min(selectedRange.start, selectedRange.end)) < 0.01
+                      && Math.abs(loopSection.end - Math.max(selectedRange.start, selectedRange.end)) < 0.01
+                      ? "active" : ""}`}
                     style={{
                       left: `${(Math.min(selectedRange.start, selectedRange.end) / duration) * 100}%`,
                       width: `${(Math.abs(selectedRange.end - selectedRange.start) / duration) * 100}%`,
                     }}
+                  />
+                </div>
+              ) : null}
+              {cutToolActive && cutCursorSeconds !== undefined && duration > 0 ? (
+                <div className="lane-region-overlay" aria-hidden="true">
+                  <div
+                    className="lane-cut-cursor"
+                    style={{ left: `${Math.max(0, Math.min(100, (cutCursorSeconds / duration) * 100))}%` }}
                   />
                 </div>
               ) : null}
@@ -3033,7 +3264,8 @@ export function App() {
                       key={track.id}
                       track={track}
                       selected={selectedTrackIds.includes(track.id)}
-                      armed={isVideo ? armedVideoTrackIds.includes(track.id) : armedTrackId === track.id}
+                      focused={focusedTrackId === track.id}
+                      armed={isVideo ? armedVideoTrackIds.includes(track.id) : armedAudioTrackIds.includes(track.id)}
                       playhead={playhead}
                       transportPlaying={playing}
                       duration={duration}
@@ -3056,12 +3288,20 @@ export function App() {
                             : undefined
                       }
                       onToggleSelect={() => toggleTrackSelection(track.id)}
+                      onSelectTrack={(additive) => {
+                        // Cmd/Ctrl-click also toggles group membership; plain click only
+                        // focuses the track for the inspector and leaves the group alone.
+                        if (additive) {
+                          setSelectedTrackIds((ids) => ids.includes(track.id) ? ids.filter((id) => id !== track.id) : [...ids, track.id]);
+                        }
+                        setFocusedTrackId(track.id);
+                      }}
                       onClipSelect={(clipId, additive) => {
                         trackLanesRef.current?.focus({ preventScroll: true });
-                        const clip = clips.find((item) => item.id === clipId);
-                        const anchor = clip?.startSeconds ?? playhead;
-                        playbackAnchorRef.current = anchor;
-                        setSelectedRange(undefined);
+                        // Selecting a clip never moves the playhead or the playback anchor —
+                        // playback always continues / resumes from wherever it currently is.
+                        // Preserve a global ruler range; only drop any per-track range.
+                        setSelectedRange((current) => (current && !current.trackId ? current : undefined));
                         setSelectedClip({ trackId: track.id, clipId });
                         if (additive) {
                           setSelectedClips((prev) => prev.some((ref) => ref.trackId === track.id && ref.clipId === clipId)
@@ -3069,7 +3309,6 @@ export function App() {
                             : [...prev, { trackId: track.id, clipId }]);
                         } else {
                           setSelectedClips([{ trackId: track.id, clipId }]);
-                          seekTo(anchor, { updateAnchor: false });
                         }
                       }}
                       onClipContextMenu={(clipId, event) => {
@@ -3081,6 +3320,9 @@ export function App() {
                         setClipMenu({ x: event.clientX, y: event.clientY });
                       }}
                       onClipMove={(clipId, deltaSeconds) => void moveClip(track.id, clipId, deltaSeconds)}
+                      cutToolActive={cutToolActive}
+                      onClipCut={(clipId, atSeconds) => void splitClip(track.id, clipId, atSeconds)}
+                      onCutHover={(seconds) => setCutCursorSeconds(seconds)}
                       onAlignmentGuideChange={setAlignmentGuideSeconds}
                       onRangeSelect={(start, end) => {
                         trackLanesRef.current?.focus({ preventScroll: true });
@@ -3097,10 +3339,35 @@ export function App() {
                         setSelectedClips([]);
                       }}
                       onArm={() => {
-                        if (isVideo) {
-                          setArmedVideoTrackIds((ids) => ids.includes(track.id) ? ids.filter((id) => id !== track.id) : [...ids, track.id]);
-                        } else {
-                          setArmedTrackId((current) => current === track.id ? undefined : track.id);
+                        // Group-aware arm: if this track is in the S-group with others, apply
+                        // to every track in the group; otherwise just this track.
+                        const inGroup = selectedTrackIds.includes(track.id) && selectedTrackIds.length > 1;
+                        const targets = inGroup ? selectedTrackIds : [track.id];
+                        const targetVideos = targets.filter((id) => session.tracks.some((t) => t.id === id && t.kind === "video"));
+                        if (targetVideos.length > 0) {
+                          const allArmed = targetVideos.every((id) => armedVideoTrackIds.includes(id));
+                          setArmedVideoTrackIds((ids) => allArmed
+                            ? ids.filter((id) => !targetVideos.includes(id))
+                            : Array.from(new Set([...ids, ...targetVideos])));
+                        }
+                        const targetAudios = targets.filter((id) => session.tracks.some((t) => t.id === id && t.kind !== "video"));
+                        if (targetAudios.length > 0) {
+                          const allArmed = targetAudios.every((id) => armedAudioTrackIds.includes(id));
+                          setArmedAudioTrackIds((ids) => allArmed
+                            ? ids.filter((id) => !targetAudios.includes(id))
+                            : Array.from(new Set([...ids, ...targetAudios])));
+                        }
+                      }}
+                      onMute={() => {
+                        // Group-aware mute: if track is in the S-group with others, mute/unmute
+                        // every group member together based on whether all are currently muted.
+                        const inGroup = selectedTrackIds.includes(track.id) && selectedTrackIds.length > 1;
+                        const targetIds = inGroup ? selectedTrackIds : [track.id];
+                        const targetTracks = session.tracks.filter((t) => targetIds.includes(t.id));
+                        const allMuted = targetTracks.every((t) => t.muted);
+                        const nextMuted = !allMuted;
+                        for (const t of targetTracks) {
+                          if (t.muted !== nextMuted) void updateTrack(t, { muted: nextMuted });
                         }
                       }}
                       onSeek={(seconds) => seekTo(seconds)}
@@ -3501,6 +3768,50 @@ export function App() {
           </>
         )}
       </aside>
+      {addTrackMenuOpen ? (
+        <div className="add-track-modal-backdrop" onPointerDown={() => setAddTrackMenuOpen(false)}>
+          <div
+            className="add-track-modal"
+            role="dialog"
+            aria-label="Add a track"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="add-track-modal-head">
+              <strong>Add a track</strong>
+              <button type="button" className="add-track-modal-close" onClick={() => setAddTrackMenuOpen(false)} aria-label="Close">×</button>
+            </div>
+            <div className="add-track-modal-grid">
+              <button
+                type="button"
+                className="add-track-card"
+                onClick={() => { setAddTrackMenuOpen(false); void addRecordingTrack(1); }}
+              >
+                <Mic size={28} />
+                <strong>Audio · Mono</strong>
+                <span>1-channel recording track</span>
+              </button>
+              <button
+                type="button"
+                className="add-track-card"
+                onClick={() => { setAddTrackMenuOpen(false); void addRecordingTrack(2); }}
+              >
+                <Mic size={28} />
+                <strong>Audio · Stereo</strong>
+                <span>2-channel recording track</span>
+              </button>
+              <button
+                type="button"
+                className="add-track-card"
+                onClick={() => { setAddTrackMenuOpen(false); void addVideoTrack(); }}
+              >
+                <Camera size={28} />
+                <strong>Video</strong>
+                <span>Camera / video clips</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {clipMenu ? (
         <>
           <div
@@ -3557,20 +3868,25 @@ function TimeRuler({
   duration,
   playhead,
   selection,
+  loopActive,
   onSeek,
   onSelect,
   onClear,
+  onToggleLoop,
 }: {
   duration: number;
   playhead: number;
   selection?: { start: number; end: number };
+  loopActive: boolean;
   onSeek: (seconds: number) => void;
   onSelect: (start: number, end: number) => void;
   onClear: () => void;
+  onToggleLoop: () => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ start: number; moved: boolean } | null>(null);
   const resizeRef = useRef<{ anchor: number } | null>(null);
+  const bandRef = useRef<{ start: number; moved: boolean } | null>(null);
   const secondsFromClientX = (clientX: number) => {
     const rect = wrapRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return 0;
@@ -3594,6 +3910,31 @@ function TimeRuler({
     resizeRef.current = null;
     event.stopPropagation();
     event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+  // Click on the selection band toggles the loop; a drag inside it redraws the region.
+  const handleBandDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    bandRef.current = { start: secondsFromClientX(event.clientX), moved: false };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const handleBandMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const band = bandRef.current;
+    if (!band) return;
+    event.stopPropagation();
+    const seconds = secondsFromClientX(event.clientX);
+    if (Math.abs(seconds - band.start) > 0.02) {
+      band.moved = true;
+      onSelect(band.start, seconds);
+    }
+  };
+  const handleBandUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    const band = bandRef.current;
+    if (!band) return;
+    bandRef.current = null;
+    event.stopPropagation();
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    if (!band.moved) onToggleLoop();
   };
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -3646,7 +3987,14 @@ function TimeRuler({
           </div>
         ))}
         {selection && selWidthPct > 0.05 ? (
-          <div className="time-ruler-selection" style={{ left: `${selLeftPct}%`, width: `${selWidthPct}%` }}>
+          <div
+            className={`time-ruler-selection ${loopActive ? "active" : ""}`}
+            style={{ left: `${selLeftPct}%`, width: `${selWidthPct}%` }}
+            onPointerDown={handleBandDown}
+            onPointerMove={handleBandMove}
+            onPointerUp={handleBandUp}
+            title={loopActive ? "Loop active. Click to disable." : "Click to loop this region."}
+          >
             <div
               className="time-ruler-handle start"
               onPointerDown={(event) => handleEdgeDown("start", event)}
@@ -4777,7 +5125,6 @@ export function CameraPreviewApp() {
   void selectedLayer;
   void selectedLayerId;
   void setSelectedLayerId;
-  void updateLayerLayout;
   void updateCanvas;
 
   return (
@@ -4803,12 +5150,104 @@ export function CameraPreviewApp() {
                 {layer.clip
                   ? <RecordedVideoFeed clip={layer.clip} playing={layer.track.transportPlaying} />
                   : <CameraLiveFeed track={layer.track} />}
+                {layer.clip ? (
+                  <CropEditor
+                    layout={layer.layout}
+                    onChange={(next) => updateLayerLayout(layer.track.id, layer.clip!.id, next, 250)}
+                  />
+                ) : null}
               </div>
             </div>
           ))}
         </div>
       )}
     </main>
+  );
+}
+
+// Lightweight free-form crop editor for a single video panel in the camera-preview
+// window. Four draggable edge handles set cropTop/Right/Bottom/Left on the clip's
+// layout; the dimmed regions show what will be cropped out.
+function CropEditor({ layout, onChange }: { layout: VideoLayout; onChange: (next: VideoLayout) => void }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ edge: "top" | "right" | "bottom" | "left"; startX: number; startY: number; original: number } | null>(null);
+  const edgeKey: Record<"top" | "right" | "bottom" | "left", "cropTop" | "cropRight" | "cropBottom" | "cropLeft"> = {
+    top: "cropTop", right: "cropRight", bottom: "cropBottom", left: "cropLeft",
+  };
+  const handleDown = (edge: "top" | "right" | "bottom" | "left", event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragRef.current = {
+      edge,
+      startX: event.clientX,
+      startY: event.clientY,
+      original: layout[edgeKey[edge]],
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const handleMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    const rect = wrapRef.current?.getBoundingClientRect();
+    if (!drag || !rect || rect.width <= 0 || rect.height <= 0) return;
+    event.preventDefault();
+    let deltaPct = 0;
+    if (drag.edge === "top" || drag.edge === "bottom") {
+      const deltaY = event.clientY - drag.startY;
+      deltaPct = (deltaY / rect.height) * 100;
+      if (drag.edge === "bottom") deltaPct = -deltaPct;
+    } else {
+      const deltaX = event.clientX - drag.startX;
+      deltaPct = (deltaX / rect.width) * 100;
+      if (drag.edge === "right") deltaPct = -deltaPct;
+    }
+    const nextVal = Math.max(0, Math.min(45, drag.original + deltaPct));
+    onChange({ ...layout, [edgeKey[drag.edge]]: nextVal });
+  };
+  const handleUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    dragRef.current = null;
+  };
+  const tBar = `${layout.cropTop}%`;
+  const bBar = `${layout.cropBottom}%`;
+  const lBar = `${layout.cropLeft}%`;
+  const rBar = `${layout.cropRight}%`;
+  return (
+    <div ref={wrapRef} className="crop-overlay">
+      <div className="crop-dim" style={{ top: 0, left: 0, right: 0, height: tBar }} />
+      <div className="crop-dim" style={{ bottom: 0, left: 0, right: 0, height: bBar }} />
+      <div className="crop-dim" style={{ top: tBar, bottom: bBar, left: 0, width: lBar }} />
+      <div className="crop-dim" style={{ top: tBar, bottom: bBar, right: 0, width: rBar }} />
+      <div
+        className="crop-handle horizontal"
+        style={{ top: tBar, left: lBar, right: rBar }}
+        onPointerDown={(e) => handleDown("top", e)}
+        onPointerMove={handleMove}
+        onPointerUp={handleUp}
+      />
+      <div
+        className="crop-handle horizontal"
+        style={{ bottom: bBar, left: lBar, right: rBar }}
+        onPointerDown={(e) => handleDown("bottom", e)}
+        onPointerMove={handleMove}
+        onPointerUp={handleUp}
+      />
+      <div
+        className="crop-handle vertical"
+        style={{ left: lBar, top: tBar, bottom: bBar }}
+        onPointerDown={(e) => handleDown("left", e)}
+        onPointerMove={handleMove}
+        onPointerUp={handleUp}
+      />
+      <div
+        className="crop-handle vertical"
+        style={{ right: rBar, top: tBar, bottom: bBar }}
+        onPointerDown={(e) => handleDown("right", e)}
+        onPointerMove={handleMove}
+        onPointerUp={handleUp}
+      />
+    </div>
   );
 }
 
@@ -5158,12 +5597,17 @@ function TrackInspector({
   sampleRate,
   inputDevices,
   inputDevice,
+  inputGainDb,
+  inputChannels,
+  inputChannelLevels,
   cameraDevices,
   cameraDevice,
   cameraAudio,
   selectionCount,
   onChange,
   onInputDeviceChange,
+  onInputGainChange,
+  onInputChannelsChange,
   onRefreshInputDevices,
   onCameraDeviceChange,
   onCameraAudioChange,
@@ -5175,12 +5619,17 @@ function TrackInspector({
   sampleRate: number;
   inputDevices: string[];
   inputDevice: string;
+  inputGainDb: number;
+  inputChannels: number[];
+  inputChannelLevels: number[];
   cameraDevices: MediaDeviceInfo[];
   cameraDevice: string;
   cameraAudio: boolean;
   selectionCount: number;
   onChange: (track: Track, patch: Partial<Track>) => void;
   onInputDeviceChange: (trackId: string, device: string) => void;
+  onInputGainChange: (trackId: string, gainDb: number) => void;
+  onInputChannelsChange: (trackId: string, channels: number[]) => void;
   onRefreshInputDevices: () => void;
   onCameraDeviceChange: (trackId: string, device: string) => void;
   onCameraAudioChange: (trackId: string, enabled: boolean) => void;
@@ -5189,22 +5638,30 @@ function TrackInspector({
 }) {
   const [nameDraft, setNameDraft] = useState(track?.name ?? "");
   const [roleDraft, setRoleDraft] = useState(track?.role ?? "");
+  // Number of input channels exposed by the currently-selected device. Probed when
+  // the user opens or changes the input device.
+  const [deviceChannelCount, setDeviceChannelCount] = useState<number>(2);
 
   useEffect(() => {
     setNameDraft(track?.name ?? "");
     setRoleDraft(track?.role ?? "");
   }, [track?.id, track?.name, track?.role]);
 
+  useEffect(() => {
+    if (!track || track.kind === "video") return;
+    let cancelled = false;
+    void api.inputDeviceChannelCount(inputDevice || undefined)
+      .then((count) => { if (!cancelled) setDeviceChannelCount(Math.max(1, Math.min(64, count))); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [track?.id, track?.kind, inputDevice]);
+
   if (!track) {
     return (
       <aside className="track-inspector">
-        <div className="inspector-tabs">
-          <button className="active">Inspector</button>
-          <button>Visibility</button>
-        </div>
         <div className="inspector-empty">
           <strong>{selectionCount > 1 ? "Multiple Tracks Selected" : "No Track Selected"}</strong>
-          <span>{selectionCount > 1 ? "Select one track to edit recording input and mix details." : "Click S on a track to show its details."}</span>
+          <span>{selectionCount > 1 ? "Select one track to edit recording input and mix details." : "Click a track to show its details."}</span>
         </div>
       </aside>
     );
@@ -5223,10 +5680,6 @@ function TrackInspector({
   };
   return (
     <aside className="track-inspector">
-      <div className="inspector-tabs">
-        <button className="active">Inspector</button>
-        <button>Visibility</button>
-      </div>
       <div className="inspector-track-title" style={{ borderLeftColor: track.color }}>
         <input
           className="inspector-name-input"
@@ -5277,13 +5730,86 @@ function TrackInspector({
             </label>
           </>
         ) : (
-          <label className="inspector-field">
-            <span><Mic size={12} /> Input</span>
-            <select value={inputDevice} onChange={(event) => onInputDeviceChange(track.id, event.target.value)} onFocus={onRefreshInputDevices}>
-              <option value="">Default input</option>
-              {inputDevices.map((device) => <option key={device} value={device}>{device}</option>)}
-            </select>
-          </label>
+          <>
+            <label className="inspector-field">
+              <span><Mic size={12} /> Input</span>
+              <select value={inputDevice} onChange={(event) => onInputDeviceChange(track.id, event.target.value)} onFocus={onRefreshInputDevices}>
+                <option value="">Default input</option>
+                {inputDevices.map((device) => <option key={device} value={device}>{device}</option>)}
+              </select>
+            </label>
+            {(() => {
+              const trackStereo = (source?.channels ?? 1) >= 2;
+              // Build labels: for a 2-ch interface, label 0 = "L", 1 = "R"; otherwise "Ch N".
+              const labelFor = (idx: number) => deviceChannelCount === 2
+                ? (idx === 0 ? "L" : "R")
+                : `Ch ${idx + 1}`;
+              const opts: number[] = Array.from({ length: deviceChannelCount }, (_, i) => i);
+              const levelAt = (idx: number) => Math.max(0, Math.min(1, inputChannelLevels[idx] ?? 0));
+              if (!trackStereo) {
+                const current = inputChannels[0] ?? 0;
+                return (
+                  <label className="inspector-field" title="Which physical input channel of the interface to record. The bar shows live level.">
+                    <span>Channel</span>
+                    <select value={current} onChange={(event) => onInputChannelsChange(track.id, [Number(event.target.value)])}>
+                      {opts.map((idx) => <option key={idx} value={idx}>{labelFor(idx)}</option>)}
+                    </select>
+                    <div className="input-meter" aria-label={`Input level on ${labelFor(current)}`}>
+                      <span style={{ width: `${levelAt(current) * 100}%` }} />
+                    </div>
+                  </label>
+                );
+              }
+              const left = inputChannels[0] ?? 0;
+              const right = inputChannels[1] ?? (deviceChannelCount > 1 ? 1 : 0);
+              return (
+                <>
+                  <label className="inspector-field" title="Left input channel. The bar shows live level.">
+                    <span>L</span>
+                    <select value={left} onChange={(event) => onInputChannelsChange(track.id, [Number(event.target.value), right])}>
+                      {opts.map((idx) => <option key={idx} value={idx}>{labelFor(idx)}</option>)}
+                    </select>
+                    <div className="input-meter">
+                      <span style={{ width: `${levelAt(left) * 100}%` }} />
+                    </div>
+                  </label>
+                  <label className="inspector-field" title="Right input channel. The bar shows live level.">
+                    <span>R</span>
+                    <select value={right} onChange={(event) => onInputChannelsChange(track.id, [left, Number(event.target.value)])}>
+                      {opts.map((idx) => <option key={idx} value={idx}>{labelFor(idx)}</option>)}
+                    </select>
+                    <div className="input-meter">
+                      <span style={{ width: `${levelAt(right) * 100}%` }} />
+                    </div>
+                  </label>
+                </>
+              );
+            })()}
+            <label className="inspector-field">
+              <span>In</span>
+              <input
+                type="range"
+                min="-24"
+                max="24"
+                step="0.5"
+                value={inputGainDb}
+                onChange={(event) => onInputGainChange(track.id, Number(event.target.value))}
+              />
+              <em>{formatDb(inputGainDb)}</em>
+            </label>
+            <label className="inspector-field" title="Compensates the recording's placement on the timeline to align with what was actually playing. Positive ms = shift earlier.">
+              <span>Latency</span>
+              <input
+                type="range"
+                min="-200"
+                max="500"
+                step="1"
+                value={track.inputLatencyMs ?? 0}
+                onChange={(event) => onChange(track, { inputLatencyMs: Number(event.target.value) })}
+              />
+              <em>{(track.inputLatencyMs ?? 0)} ms</em>
+            </label>
+          </>
         )}
       </div>
       <div className="inspector-section">
@@ -5330,6 +5856,7 @@ function TrackInspector({
 function TrackRow({
   track,
   selected,
+  focused,
   armed,
   clips,
   selectedClipId,
@@ -5350,17 +5877,23 @@ function TrackRow({
   onClipSelect,
   onClipContextMenu,
   onClipMove,
+  cutToolActive,
+  onClipCut,
+  onCutHover,
   onAlignmentGuideChange,
   onRangeSelect,
   onRangeClear,
   onArm,
+  onMute,
   onSeek,
+  onSelectTrack,
   onChange,
   onDragOver,
   onDrop,
 }: {
   track: Track;
   selected: boolean;
+  focused: boolean;
   armed: boolean;
   clips: { id: string; kind?: "audio" | "video"; name: string; startSeconds: number; sourceSeconds: number; peaks?: number[]; src?: string }[];
   selectedClipId?: string;
@@ -5381,11 +5914,16 @@ function TrackRow({
   onClipSelect: (clipId: string, additive?: boolean) => void;
   onClipContextMenu: (clipId: string, event: React.MouseEvent) => void;
   onClipMove: (clipId: string, deltaSeconds: number) => void;
+  cutToolActive: boolean;
+  onClipCut: (clipId: string, atSeconds: number) => void;
+  onCutHover: (seconds: number | undefined) => void;
   onAlignmentGuideChange: (seconds: number | undefined) => void;
   onRangeSelect: (start: number, end: number) => void;
   onRangeClear: () => void;
   onArm: () => void;
+  onMute: () => void;
   onSeek: (seconds: number) => void;
+  onSelectTrack: (additive: boolean) => void;
   onChange: (patch: Partial<Track>) => void;
   onDragOver: (event: React.DragEvent) => void;
   onDrop: (event: React.DragEvent) => void;
@@ -5414,12 +5952,20 @@ function TrackRow({
   const handleClipPointerDown = (clipId: string, event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     event.stopPropagation();
+    // Cut tool: click splits the clip at the pointer position; no select, no drag.
+    if (cutToolActive) {
+      onClipCut(clipId, secondsFromClientX(event.clientX));
+      return;
+    }
     // Cmd/Ctrl-click toggles the clip into the multi-selection without starting a drag.
     if (event.metaKey || event.ctrlKey) {
       onClipSelect(clipId, true);
       return;
     }
     onClipSelect(clipId, false);
+    // Only start a drag-move when Shift is held — plain clicks just select so the
+    // user can't move a clip by accident while picking it.
+    if (!event.shiftKey) return;
     const clipStart = clips.find((item) => item.id === clipId)?.startSeconds ?? 0;
     dragRef.current = { start: secondsFromClientX(event.clientX), moved: false, clipId, clipStart, previewStart: clipStart };
     setMovePreview({ clipId, startSeconds: clipStart, aligned: false });
@@ -5453,8 +5999,11 @@ function TrackRow({
       const targetStart = drag.previewStart ?? Math.max(0, (drag.clipStart ?? 0) + seconds - drag.start);
       onClipMove(drag.clipId, targetStart - (drag.clipStart ?? targetStart));
     } else {
+      // Click on a clip selects the clip (and ensures the parent track is selected).
+      // The playhead only moves from the top ruler now.
       onClipSelect(drag.clipId, false);
-      onSeek(seconds);
+      onSelectTrack(false);
+      void seconds;
     }
   };
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -5463,7 +6012,7 @@ function TrackRow({
     const seconds = secondsFromPointer(event);
     if (Math.abs(seconds - drag.start) > 0.03) {
       drag.moved = true;
-      if (!drag.clipId) onRangeSelect(drag.start, seconds);
+      // Range selection lives on the top time ruler only — drag on a track lane is a no-op.
     }
   };
   const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -5472,13 +6021,11 @@ function TrackRow({
     dragRef.current = null;
     event.stopPropagation();
     event.currentTarget.releasePointerCapture(event.pointerId);
-    const seconds = secondsFromPointer(event);
-    if (drag.moved) {
-      onRangeSelect(drag.start, seconds);
-      return;
-    }
+    // Whether the pointer moved or not, a press on the track lane just selects this
+    // track (Cmd/Ctrl-click adds to the multi-selection). Range selection is exclusive
+    // to the top ruler now.
     onRangeClear();
-    onSeek(seconds);
+    onSelectTrack(event.metaKey || event.ctrlKey);
   };
   const cursorPct = duration > 0 ? Math.max(0, Math.min(100, (playhead / duration) * 100)) : 0;
   const rangeStartPct = selectedRange && duration > 0 ? Math.max(0, Math.min(100, (selectedRange.start / duration) * 100)) : 0;
@@ -5492,31 +6039,31 @@ function TrackRow({
     : 0;
   return (
     <div
-      className={`track ${selected ? "selected" : ""} ${armed ? "armed" : ""} ${recording ? "recording" : ""} ${track.muted ? "muted" : ""}`}
+      className={`track ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${armed ? "armed" : ""} ${recording ? "recording" : ""} ${track.muted ? "muted" : ""}`}
       onDragOver={onDragOver}
       onDrop={onDrop}
       role="option"
       aria-selected={selected}
     >
-      <div className="track-head" style={{ borderLeftColor: track.color }}>
-        <div className="track-title-row">
-          <div className="track-compact-name" title={track.name}>{track.name}</div>
-        </div>
-        <div className="toggles">
-          <button
-            className={`record-arm ${armed ? "active" : ""}`}
-            title={armed ? "Record enabled. Click to disarm." : "Record enable this track"}
-            onClick={(event) => { event.stopPropagation(); onArm(); }}
-            aria-pressed={armed}
-          >R</button>
-          <button className={track.muted ? "active" : ""} onClick={(event) => { event.stopPropagation(); onChange({ muted: !track.muted }); }}>M</button>
-          <button
-            className={`select-toggle ${selected ? "active" : ""}`}
-            title={selected ? "Selected. Click to remove from selection." : "Select this track"}
-            onClick={(event) => { event.stopPropagation(); onToggleSelect(); }}
-            aria-pressed={selected}
-          >S</button>
-        </div>
+      <div className="track-head" style={{ ['--track-color' as string]: track.color }}>
+        <button
+          className={`record-arm ${armed ? "active" : ""}`}
+          title={armed ? "Record enabled. Click to disarm." : "Record enable this track (or group)"}
+          onClick={(event) => { event.stopPropagation(); onArm(); }}
+          aria-pressed={armed}
+        >R</button>
+        <button
+          className={`mute-btn ${track.muted ? "active" : ""}`}
+          title={track.muted ? "Muted. Click to unmute." : "Mute this track (or group)"}
+          onClick={(event) => { event.stopPropagation(); onMute(); }}
+          aria-pressed={track.muted}
+        >M</button>
+        <button
+          className={`solo-btn ${selected ? "active" : ""}`}
+          title={selected ? "In group. Click to remove from group." : "Add to group"}
+          onClick={(event) => { event.stopPropagation(); onToggleSelect(); }}
+          aria-pressed={selected}
+        >S</button>
         {!isVideo && (recording || monitoring) ? (
           <div className={`track-record-meter ${recording ? "recording" : "monitoring"}`} title="Live input level">
             <span style={{ width: `${Math.max(2, Math.min(100, liveLevel * 100))}%` }} />
@@ -5525,11 +6072,14 @@ function TrackRow({
       </div>
       <div
         ref={wrapRef}
-        className="wave-wrap"
+        className={`wave-wrap ${cutToolActive ? "cut-mode" : ""}`}
+        style={{ ['--track-color' as string]: track.color }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
-        title="Click to set playhead. Drag to select a time range."
+        onMouseMove={cutToolActive ? (event) => onCutHover(secondsFromClientX(event.clientX)) : undefined}
+        onMouseLeave={cutToolActive ? () => onCutHover(undefined) : undefined}
+        title={cutToolActive ? "Click on a clip to split it at the cursor." : "Click to select this track."}
       >
         {clips.map((clip) => {
           const preview = movePreview?.clipId === clip.id ? movePreview : undefined;
@@ -5572,8 +6122,11 @@ function TrackRow({
             <span className="clip-label">{recordingStarting ? "Opening input" : "Recording"}</span>
           </div>
         ) : null}
-        {monitoring && !recording ? (isVideo ? <VideoStrip color={track.color} /> : <LiveWaveform peaks={livePeaks ?? []} color={track.color} />) : null}
-        {monitoring ? <div className="recording-overlay monitor">{isVideo ? "Camera" : monitorStarting ? "Opening input" : "Input"}</div> : null}
+        {/* Audio armed-monitoring: show live input waveform + a small "Input" badge.
+            For video tracks we used to paint a full-lane VideoStrip with a "Camera"
+            label — too much; just light the R button instead. */}
+        {monitoring && !recording && !isVideo ? <LiveWaveform peaks={livePeaks ?? []} color={track.color} /> : null}
+        {monitoring && !isVideo ? <div className="recording-overlay monitor">{monitorStarting ? "Opening input" : "Input"}</div> : null}
         <div className="playhead" style={{ left: `${cursorPct}%` }} />
       </div>
     </div>

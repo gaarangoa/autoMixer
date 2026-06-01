@@ -59,6 +59,7 @@ pub fn make_track(source_file_id: String, name: String, index: usize) -> Track {
         muted: false,
         solo: false,
         ai_generated: false,
+        input_latency_ms: 0,
         color: COLORS[index % COLORS.len()].to_string(),
         chain: default_chain(),
         sends: Sends { reverb_db: -60.0, delay_db: -60.0 },
