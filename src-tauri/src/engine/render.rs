@@ -43,6 +43,39 @@ pub fn render_session_to_buffer(session: &MixSession) -> Result<RenderedMix, Str
     render_session_to_buffer_with_bypass(session, false)
 }
 
+/// Render only a sub-range [start, end) of the session into an in-memory buffer.
+/// Skips the (often long) section before `range_start` by seeking the mixer; skips
+/// everything after `range_end`. Used by the agent video edit so analysis runs over
+/// just the selected ruler region instead of the whole timeline.
+pub fn render_session_range_to_buffer(
+    session: &MixSession,
+    range_start: u64,
+    range_end: u64,
+) -> Result<RenderedMix, String> {
+    let (mut mixer, total_with_tail, channels, _sample_rate) = build_render_mixer(session, false)?;
+    let safe_end = range_end.min(total_with_tail);
+    if safe_end <= range_start {
+        return Ok(RenderedMix { samples: Vec::new(), channels, sample_rate: session.sample_rate });
+    }
+    // Seek before rendering. The Play command pushed in build_render_mixer doesn't
+    // touch playhead, so setting it directly here is safe; the first mixer.render
+    // call will drain the queue (processing Play) and then render from this point.
+    mixer.playhead = range_start as f64;
+    mixer.shared.playhead.store(range_start, std::sync::atomic::Ordering::Relaxed);
+    let frames_needed = (safe_end - range_start) as usize;
+    let mut block = vec![0.0_f32; RENDER_BLOCK * channels as usize];
+    let mut produced: usize = 0;
+    let mut out: Vec<f32> = Vec::with_capacity(frames_needed * channels as usize);
+    while produced < frames_needed {
+        mixer.render(&mut block);
+        let frames_this_block = block.len() / channels as usize;
+        let to_write = (frames_needed - produced).min(frames_this_block);
+        out.extend_from_slice(&block[..to_write * channels as usize]);
+        produced += to_write;
+    }
+    Ok(RenderedMix { samples: out, channels, sample_rate: session.sample_rate })
+}
+
 /// Render using the same source-only bypass path as the live MIX/ORIG toggle.
 pub fn render_session_to_buffer_with_bypass(
     session: &MixSession,

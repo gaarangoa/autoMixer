@@ -144,6 +144,25 @@ export type AgentVideoScriptCandidate = {
   note?: string | null;
 };
 
+// Free-form color grade the agent can pick from user instructions. Every field is
+// optional and clamped on the backend before being turned into an ffmpeg filter
+// chain. Takes priority over the named look_preset when present on a render.
+export type AgentColorGrade = {
+  name?: string | null;
+  // 1-2 sentence rationale from the agent: which user word drove which parameter.
+  reason?: string | null;
+  brightness?: number | null;
+  contrast?: number | null;
+  saturation?: number | null;
+  gamma?: number | null;
+  rgbMix?: { rr?: number | null; gg?: number | null; bb?: number | null } | null;
+  hueShift?: number | null;
+  vignette?: number | null;
+  blur?: number | null;
+  sharpen?: number | null;
+  grain?: number | null;
+};
+
 export type AgentVideoScriptEntry = {
   windowIndex: number;
   totalWindows: number;

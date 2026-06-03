@@ -59,6 +59,13 @@ pub struct RenderResponse {
 pub struct AgentVideoEditResponse {
     path: String,
     script: Vec<AgentVideoScriptEntry>,
+    // Color-look preset the agent inferred from the user's instructions (e.g. "cinema",
+    // "warm", "moody"), so the frontend can sync its Look chip and reuse it on re-renders.
+    // Serialized as `lookPreset` (camelCase) for the TS client. None = no preset applied.
+    look_preset: Option<crate::model::VideoFilterPreset>,
+    // Free-form color grade derived from the user's instructions. Used as the actual
+    // render filter when present; otherwise the named look_preset (or nothing) is used.
+    color_grade: Option<AgentColorGrade>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -134,6 +141,10 @@ struct RenderedAudioAnalysis {
     samples: Vec<f32>,
     channels: usize,
     sample_rate: u32,
+    /// Timeline sample where frame 0 of `samples` begins. 0 for a full-session render,
+    /// `range_start` for a range render — used by `audio_features_for_window` to look
+    /// up the right frames without rendering the unused leading section.
+    timeline_start_sample: u64,
 }
 
 const MAX_DYNAMIC_HOLD_WINDOWS: u32 = 4;
@@ -175,10 +186,68 @@ struct AgentShotChoice {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // kept alongside analyze_agent_window_frames for the old two-call path
 struct AgentWindowFrameAnalysis {
     candidate_labels: Option<Vec<String>>,
     candidate_notes: Option<Vec<String>>,
     window_summary: Option<String>,
+}
+
+/// Combined describe-and-decide output. Used by the merged single-call agent
+/// pipeline (one vision-model HTTP request per window instead of one vision +
+/// one edit request). Backwards-compatible decoding: missing fields fall back
+/// the same way the two-call path did.
+#[derive(Deserialize)]
+struct AgentMergedChoice {
+    candidate_labels: Option<Vec<String>>,
+    candidate_notes: Option<Vec<String>>,
+    window_summary: Option<String>,
+    choice: usize,
+    decision: Option<String>,
+    reason: Option<String>,
+    edit_intent: Option<String>,
+    continuity_plan: Option<String>,
+    // Color-look preset the model picked from the user's instructions for THIS window.
+    // Aggregated across windows (majority vote) to pick the final render look. One of:
+    // none, warm, cool, mono, punch, dream, cinema, noir, moody, vintage, golden, cold.
+    look_preset: Option<String>,
+    // Free-form custom color grade. Lets the model express any look (not just the 12
+    // presets) by emitting clamped numeric parameters. Backend validates each field and
+    // builds a safe ffmpeg filter chain. We use the first non-empty grade across windows
+    // — same user prompt drives them all, so no aggregation needed.
+    color_grade: Option<AgentColorGrade>,
+}
+
+/// Free-form color-grade parameters the agent can emit per user instructions.
+/// All fields optional; the backend clamps each one to a safe range before building
+/// the ffmpeg filter chain. No raw filter strings are accepted from the model — only
+/// numeric parameters — so there's no filter-injection risk.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentColorGrade {
+    pub name: Option<String>,
+    // Short rationale (1-2 sentences) explaining how the model mapped the user's words
+    // to these parameters. Surfaced in the chat so the user can see and refine. Pure
+    // text, no validation needed beyond the trim/empty filter.
+    pub reason: Option<String>,
+    pub brightness: Option<f32>,
+    pub contrast: Option<f32>,
+    pub saturation: Option<f32>,
+    pub gamma: Option<f32>,
+    pub rgb_mix: Option<RgbMix>,
+    pub hue_shift: Option<f32>,
+    pub vignette: Option<f32>,
+    pub blur: Option<f32>,
+    pub sharpen: Option<f32>,
+    pub grain: Option<f32>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RgbMix {
+    pub rr: Option<f32>,
+    pub gg: Option<f32>,
+    pub bb: Option<f32>,
 }
 
 #[tauri::command]
@@ -1157,6 +1226,7 @@ pub fn render_video_mix(
     start_sample: Option<u64>,
     end_sample: Option<u64>,
     track_ids: Option<Vec<String>>,
+    aspect_ratio: Option<String>,
 ) -> Result<RenderResponse, String> {
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
     let path = normalize_mp4_path(PathBuf::from(output_path));
@@ -1195,7 +1265,7 @@ pub fn render_video_mix(
         .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64))
         .arg("-i")
         .arg(&audio_path);
-    let filter = build_video_filter(&video_inputs, &project.session, range_start, range_end);
+    let filter = build_video_filter(&video_inputs, &project.session, range_start, range_end, aspect_ratio.as_deref());
     command
         .arg("-filter_complex")
         .arg(filter)
@@ -1223,7 +1293,7 @@ pub fn render_video_mix(
 }
 
 #[tauri::command]
-pub fn export_rendered_video(source_path: String, output_path: String) -> Result<RenderResponse, String> {
+pub fn export_rendered_video(source_path: String, output_path: String, aspect_ratio: Option<String>) -> Result<RenderResponse, String> {
     let source = PathBuf::from(source_path);
     if !source.exists() {
         return Err("The Main video render is missing. Run Agent Edit again before exporting.".into());
@@ -1231,6 +1301,36 @@ pub fn export_rendered_video(source_path: String, output_path: String) -> Result
     let path = normalize_mp4_path(PathBuf::from(output_path));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    // Letterbox/pillarbox the source into the requested aspect with black padding.
+    // No aspect (or "original") just falls through to a fast copy.
+    if let Some(aspect) = aspect_ratio.as_deref() {
+        if aspect == "square" || aspect == "portrait916" {
+            let (src_w, src_h) = probe_video_dimensions(&source)?;
+            let (t_w, t_h) = aspect_target_box(src_w as i32, src_h as i32, Some(aspect))
+                .ok_or("Unknown aspect ratio")?;
+            let filter = format!(
+                "scale={t_w}:{t_h}:force_original_aspect_ratio=decrease,pad={t_w}:{t_h}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p"
+            );
+            let output = Command::new("ffmpeg")
+                .arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
+                .arg("-i").arg(&source)
+                .arg("-vf").arg(&filter)
+                .arg("-c:v").arg("libx264")
+                .arg("-pix_fmt").arg("yuv420p")
+                .arg("-movflags").arg("+faststart")
+                .arg("-c:a").arg("copy")
+                .arg(&path)
+                .output()
+                .map_err(|error| format!("Could not run ffmpeg: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "ffmpeg aspect export failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            return Ok(RenderResponse { path: path.to_string_lossy().to_string() });
+        }
     }
     if source == path {
         return Ok(RenderResponse { path: path.to_string_lossy().to_string() });
@@ -1394,12 +1494,30 @@ pub async fn render_agent_video_edit(
     let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
     fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
     let audio_path = renders_dir.join(format!("{session_id}.agent-video-edit.wav"));
-    audio::render_mix(&project.session, &audio_path)?;
-    let audio_analysis = load_rendered_audio_analysis(&audio_path)
-        .map_err(|error| {
-            emit_agent_progress(&app, &started, "error", "Could not analyze rendered audio for the video agent.", 0, total_windows);
-            error
-        })?;
+    // Render the audio mix only across the selected range, in memory — way faster than
+    // rendering the whole session and round-tripping through a WAV file. The full-render
+    // path below for the final ffmpeg step still writes the audio to disk.
+    let rendered_range = crate::engine::render::render_session_range_to_buffer(
+        &project.session,
+        range_start,
+        range_end,
+    )
+    .map_err(|error| {
+        emit_agent_progress(&app, &started, "error", "Could not render mix audio for the video agent.", 0, total_windows);
+        error
+    })?;
+    let audio_analysis = RenderedAudioAnalysis {
+        samples: rendered_range.samples,
+        channels: rendered_range.channels as usize,
+        sample_rate: rendered_range.sample_rate,
+        timeline_start_sample: range_start,
+    };
+    // The final render still needs the mixed audio on disk for the ffmpeg-step (only
+    // when the user clicks Process / when this isn't plan_only). Defer that until we
+    // know we're not in plan_only mode.
+    if !plan_only.unwrap_or(false) {
+        audio::render_mix(&project.session, &audio_path)?;
+    }
     emit_agent_progress(
         &app,
         &started,
@@ -1410,7 +1528,7 @@ pub async fn render_agent_video_edit(
     );
     let temp_dir = state.config.data_dir.join("agent-video-edit").join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&temp_dir).map_err(|error| format!("Could not prepare agent frame cache: {error}"))?;
-    let (segments, script) = build_agent_edit_segments(
+    let (segments, script, agent_look_preset, agent_color_grade) = build_agent_edit_segments(
         &app,
         &started,
         &video_inputs,
@@ -1430,7 +1548,7 @@ pub async fn render_agent_video_edit(
         emit_agent_progress(&app, &started, "fallback", &format!("Vision agent failed; using automatic cuts. {error}"), 0, total_windows);
         let segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
         let script = build_fallback_agent_script(&video_inputs, &segments, range_start, range_end, total_windows, project.session.sample_rate, &error);
-        (segments, script)
+        (segments, script, None, None)
     });
     let _ = fs::remove_dir_all(&temp_dir);
     if segments.is_empty() {
@@ -1440,18 +1558,26 @@ pub async fn render_agent_video_edit(
 
     if plan_only.unwrap_or(false) {
         emit_agent_progress(&app, &started, "done", "Plan ready for review.", total_windows, total_windows);
-        return Ok(AgentVideoEditResponse { path: String::new(), script });
+        return Ok(AgentVideoEditResponse { path: String::new(), script, look_preset: agent_look_preset, color_grade: agent_color_grade });
     }
 
     emit_agent_progress(&app, &started, "audio", "Using analyzed mix audio for video export...", total_windows, total_windows);
-    emit_agent_progress(&app, &started, "rendering", &format!("Rendering {} selected cuts to MP4...", segments.len()), total_windows, total_windows);
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &path, None)
+    // Prefer the free-form color grade when present (richer than a named preset).
+    // Fall back to the named preset if the model only voted that.
+    let grade_filter = agent_color_grade.as_ref().and_then(build_color_grade_filter);
+    let look_label = if grade_filter.is_some() {
+        agent_color_grade.as_ref().and_then(|g| g.name.clone()).unwrap_or_else(|| "custom grade".to_string())
+    } else {
+        agent_look_preset.as_ref().map(|preset| format!("{:?}", preset)).unwrap_or_else(|| "no grade".to_string())
+    };
+    emit_agent_progress(&app, &started, "rendering", &format!("Rendering {} selected cuts to MP4 ({look_label})...", segments.len()), total_windows, total_windows);
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &path, agent_look_preset.clone(), grade_filter)
         .map_err(|error| {
             emit_agent_progress(&app, &started, "error", "ffmpeg failed while rendering the agent edit.", total_windows, total_windows);
             error
         })?;
     emit_agent_progress(&app, &started, "done", "Agent Video Edit complete.", total_windows, total_windows);
-    Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script })
+    Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script, look_preset: agent_look_preset, color_grade: agent_color_grade })
 }
 
 /// Render a sequence of edit segments (each picking one source clip for a time span)
@@ -1466,6 +1592,9 @@ fn render_segments_ffmpeg(
     range_end: u64,
     output_path: &Path,
     look_override: Option<crate::model::VideoFilterPreset>,
+    // Free-form ffmpeg filter chain (already built by build_color_grade_filter, so
+    // every segment is clamped & safe). Wraps the final [v] output. None = no grade.
+    color_grade_filter: Option<String>,
 ) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
@@ -1481,7 +1610,18 @@ fn render_segments_ffmpeg(
         .arg("-i")
         .arg(audio_path);
 
-    let filter = build_auto_edit_filter(video_inputs, segments, session, range_start, range_end, look_override);
+    let base_filter = build_auto_edit_filter(video_inputs, segments, session, range_start, range_end, look_override);
+    // If the agent emitted a custom grade, append it to the chain by renaming the
+    // last [v] to [vraw] and feeding it through the grade filter to produce [v].
+    let filter = match color_grade_filter {
+        Some(chain) if !chain.is_empty() => {
+            let mut s = base_filter.replace("[v]", "[vraw]");
+            s.push(';');
+            s.push_str(&format!("[vraw]{chain},format=yuv420p[v]"));
+            s
+        }
+        _ => base_filter,
+    };
     command
         .arg("-filter_complex")
         .arg(filter)
@@ -1584,6 +1724,7 @@ pub fn render_video_from_script(
     end_sample: Option<u64>,
     script: Vec<AgentVideoScriptEntry>,
     look_preset: Option<crate::model::VideoFilterPreset>,
+    color_grade: Option<AgentColorGrade>,
 ) -> Result<RenderFromScriptResponse, String> {
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
     let full_end = session_duration_samples(&project.session);
@@ -1614,7 +1755,8 @@ pub fn render_video_from_script(
     let audio_path = renders_dir.join(format!("{session_id}.video-edit.wav"));
     audio::render_mix(&project.session, &audio_path)?;
     let output_path = renders_dir.join(format!("agent-edit-{}.mp4", uuid::Uuid::new_v4()));
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset)?;
+    let grade_filter = color_grade.as_ref().and_then(build_color_grade_filter);
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset, grade_filter)?;
 
     let duration_ms = (((range_end.saturating_sub(range_start)) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64;
     Ok(RenderFromScriptResponse {
@@ -1637,6 +1779,7 @@ pub fn rerender_agent_edit(
     end_sample: Option<u64>,
     script: Vec<AgentVideoScriptEntry>,
     look_preset: Option<crate::model::VideoFilterPreset>,
+    color_grade: Option<AgentColorGrade>,
 ) -> Result<MixProject, String> {
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
     let full_end = session_duration_samples(&project.session);
@@ -1668,7 +1811,8 @@ pub fn rerender_agent_edit(
     let audio_path = renders_dir.join(format!("{session_id}.video-edit.wav"));
     audio::render_mix(&project.session, &audio_path)?;
     let output_path = renders_dir.join(format!("rerender-{}.mp4", uuid::Uuid::new_v4()));
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset)?;
+    let grade_filter = color_grade.as_ref().and_then(build_color_grade_filter);
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset, grade_filter)?;
 
     let duration_ms = (((range_end.saturating_sub(range_start)) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64;
     let updated = state
@@ -1934,7 +2078,278 @@ fn default_video_layout(index: usize) -> VideoLayout {
     layout
 }
 
-fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_start: u64, range_end: u64) -> String {
+/// Pick a default look + color grade by scanning the user's instructions for known
+/// style keywords. Runs BEFORE the per-window vision calls and seeds the pipeline so
+/// the user gets a real grade even when the model is too conservative to emit one.
+/// The vision model can still override per-window. Match is case-insensitive and on
+/// whole-word boundaries via simple substring on a lowercase copy — good enough for
+/// chat-style prompts. Returns (preset, grade) where either may be None.
+pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFilterPreset>, Option<AgentColorGrade>) {
+    use crate::model::VideoFilterPreset;
+    let t = text.to_lowercase();
+    let has = |needle: &str| t.contains(needle);
+    let mut preset: Option<VideoFilterPreset> = None;
+    let mut name_parts: Vec<&'static str> = Vec::new();
+    // Build a grade by accumulating per-keyword nudges. Multiple keywords compound.
+    let mut brightness: Option<f32> = None;
+    let mut contrast: Option<f32> = None;
+    let mut saturation: Option<f32> = None;
+    let mut gamma: Option<f32> = None;
+    let mut rr: Option<f32> = None;
+    let mut gg: Option<f32> = None;
+    let mut bb: Option<f32> = None;
+    let mut vignette: Option<f32> = None;
+    let mut sharpen: Option<f32> = None;
+    let mut blur: Option<f32> = None;
+    let mut grain: Option<f32> = None;
+    let mut hue_shift: Option<f32> = None;
+
+    // Macro looks (preset + grade defaults).
+    if has("cinema") || has("cinematic") || has("epic") || has("film") || has("movie") || has("blockbuster") {
+        preset = Some(VideoFilterPreset::Cinema);
+        name_parts.push("epic cinema");
+        contrast = Some(1.12);
+        saturation = Some(1.04);
+        rr = Some(1.08); gg = Some(0.96); bb = Some(0.88); // mild teal-orange
+        vignette = Some(0.22);
+        sharpen = Some(0.45);
+        grain = Some(1.5);
+    }
+    if has("teal") || has("teal-and-orange") || has("teal and orange") {
+        preset = Some(VideoFilterPreset::Cinema);
+        rr = Some(rr.unwrap_or(1.0).max(1.10));
+        bb = Some(bb.unwrap_or(1.0).min(0.85));
+        name_parts.push("teal-and-orange");
+    }
+    if has("warm") || has("sunset") || has("golden hour") {
+        preset = preset.or(Some(VideoFilterPreset::Warm));
+        rr = Some(rr.unwrap_or(1.0).max(1.06));
+        bb = Some(bb.unwrap_or(1.0).min(0.94));
+        name_parts.push("warm");
+    }
+    if has("golden") {
+        preset = Some(VideoFilterPreset::Golden);
+        rr = Some(1.10); gg = Some(1.02); bb = Some(0.82);
+        saturation = Some(saturation.unwrap_or(1.0).max(1.10));
+        name_parts.push("golden");
+    }
+    if has("cool") || has("blue") || has("icy") {
+        preset = preset.or(Some(VideoFilterPreset::Cool));
+        rr = Some(rr.unwrap_or(1.0).min(0.94));
+        bb = Some(bb.unwrap_or(1.0).max(1.08));
+        name_parts.push("cool");
+    }
+    if has("cold") {
+        preset = Some(VideoFilterPreset::Cold);
+        rr = Some(0.84); gg = Some(0.95); bb = Some(1.16);
+        name_parts.push("cold");
+    }
+    if has("mono") || has("black and white") || has("b&w") || has("grayscale") || has("greyscale") {
+        preset = Some(VideoFilterPreset::Mono);
+        saturation = Some(0.0);
+        name_parts.push("monochrome");
+    }
+    if has("noir") {
+        preset = Some(VideoFilterPreset::Noir);
+        saturation = Some(0.0);
+        contrast = Some(contrast.unwrap_or(1.0).max(1.28));
+        name_parts.push("noir");
+    }
+    if has("punch") || has("vibrant") || has("punchy") {
+        preset = preset.or(Some(VideoFilterPreset::Punch));
+        contrast = Some(contrast.unwrap_or(1.0).max(1.14));
+        saturation = Some(saturation.unwrap_or(1.0).max(1.14));
+        name_parts.push("punchy");
+    }
+    if has("dream") || has("soft") {
+        preset = preset.or(Some(VideoFilterPreset::Dream));
+        blur = Some(1.0);
+        brightness = Some(brightness.unwrap_or(0.0) + 0.04);
+        saturation = Some(saturation.unwrap_or(1.0).min(0.92));
+        name_parts.push("dreamy");
+    }
+    if has("moody") || has("dark") || has("serious") {
+        preset = preset.or(Some(VideoFilterPreset::Moody));
+        brightness = Some(brightness.unwrap_or(0.0) - 0.05);
+        contrast = Some(contrast.unwrap_or(1.0).max(1.16));
+        saturation = Some(saturation.unwrap_or(1.0).min(0.88));
+        name_parts.push("moody");
+    }
+    if has("vintage") || has("retro") {
+        preset = preset.or(Some(VideoFilterPreset::Vintage));
+        contrast = Some(0.94);
+        saturation = Some(0.70);
+        rr = Some(rr.unwrap_or(1.0).max(1.06));
+        gg = Some(gg.unwrap_or(1.0).min(0.98));
+        bb = Some(bb.unwrap_or(1.0).min(0.86));
+        grain = Some(grain.unwrap_or(0.0).max(3.0));
+        name_parts.push("vintage");
+    }
+
+    // Modifier knobs — words that nudge the grade without choosing a preset.
+    if has("bright") || has("brighter") || has("more white") || has("whiter") || has("lifted") {
+        brightness = Some(brightness.unwrap_or(0.0) + 0.05);
+        gamma = Some(gamma.unwrap_or(1.0).max(1.05));
+        name_parts.push("brighter");
+    }
+    if has("dim") || has("darker") || has("dimmer") {
+        brightness = Some(brightness.unwrap_or(0.0) - 0.05);
+        name_parts.push("darker");
+    }
+    if has("clear") || has("clearer") || has("sharp") || has("sharper") || has("crisp") {
+        sharpen = Some(sharpen.unwrap_or(0.0).max(0.6));
+        name_parts.push("crisp");
+    }
+    if has("desaturat") || has("muted") || has("faded") {
+        saturation = Some(saturation.unwrap_or(1.0).min(0.75));
+        name_parts.push("desaturated");
+    }
+    if has("vibrant") || has("colorful") || has("colourful") {
+        saturation = Some(saturation.unwrap_or(1.0).max(1.18));
+    }
+    if has("vignette") {
+        vignette = Some(vignette.unwrap_or(0.0).max(0.30));
+    }
+    if has("grain") || has("film grain") {
+        grain = Some(grain.unwrap_or(0.0).max(3.0));
+    }
+    if has("hue shift") {
+        hue_shift = Some(20.0);
+    }
+
+    let nothing_set =
+        brightness.is_none() && contrast.is_none() && saturation.is_none() && gamma.is_none()
+        && rr.is_none() && gg.is_none() && bb.is_none() && vignette.is_none()
+        && sharpen.is_none() && blur.is_none() && grain.is_none() && hue_shift.is_none();
+    if nothing_set && preset.is_none() {
+        return (None, None);
+    }
+    let name = if name_parts.is_empty() { None } else { Some(name_parts.join(" + ")) };
+    let reason = if name_parts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Inferred from instruction keywords ({}) — vision model may refine these per window.",
+            name_parts.join(", ")
+        ))
+    };
+    let rgb_mix = if rr.is_some() || gg.is_some() || bb.is_some() {
+        Some(RgbMix { rr, gg, bb })
+    } else { None };
+    let grade = AgentColorGrade {
+        name,
+        reason,
+        brightness, contrast, saturation, gamma,
+        rgb_mix,
+        hue_shift, vignette, blur, sharpen, grain,
+    };
+    let grade = if build_color_grade_filter(&grade).is_some() { Some(grade) } else { None };
+    (preset, grade)
+}
+
+/// Build a safe ffmpeg filter chain from the agent's free-form color-grade
+/// parameters. Every field is clamped to a vetted range and any NaN/inf is
+/// dropped. Returns None when the grade has nothing meaningful set (so the
+/// caller can skip the `-vf`/post-process step entirely).
+pub fn build_color_grade_filter(grade: &AgentColorGrade) -> Option<String> {
+    fn clamp_finite(value: Option<f32>, lo: f32, hi: f32) -> Option<f32> {
+        let v = value?;
+        if !v.is_finite() { return None; }
+        Some(v.clamp(lo, hi))
+    }
+    let brightness = clamp_finite(grade.brightness, -0.5, 0.5);
+    let contrast = clamp_finite(grade.contrast, 0.4, 2.0);
+    let saturation = clamp_finite(grade.saturation, 0.0, 2.5);
+    let gamma = clamp_finite(grade.gamma, 0.5, 1.8);
+    let hue_shift = clamp_finite(grade.hue_shift, -180.0, 180.0);
+    let vignette = clamp_finite(grade.vignette, 0.0, 1.0);
+    let blur = clamp_finite(grade.blur, 0.0, 8.0);
+    let sharpen = clamp_finite(grade.sharpen, 0.0, 2.0);
+    let grain = clamp_finite(grade.grain, 0.0, 30.0);
+    let rgb = grade.rgb_mix.as_ref().map(|m| (
+        clamp_finite(m.rr, 0.4, 1.6),
+        clamp_finite(m.gg, 0.4, 1.6),
+        clamp_finite(m.bb, 0.4, 1.6),
+    ));
+    let mut parts: Vec<String> = Vec::new();
+    // eq: only emit fields that actually move the picture.
+    let has_eq = brightness.is_some() || contrast.is_some() || saturation.is_some() || gamma.is_some();
+    if has_eq {
+        let b = brightness.unwrap_or(0.0);
+        let c = contrast.unwrap_or(1.0);
+        let s = saturation.unwrap_or(1.0);
+        let g = gamma.unwrap_or(1.0);
+        parts.push(format!("eq=brightness={b:.3}:contrast={c:.3}:saturation={s:.3}:gamma={g:.3}"));
+    }
+    if let Some((rr, gg, bb)) = rgb {
+        if rr.is_some() || gg.is_some() || bb.is_some() {
+            parts.push(format!(
+                "colorchannelmixer=rr={:.3}:gg={:.3}:bb={:.3}",
+                rr.unwrap_or(1.0), gg.unwrap_or(1.0), bb.unwrap_or(1.0)
+            ));
+        }
+    }
+    if let Some(h) = hue_shift { if h.abs() >= 0.5 { parts.push(format!("hue=h={h:.2}")); } }
+    if let Some(v) = vignette { if v >= 0.05 {
+        // Map 0..1 to ffmpeg's angle param 0..PI/3 — gentle range.
+        let angle = (v as f64) * std::f64::consts::FRAC_PI_3;
+        parts.push(format!("vignette=angle={angle:.4}"));
+    }}
+    if let Some(b) = blur { if b >= 0.5 { parts.push(format!("gblur=sigma={b:.2}")); } }
+    if let Some(s) = sharpen { if s >= 0.05 {
+        // unsharp: positive amount sharpens. 5x5 luma matrix, mild chroma.
+        parts.push(format!("unsharp=5:5:{:.2}:5:5:0.0", s));
+    }}
+    if let Some(g) = grain { if g >= 0.5 { parts.push(format!("noise=alls={g:.1}:allf=t")); } }
+    if parts.is_empty() { None } else { Some(parts.join(",")) }
+}
+
+/// Map a preset name string (as returned by the agent vision model) to a
+/// VideoFilterPreset variant. Returns None for "none" or anything unrecognized.
+fn parse_video_filter_preset(name: &str) -> Option<crate::model::VideoFilterPreset> {
+    use crate::model::VideoFilterPreset;
+    match name.trim().to_lowercase().as_str() {
+        "warm" => Some(VideoFilterPreset::Warm),
+        "cool" => Some(VideoFilterPreset::Cool),
+        "mono" => Some(VideoFilterPreset::Mono),
+        "punch" => Some(VideoFilterPreset::Punch),
+        "dream" => Some(VideoFilterPreset::Dream),
+        "cinema" => Some(VideoFilterPreset::Cinema),
+        "noir" => Some(VideoFilterPreset::Noir),
+        "moody" => Some(VideoFilterPreset::Moody),
+        "vintage" => Some(VideoFilterPreset::Vintage),
+        "golden" => Some(VideoFilterPreset::Golden),
+        "cold" => Some(VideoFilterPreset::Cold),
+        _ => None,
+    }
+}
+
+/// Compute the target (width, height) for a letterbox/pillarbox fit so the W×H
+/// source canvas fits inside a box with the requested aspect, without cropping.
+/// Returns None for "original" or unknown values.
+fn aspect_target_box(out_w: i32, out_h: i32, aspect: Option<&str>) -> Option<(i32, i32)> {
+    let aspect = aspect?;
+    let (t_w, t_h) = match aspect {
+        "square" => {
+            let side = out_w.max(out_h);
+            (side, side)
+        }
+        // 9:16 portrait: enlarge whichever dimension is needed so the box ratio is exactly 9/16.
+        "portrait916" => {
+            let cand_h_from_w = (out_w as f64 * 16.0 / 9.0).ceil() as i32;
+            if cand_h_from_w >= out_h {
+                (out_w, cand_h_from_w)
+            } else {
+                let cand_w_from_h = (out_h as f64 * 9.0 / 16.0).ceil() as i32;
+                (cand_w_from_h, out_h)
+            }
+        }
+        _ => return None,
+    };
+    Some((even_dimension(t_w), even_dimension(t_h)))
+}
+
+fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_start: u64, range_end: u64, aspect: Option<&str>) -> String {
     let sample_rate = session.sample_rate;
     let canvas = &session.video_canvas;
     let reference_w = canvas.width.clamp(240, 3840) as i32;
@@ -2001,7 +2416,14 @@ fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_sta
         ));
     }
     filter.push(';');
-    filter.push_str(&format!("[base{}]format=yuv420p[v]", clips.len()));
+    if let Some((t_w, t_h)) = aspect_target_box(output_w, output_h, aspect) {
+        filter.push_str(&format!(
+            "[base{}]scale={t_w}:{t_h}:force_original_aspect_ratio=decrease,pad={t_w}:{t_h}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p[v]",
+            clips.len()
+        ));
+    } else {
+        filter.push_str(&format!("[base{}]format=yuv420p[v]", clips.len()));
+    }
     filter
 }
 
@@ -2222,6 +2644,7 @@ fn build_fallback_agent_script(
     script
 }
 
+#[allow(dead_code)] // Kept as a fallback path that reads the rendered WAV from disk.
 fn load_rendered_audio_analysis(path: &Path) -> Result<RenderedAudioAnalysis, String> {
     let mut reader = hound::WavReader::open(path).map_err(|error| format!("Could not open rendered mix audio: {error}"))?;
     let spec = reader.spec();
@@ -2250,6 +2673,7 @@ fn load_rendered_audio_analysis(path: &Path) -> Result<RenderedAudioAnalysis, St
         samples,
         channels,
         sample_rate: spec.sample_rate,
+        timeline_start_sample: 0,
     })
 }
 
@@ -2270,10 +2694,15 @@ fn audio_features_for_window(
         };
     };
     let frame_count = analysis.samples.len() / analysis.channels.max(1);
-    let start_frame = ((window_start as f64 / session_sample_rate as f64) * analysis.sample_rate as f64)
+    // Subtract the analysis's timeline offset so a range-render (which starts at
+    // sample range_start, not 0) still lines up with timeline-space window samples.
+    let offset = analysis.timeline_start_sample;
+    let local_start = window_start.saturating_sub(offset);
+    let local_end = window_end.saturating_sub(offset);
+    let start_frame = ((local_start as f64 / session_sample_rate as f64) * analysis.sample_rate as f64)
         .round()
         .clamp(0.0, frame_count as f64) as usize;
-    let end_frame = ((window_end as f64 / session_sample_rate as f64) * analysis.sample_rate as f64)
+    let end_frame = ((local_end as f64 / session_sample_rate as f64) * analysis.sample_rate as f64)
         .round()
         .clamp(start_frame as f64, frame_count as f64) as usize;
     if end_frame <= start_frame {
@@ -2369,10 +2798,28 @@ async fn build_agent_edit_segments(
     instructions: Option<&str>,
     audio_analysis: Option<&RenderedAudioAnalysis>,
     temp_dir: &Path,
-) -> Result<(Vec<AutoEditSegment>, Vec<AgentVideoScriptEntry>), String> {
+) -> Result<(Vec<AutoEditSegment>, Vec<AgentVideoScriptEntry>, Option<crate::model::VideoFilterPreset>, Option<AgentColorGrade>), String> {
     let sample_rate = session.sample_rate;
     let mut segments: Vec<AutoEditSegment> = Vec::new();
     let mut script = Vec::new();
+    // Each window's vision call also returns a `look_preset` derived from the user
+    // instructions. We tally votes and pick the most common non-"none" preset for the
+    // whole render. Windows with no instruction-driven preference vote "none".
+    let mut look_votes: HashMap<String, u32> = HashMap::new();
+    // First non-empty custom color grade from any window. All windows see the same
+    // user instructions, so the first response is just as informed as the last.
+    let mut first_color_grade: Option<AgentColorGrade> = None;
+    // Deterministic keyword pre-detection — picks a default look + grade from the
+    // user's text BEFORE we hit the vision model. The model can override per window
+    // (its votes go into look_votes and first_color_grade above) but if it doesn't,
+    // we fall back to this so the user always sees a real grade when they asked for one.
+    let (keyword_look, keyword_grade) = match instructions {
+        Some(text) if !text.is_empty() => infer_look_from_instructions(text),
+        _ => (None, None),
+    };
+    if let Some(preset) = keyword_look.as_ref() {
+        *look_votes.entry(format!("{:?}", preset).to_lowercase()).or_insert(0) += 1;
+    }
     let mut cursor = range_start;
     let total_windows = range_end.saturating_sub(range_start).div_ceil(interval_samples).max(1) as u32;
     let mut window_index = 0_u32;
@@ -2488,14 +2935,46 @@ async fn build_agent_edit_segments(
             app,
             started,
             "vision",
-            &format!("Stage 1/2: analyzing frames and audio for window {window_index}/{total_windows}..."),
+            &format!("Analyzing frames and deciding edit for window {window_index}/{total_windows}..."),
             window_index,
             total_windows,
         );
-        let frame_analysis = analyze_agent_window_frames(base_url, vision_model, &labels, images, instructions)
+        let previous_label = previous_input_index
+            .and_then(|previous| labels.iter().position(|(input_index, _)| *input_index == previous))
+            .map(|index| index + 1);
+        // Merged describe+decide call: one HTTP roundtrip per window instead of two.
+        // We still skip the LLM entirely when there's only one readable angle.
+        let merged = if image_count >= 2 {
+            analyze_and_decide_window(
+                base_url,
+                vision_model,
+                &labels,
+                images,
+                &audio_features,
+                previous_label,
+                consecutive_same,
+                instructions,
+            )
             .await
-            .ok();
-        if let Some(angle_labels) = frame_analysis.as_ref().and_then(|analysis| analysis.candidate_labels.as_ref()) {
+            .ok()
+        } else {
+            Some(AgentMergedChoice {
+                candidate_labels: None,
+                candidate_notes: None,
+                window_summary: Some("Single available angle.".into()),
+                choice: 1,
+                decision: Some("cut".into()),
+                reason: Some("Only one readable camera angle was available for this window.".into()),
+                edit_intent: Some("single available angle".into()),
+                continuity_plan: Some("Use the only available readable shot.".into()),
+                look_preset: None,
+                color_grade: None,
+            })
+        };
+        // `edit_model` is unused now that vision + decide are merged into one
+        // vision-model call. Keep the parameter so existing callers don't break.
+        let _ = edit_model;
+        if let Some(angle_labels) = merged.as_ref().and_then(|m| m.candidate_labels.as_ref()) {
             for (candidate, angle_label) in candidates.iter_mut().zip(angle_labels.iter()) {
                 let angle_label = angle_label.trim();
                 if !angle_label.is_empty() {
@@ -2503,7 +2982,7 @@ async fn build_agent_edit_segments(
                 }
             }
         }
-        if let Some(notes) = frame_analysis.as_ref().and_then(|analysis| analysis.candidate_notes.as_ref()) {
+        if let Some(notes) = merged.as_ref().and_then(|m| m.candidate_notes.as_ref()) {
             for (candidate, note) in candidates.iter_mut().zip(notes.iter()) {
                 let note = note.trim();
                 if !note.is_empty() {
@@ -2511,46 +2990,34 @@ async fn build_agent_edit_segments(
                 }
             }
         }
-        let frame_summary = frame_analysis
+        let frame_summary = merged
             .as_ref()
-            .and_then(|analysis| analysis.window_summary.as_deref())
+            .and_then(|m| m.window_summary.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("No visual summary returned.");
-        emit_agent_progress(
-            app,
-            started,
-            "decision",
-            &format!("Stage 2/2: deciding edit point for window {window_index}/{total_windows}..."),
-            window_index,
-            total_windows,
-        );
-        let previous_label = previous_input_index
-            .and_then(|previous| labels.iter().position(|(input_index, _)| *input_index == previous))
-            .map(|index| index + 1);
-        let model_choice = if image_count >= 2 {
-            decide_agent_shot(
-                base_url,
-                edit_model,
-                &labels,
-                &candidates,
-                &audio_features,
-                frame_summary,
-                previous_label,
-                consecutive_same,
-                instructions,
-            )
-                .await
-                .ok()
-        } else {
-            Some(AgentShotChoice {
-                choice: 1,
-                decision: Some("cut".into()),
-                reason: Some("Only one readable camera angle was available for this window.".into()),
-                edit_intent: Some("single available angle".into()),
-                continuity_plan: Some("Use the only available readable shot.".into()),
-            })
-        };
+        let model_choice = merged.as_ref().map(|m| AgentShotChoice {
+            choice: m.choice,
+            decision: m.decision.clone(),
+            reason: m.reason.clone(),
+            edit_intent: m.edit_intent.clone(),
+            continuity_plan: m.continuity_plan.clone(),
+        });
+        if let Some(preset_name) = merged.as_ref().and_then(|m| m.look_preset.as_deref()) {
+            let normalized = preset_name.trim().to_lowercase();
+            if !normalized.is_empty() {
+                *look_votes.entry(normalized).or_insert(0) += 1;
+            }
+        }
+        if first_color_grade.is_none() {
+            if let Some(grade) = merged.as_ref().and_then(|m| m.color_grade.clone()) {
+                // Only adopt the grade if it would actually produce a filter — skip
+                // empty/neutral objects the model emits when no look is requested.
+                if build_color_grade_filter(&grade).is_some() {
+                    first_color_grade = Some(grade);
+                }
+            }
+        }
         let model_requested_hold = model_choice
             .as_ref()
             .and_then(|choice| choice.decision.as_deref())
@@ -2807,21 +3274,36 @@ async fn build_agent_edit_segments(
         }
         cursor = next;
     }
-    Ok((segments, script))
+    // Pick the most-voted preset. "none" is a vote against any grade; we only return
+    // a real preset when a non-"none" choice wins (or ties for first by ordering).
+    // Falls back to the keyword pre-detection when the model votes "none" everywhere.
+    let chosen_look = look_votes
+        .iter()
+        .filter(|(name, _)| name.as_str() != "none")
+        .max_by_key(|(_, count)| *count)
+        .and_then(|(name, _)| parse_video_filter_preset(name))
+        .or(keyword_look);
+    // Same fallback for the free-form grade: prefer what the model actually emitted,
+    // otherwise use the deterministic grade derived from instruction keywords.
+    let chosen_grade = first_color_grade.or(keyword_grade);
+    Ok((segments, script, chosen_look, chosen_grade))
 }
 
 fn extract_video_frame(clip: &VideoRenderClip, sample: u64, session: &MixSession, output_path: &Path) -> Result<(), String> {
     let sample_rate = session.sample_rate;
     let source_offset = clip.source_offset_ms as f64 / 1000.0
         + sample.saturating_sub(clip.start_sample) as f64 / sample_rate as f64;
-    let canvas = &session.video_canvas;
-    let output_w = even_dimension(canvas.width.clamp(240, 3840) as i32);
-    let output_h = even_dimension(canvas.height.clamp(240, 3840) as i32);
-    let background = ffmpeg_color(&canvas.background);
-    let (x, y) = centered_layout_position(&clip.layout, output_w, output_h);
-    let suffix = layout_processing_suffix(&clip.layout, output_w, output_h);
+    // Build a slim thumbnail for the vision model: apply the user's crop (so the agent
+    // sees the same framing it'll render to), scale to max 512 px on the long edge,
+    // and write a lower-quality JPEG. The full render uses the full pipeline; vision
+    // analysis does not need the canvas-sized image.
+    let layout = normalized_video_layout(&clip.layout);
+    let crop_w = (1.0 - ((layout.crop_left + layout.crop_right).min(90.0) / 100.0)).max(0.05);
+    let crop_h = (1.0 - ((layout.crop_top + layout.crop_bottom).min(90.0) / 100.0)).max(0.05);
+    let crop_x = (layout.crop_left / 100.0).clamp(0.0, 0.9);
+    let crop_y = (layout.crop_top / 100.0).clamp(0.0, 0.9);
     let filter = format!(
-        "[0:v]setpts=PTS-STARTPTS{suffix}[clip];[1:v][clip]overlay={x}:{y}:eof_action=pass,format=yuv420p[v]"
+        "crop=iw*{crop_w:.5}:ih*{crop_h:.5}:iw*{crop_x:.5}:ih*{crop_y:.5},scale=512:512:force_original_aspect_ratio=decrease"
     );
     let output = Command::new("ffmpeg")
         .arg("-y")
@@ -2832,18 +3314,12 @@ fn extract_video_frame(clip: &VideoRenderClip, sample: u64, session: &MixSession
         .arg(format!("{source_offset:.3}"))
         .arg("-i")
         .arg(&clip.path)
-        .arg("-f")
-        .arg("lavfi")
-        .arg("-i")
-        .arg(format!("color=c={background}:s={output_w}x{output_h}:d=1"))
-        .arg("-filter_complex")
+        .arg("-vf")
         .arg(filter)
-        .arg("-map")
-        .arg("[v]")
         .arg("-frames:v")
         .arg("1")
         .arg("-q:v")
-        .arg("3")
+        .arg("8") // 1..31, higher = lower quality. 8 is small + clearly readable.
         .arg(output_path)
         .output()
         .map_err(|error| format!("Could not extract video frame: {error}"))?;
@@ -2873,6 +3349,7 @@ fn candidate_note_rejects_dynamic_cut(note: &str) -> bool {
     .any(|term| note.contains(term))
 }
 
+#[allow(dead_code)] // superseded by analyze_and_decide_window (single-call agent path)
 async fn analyze_agent_window_frames(
     base_url: &str,
     model: &str,
@@ -2905,6 +3382,7 @@ async fn analyze_agent_window_frames(
         .map_err(|error| format!("Could not parse frame analysis response: {error}"))
 }
 
+#[allow(dead_code)] // superseded by analyze_and_decide_window (single-call agent path)
 async fn decide_agent_shot(
     base_url: &str,
     model: &str,
@@ -2970,6 +3448,68 @@ async fn decide_agent_shot(
     Ok(choice)
 }
 
+/// Single-call replacement for `analyze_agent_window_frames` + `decide_agent_shot`.
+/// Asks the vision model to describe the frames *and* pick the best image in one
+/// prompt. Cuts wall-clock time roughly in half because we skip one HTTP roundtrip
+/// and one prompt-prefill per window. The decision rules are the same as the
+/// Stage-2 prompt, just folded into the Stage-1 prompt.
+async fn analyze_and_decide_window(
+    base_url: &str,
+    model: &str,
+    labels: &[(usize, String)],
+    images: Vec<String>,
+    audio_features: &AgentAudioWindowFeatures,
+    previous_label: Option<usize>,
+    consecutive_same: u32,
+    instructions: Option<&str>,
+) -> Result<AgentMergedChoice, String> {
+    let label_text = labels
+        .iter()
+        .enumerate()
+        .map(|(index, (_, label))| format!("{} = {label}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let continuity_note = previous_label
+        .map(|label| format!(
+            "Previous chosen image number was {label}, held for {consecutive_same} consecutive edit window(s). You may HOLD it if alternatives don't justify a cut, but after 3+ held windows actively prefer a readable alternate for dynamics."
+        ))
+        .unwrap_or_else(|| "No previous shot has been chosen yet.".to_string());
+    let instruction_note = instructions
+        .map(|value| format!("User edit instructions (treat as creative guidelines unless they force a black/unusable shot):\n{value}\n"))
+        .unwrap_or_else(|| "User edit instructions: none.\n".to_string());
+    let audio_text = audio_features_text(audio_features);
+    let prompt = format!(
+        "You are a multicam editor. Look at each simultaneous camera frame and pick the strongest one for this edit window, in one pass.\n\
+         {instruction_note}\
+         Images are in this order:\n{label_text}\n\
+         Audio features: {audio_text}\n\
+         {continuity_note}\n\
+         For each image, derive a short angle label (e.g. \"wide room\", \"overhead/top-down\", \"face/profile\", \"guitar hands\", \"fretboard close-up\", \"keyboard hands\", \"drums\", \"dark/weak\", \"blocked/unclear\") and a concrete 8-14 word visual note using framing, face/eyes, hands, instrument, gesture, motion, focus, exposure, occlusion, and uniqueness. Never write the literal phrase \"concrete note\".\n\
+         Then pick the best image. CUT only when the new shot creates a coherent edit: meaningfully different angle, better detail, face/reaction, clearer action, sensible pacing change. HOLD when changing would feel arbitrary. Use audio to support pacing: loud/high-transient sections can justify cuts; quiet sections favor holds unless the alternate is clearly better.\n\
+         Also design a color grade that fits the user's instructions for the whole edit. Choose either a named preset (`look_preset`) and/or a custom `color_grade` with numeric parameters. Use the custom grade when the user asks for something specific (\"epic cinematic teal-and-orange\", \"sunny warm summer\", \"dreamy faded film\", etc.). Be expressive — sum the parameters into a real grade, don't default to neutral.\n\
+         Named presets you may use: none, warm, cool, mono, punch, dream, cinema, noir, moody, vintage, golden, cold. Map: cinematic/epic/film->cinema; teal-and-orange/blockbuster->cinema with custom rgbMix (rr>1, bb<1); warm/sunset->warm or golden; cool/teal->cool; b&w->mono; punchy->punch; dreamy->dream; dark/serious->moody; retro->vintage; icy->cold; noir->noir.\n\
+         Custom grade fields (ALL optional, ALL numeric, ranges clamped server-side):\n\
+         - brightness: -0.5..0.5 (0 = unchanged)\n\
+         - contrast: 0.4..2.0 (1 = unchanged)\n\
+         - saturation: 0..2.5 (1 = unchanged, 0 = grayscale)\n\
+         - gamma: 0.5..1.8 (1 = unchanged)\n\
+         - rgbMix: {{rr, gg, bb}} each 0.4..1.6 (1 = unchanged). For teal+orange: rr~1.1, gg~0.95, bb~0.85. For cool: rr~0.9, bb~1.15.\n\
+         - hueShift: -180..180 degrees (0 = unchanged)\n\
+         - vignette: 0..1 (subtle darkening at edges)\n\
+         - blur: 0..8 (sigma; >0.5 visibly softens)\n\
+         - sharpen: 0..2 (0.5 = mild, 1.5 = strong)\n\
+         - grain: 0..30 (subtle film grain)\n\
+         If the user gave no look direction, use \"look_preset\": \"none\" and omit color_grade.\n\
+         For the color_grade.reason field, write 1-2 sentences mapping the user's exact words to the parameters you picked: e.g., \"You asked for epic/cinematic so I lifted contrast to 1.12 and warmed the highlights via rgbMix rr=1.10. The 'brighter, clearer' note pushed brightness +0.05 and sharpen 0.6.\" Be concrete about which word drove which knob.\n\
+         Reply only as JSON with this exact shape:\n\
+         {{\"window_summary\": \"one sentence summarizing the available visual choices\", \"candidate_labels\": [\"label1\", \"label2\"], \"candidate_notes\": [\"Image 1 note\", \"Image 2 note\"], \"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"hold continuity | wide context | hands detail | face/reaction | motion accent | pacing variation\", \"reason\": \"one specific sentence using visual + audio evidence\", \"continuity_plan\": \"how this supports the surrounding edit\", \"look_preset\": \"none|warm|cool|mono|punch|dream|cinema|noir|moody|vintage|golden|cold\", \"color_grade\": {{\"name\": \"epic cinema\", \"reason\": \"1-2 sentences mapping the user's words to these knobs\", \"brightness\": 0.0, \"contrast\": 1.12, \"saturation\": 1.05, \"gamma\": 1.0, \"rgbMix\": {{\"rr\": 1.10, \"gg\": 0.96, \"bb\": 0.85}}, \"hueShift\": 0, \"vignette\": 0.25, \"blur\": 0, \"sharpen\": 0.4, \"grain\": 2}}}}"
+    );
+    let parsed = call_ollama_chat(base_url, model, prompt, Some(images)).await?;
+    let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
+    serde_json::from_str::<AgentMergedChoice>(&extracted)
+        .map_err(|error| format!("Could not parse merged agent decision: {error}"))
+}
+
 async fn call_ollama_chat(
     base_url: &str,
     model: &str,
@@ -3008,48 +3548,41 @@ fn build_auto_edit_filter(
     range_end: u64,
     look_override: Option<crate::model::VideoFilterPreset>,
 ) -> String {
+    // We build ONE canvas the length of the entire range and overlay each segment at
+    // its timeline PTS, gated by `enable='between(t,...)'`. This is the same pattern
+    // build_video_filter uses for multicam and crucially avoids the audio/video drift
+    // caused by concatenating per-segment streams whose durations don't snap to the
+    // frame grid (with fps=30 and segment durations in arbitrary seconds, every cut
+    // adds a fractional-frame rounding error that compounds against the audio).
     let canvas = &session.video_canvas;
     let output_w = even_dimension(canvas.width.clamp(240, 3840) as i32);
     let output_h = even_dimension(canvas.height.clamp(240, 3840) as i32);
     let background = ffmpeg_color(&canvas.background);
-    let mut filter = String::new();
-    let mut concat_labels = Vec::new();
-    let mut timeline_cursor = range_start;
-    let mut part_index = 0_usize;
+    let sample_rate = session.sample_rate as f64;
+    let total_duration = ((range_end.saturating_sub(range_start)) as f64 / sample_rate).max(0.001);
     let mut sorted_segments = segments.iter().collect::<Vec<_>>();
     sorted_segments.sort_by_key(|segment| segment.timeline_start);
 
+    let mut filter = format!(
+        "color=c={background}:s={output_w}x{output_h}:d={total_duration:.3},setsar=1,fps=30[base0]"
+    );
+    let mut overlay_count = 0_usize;
     for segment in sorted_segments {
         let segment_start = segment.timeline_start.max(range_start).min(range_end);
         let segment_end = segment.timeline_end.max(range_start).min(range_end);
         if segment_end <= segment_start {
             continue;
         }
-        if segment_start > timeline_cursor {
-            let duration = segment_start.saturating_sub(timeline_cursor) as f64 / session.sample_rate as f64;
-            if !filter.is_empty() {
-                filter.push(';');
-            }
-            filter.push_str(&format!(
-                "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,fps=30,format=yuv420p[v{part_index}]"
-            ));
-            concat_labels.push(format!("[v{part_index}]"));
-            part_index += 1;
-            timeline_cursor = segment_start;
-        }
-        let effective_start = segment_start.max(timeline_cursor);
-        if segment_end <= effective_start {
-            continue;
-        }
         let clip = &clips[segment.input_index];
-        let duration = segment_end.saturating_sub(effective_start) as f64 / session.sample_rate as f64;
+        let timeline_offset = (segment_start.saturating_sub(range_start) as f64 / sample_rate).max(0.0);
+        let duration = (segment_end.saturating_sub(segment_start) as f64 / sample_rate).max(1.0 / 30.0);
         let source_offset = segment.source_offset_ms as f64 / 1000.0
-            + effective_start.saturating_sub(segment.timeline_start) as f64 / session.sample_rate as f64;
+            + (segment_start.saturating_sub(segment.timeline_start) as f64 / sample_rate);
         // A cut-style edit shows one camera at a time, so each shot fills the whole canvas.
         // Force the box to full-frame (drop the picture-in-picture position/size used for the
-        // multi-cam composition) but KEEP the per-track crop (the user's framing, e.g. cropping
-        // the face out), rotation (to un-flip cameras) and color grading. The kept (cropped)
-        // region is then scaled to cover the whole canvas.
+        // multi-cam composition) but KEEP the per-track crop (the user's framing), rotation
+        // (to un-flip cameras) and color grading. The kept (cropped) region is then scaled
+        // to cover the whole canvas.
         let mut fill_layout = clip.layout.clone();
         fill_layout.x = 0.0;
         fill_layout.y = 0.0;
@@ -3063,42 +3596,26 @@ fn build_auto_edit_filter(
         }
         let (x, y) = centered_layout_position(&fill_layout, output_w, output_h);
         let suffix = layout_processing_suffix(&fill_layout, output_w, output_h);
-        if !filter.is_empty() {
-            filter.push(';');
-        }
+        let clip_label = format!("clip{overlay_count}");
+        // Normalise the source's frame rate first — webcam captures often report bogus
+        // r_frame_rate values (e.g. 600/1) which propagate through trim and confuse timing.
+        // setpts shifts the clip's PTS to its absolute timeline position so the overlay's
+        // `enable='between(t,...)'` window picks it up at exactly the right moment.
+        filter.push(';');
         filter.push_str(&format!(
-            // Normalise the source's frame rate first — webcam captures often report bogus
-            // r_frame_rate values (e.g. 600/1) which propagate through trim and confuse the
-            // concat timing, producing stuttery/slow playback.
-            "[{}:v]fps=30,trim=start={source_offset:.3}:duration={duration:.3},setpts=PTS-STARTPTS{suffix}[clip{part_index}];color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1[base{part_index}];[base{part_index}][clip{part_index}]overlay={x}:{y}:eof_action=pass,fps=30,format=yuv420p[v{part_index}]",
-            segment.input_index
+            "[{input}:v]fps=30,trim=start={source_offset:.3}:duration={duration:.3},setpts=PTS-STARTPTS+{timeline_offset:.3}/TB{suffix}[{clip_label}]",
+            input = segment.input_index,
         ));
-        concat_labels.push(format!("[v{part_index}]"));
-        part_index += 1;
-        timeline_cursor = segment_end;
-    }
-    if range_end > timeline_cursor {
-        let duration = range_end.saturating_sub(timeline_cursor) as f64 / session.sample_rate as f64;
-        if !filter.is_empty() {
-            filter.push(';');
-        }
+        let next_base = overlay_count + 1;
+        let segment_end_seconds = timeline_offset + duration;
+        filter.push(';');
         filter.push_str(&format!(
-            "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,fps=30,format=yuv420p[v{part_index}]"
+            "[base{overlay_count}][{clip_label}]overlay={x}:{y}:enable='between(t,{timeline_offset:.3},{segment_end_seconds:.3})':eof_action=pass[base{next_base}]"
         ));
-        concat_labels.push(format!("[v{part_index}]"));
-        part_index += 1;
-    }
-    if filter.is_empty() {
-        let duration = range_end.saturating_sub(range_start) as f64 / session.sample_rate as f64;
-        filter.push_str(&format!(
-            "color=c={background}:s={output_w}x{output_h}:d={duration:.3},setsar=1,fps=30,format=yuv420p[v0]"
-        ));
-        concat_labels.push("[v0]".to_string());
-        part_index = 1;
+        overlay_count += 1;
     }
     filter.push(';');
-    filter.push_str(&concat_labels.join(""));
-    filter.push_str(&format!("concat=n={part_index}:v=1:a=0[v]"));
+    filter.push_str(&format!("[base{overlay_count}]format=yuv420p[v]"));
     filter
 }
 

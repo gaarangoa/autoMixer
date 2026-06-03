@@ -464,6 +464,62 @@ button:disabled {
   color: #d9f7e8;
 }
 
+/* Click-to-apply preset chips for the agent video edit. Active chip is highlighted; clicking re-renders. */
+.look-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid #1f2832;
+}
+.look-picker-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8a98a8;
+  margin-right: 4px;
+}
+.look-chip {
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid #34404c;
+  border-radius: 999px;
+  background: #171f28;
+  color: #d8e0e8;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.look-chip:hover:not(:disabled) {
+  background: #202a35;
+}
+.look-chip.active {
+  border-color: #ffd166;
+  background: #2a2418;
+  color: #ffd166;
+}
+.look-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Aspect-ratio picker next to the Export MP4 buttons (Original / 1:1 / 9:16). */
+.aspect-select {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid #34404c;
+  border-radius: 6px;
+  background: #171f28;
+  color: #d8e0e8;
+  font-size: 12px;
+  font-weight: 600;
+}
+.aspect-select:disabled {
+  opacity: 0.55;
+}
+
 .video-editor-actions button:disabled,
 .video-editor-chat-form button:disabled {
   opacity: 0.45;

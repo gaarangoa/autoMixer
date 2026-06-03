@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Camera, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, Square, Trash2, Upload, Video } from "lucide-react";
-import type { AbJudgeResponse, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
+import type { AbJudgeResponse, AgentColorGrade, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { api } from "./api";
+import { api, type ExportAspect } from "./api";
 
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "gpt-oss:20b";
@@ -166,7 +166,7 @@ export function App() {
   const [newDraft, setNewDraft] = useState<string | null>(null);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; message: string; elapsedSeconds: number } | null>(null);
   const [videoEditorOpen, setVideoEditorOpen] = useState(false);
-  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("1");
+  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("2");
   const [agentVideoModel, setAgentVideoModel] = useState(() => initialAgentVideoModelRef.current ?? DEFAULT_AGENT_VIDEO_MODEL);
   const [agentVideoEditModel, setAgentVideoEditModel] = useState(() => initialAgentVideoEditModelRef.current ?? initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
   const [agentVideoInstructions, setAgentVideoInstructions] = useState(() => initialAgentVideoInstructionsRef.current ?? "");
@@ -175,6 +175,14 @@ export function App() {
   const [agentEditScript, setAgentEditScript] = useState<AgentVideoScriptEntry[]>([]);
   const [agentEditContext, setAgentEditContext] = useState<{ trackId: string; clipId: string; sourceTrackIds: string[] } | null>(null);
   const [agentEditLook, setAgentEditLook] = useState<VideoFilterPreset>("none");
+  // Custom color grade the agent emits from user instructions ("epic cinematic teal-and-orange",
+  // "dreamy faded film"...). Takes priority over the Look chip during renders. Cleared when
+  // the user clicks a Look chip so the chip override is honored.
+  const [agentColorGrade, setAgentColorGrade] = useState<AgentColorGrade | null>(null);
+  // Final-export aspect ratio. "original" copies bytes / keeps current canvas size;
+  // "square" letterboxes into 1:1; "portrait916" into 9:16 (phone). Used by both
+  // Export MP4 buttons (main + editor). Black bars fill the padding.
+  const [exportAspect, setExportAspect] = useState<ExportAspect>("original");
   // The plan the agent produced from the last Send. The user reviews/edits it then
   // clicks Process to actually render. Null = no plan pending.
   const [agentPlan, setAgentPlan] = useState<AgentVideoScriptEntry[] | null>(null);
@@ -2286,7 +2294,7 @@ export function App() {
     if (!outputPath) return;
     setBusy(true);
     try {
-      await api.renderVideoMix(session.id, outputPath, range?.startSample, range?.endSample, selectedVideoTrackIds);
+      await api.renderVideoMix(session.id, outputPath, range?.startSample, range?.endSample, selectedVideoTrackIds, exportAspect);
       const rangeText = range ? ` (${formatTime(range.startSample / session.sampleRate)}-${formatTime(range.endSample / session.sampleRate)})` : "";
       setMessages((items) => [...items, { role: "system", text: `Rendered ${selectedVideoTrackIds.length} selected video track${selectedVideoTrackIds.length === 1 ? "" : "s"}${rangeText} ${outputPath}` }]);
     } catch (error) {
@@ -2377,9 +2385,17 @@ export function App() {
         endSample: range?.endSample,
         intervalSeconds: sampleIntervalSeconds,
       });
+      // Agent inferred a color look from instructions ("cinematic", "moody", etc.).
+      // Sync the chip so the Process render applies it, and tell the user about it.
+      if (result.lookPreset && result.lookPreset !== "none") {
+        setAgentEditLook(result.lookPreset);
+      }
+      // Custom free-form grade (preferred over the preset on the render side).
+      setAgentColorGrade(result.colorGrade ?? null);
+      const planSummary = summarizeAgentPlan(result.script, result.lookPreset, result.colorGrade);
       setVideoChatMessages((items) => [...items, {
         role: "agent",
-        text: `Planned ${result.script.length} shots${rangeText}. Review the plan and click Process to render.`,
+        text: `Planned ${result.script.length} shots${rangeText}.\n\n${planSummary}\n\nReview the plan and click Process to render.`,
         createdAt: new Date().toISOString(),
       }]);
       setAgentEditStatus(`Plan ready — ${result.script.length} shots. Review and click Process.`);
@@ -2415,6 +2431,8 @@ export function App() {
         agentPlanContext.startSample,
         agentPlanContext.endSample,
         agentPlan,
+        agentEditLook && agentEditLook !== "none" ? agentEditLook : undefined,
+        agentColorGrade ?? undefined,
       );
       const existingTrack = agentEditContext
         ? session.tracks.find((track) => track.id === agentEditContext.trackId)
@@ -2517,7 +2535,7 @@ export function App() {
     });
     if (!outputPath) return;
     try {
-      const result = await api.exportRenderedVideo(sourcePath, outputPath);
+      const result = await api.exportRenderedVideo(sourcePath, outputPath, exportAspect);
       pushSystem(`Saved ${result.path}`);
     } catch (error) {
       pushSystem(error);
@@ -2828,6 +2846,17 @@ export function App() {
                 <button type="button" onClick={() => void openCameraPreviewWindow(buildCameraPreviewTracks(), true)} disabled={selectedVideoTracksForEditor.length === 0}>
                   Show Canvas Preview
                 </button>
+                <select
+                  className="aspect-select"
+                  value={exportAspect}
+                  onChange={(event) => setExportAspect(event.target.value as ExportAspect)}
+                  title="Output aspect ratio for export (black bars added; source not cropped)"
+                  disabled={busy}
+                >
+                  <option value="original">Original</option>
+                  <option value="square">Square 1:1</option>
+                  <option value="portrait916">Portrait 9:16</option>
+                </select>
                 <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
                   <Download size={15} /> Export MP4
                 </button>
@@ -3552,6 +3581,28 @@ export function App() {
                   </div>
                 )}
               </div>
+              {/* Look picker: click a preset to re-render the agent edit with that color grade.
+                  No-op when there's no edit yet. Active preset has the "active" class. */}
+              <div className="look-picker">
+                <span className="look-picker-label">Look</span>
+                {(["none","warm","cool","mono","punch","dream","cinema","noir","moody","vintage","golden","cold"] as VideoFilterPreset[]).map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    className={`look-chip${agentEditLook === preset ? " active" : ""}`}
+                    onClick={() => {
+                      setAgentEditLook(preset);
+                      // Clicking a chip means "use this preset, not the agent's custom grade".
+                      setAgentColorGrade(null);
+                      if (agentEditContext && agentEditScript.length > 0) void rerenderEdit(preset);
+                    }}
+                    disabled={busy}
+                    title={agentEditContext ? `Re-render the current edit with the ${preset} look` : "Run the agent once first"}
+                  >
+                    {preset === "none" ? "Original" : preset[0].toUpperCase() + preset.slice(1)}
+                  </button>
+                ))}
+              </div>
               <div className="assistant-video-preview-meta">
                 <span>
                   {assistantVideoPreviewClip
@@ -3560,6 +3611,17 @@ export function App() {
                       ? `${formatTime(videoEditorStartSeconds)}-${formatTime(videoEditorEndSeconds)}`
                       : "Full timeline"}
                 </span>
+                <select
+                  className="aspect-select"
+                  value={exportAspect}
+                  onChange={(event) => setExportAspect(event.target.value as ExportAspect)}
+                  title="Output aspect ratio (black bars added; source not cropped)"
+                  disabled={busy}
+                >
+                  <option value="original">Original</option>
+                  <option value="square">Square 1:1</option>
+                  <option value="portrait916">Portrait 9:16</option>
+                </select>
                 <button
                   type="button"
                   onClick={() => void downloadAgentEdit()}
@@ -3850,6 +3912,73 @@ export function App() {
       ) : null}
     </main>
   );
+}
+
+// Build a human-readable summary of the agent's edit plan from its script entries.
+// Collapses consecutive windows that picked the same camera into one "shot" line so the
+// user sees the visual structure (which cameras, in what order, for how long) rather
+// than per-window noise. Returns markdown-ish text suitable for the chat bubble.
+function summarizeAgentPlan(script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade | null): string {
+  if (!script.length) return "No shots planned.";
+  type Shot = { trackName: string; startSeconds: number; endSeconds: number; windowCount: number; sampleReason?: string; sampleIntent?: string };
+  const shots: Shot[] = [];
+  for (const entry of script) {
+    const name = entry.chosenTrackName ?? (entry.decision === "black" ? "(no camera — black)" : "(unknown)");
+    const last = shots[shots.length - 1];
+    if (last && last.trackName === name) {
+      last.endSeconds = entry.endSeconds;
+      last.windowCount += 1;
+    } else {
+      // Pull a one-shot rationale: prefer a short fragment after "for " in the reason,
+      // or the model's edit-intent line from dataProvided. Best-effort, no failure mode.
+      const intentLine = entry.dataProvided.find((line) => line.startsWith("Edit intent:"))?.replace(/^Edit intent:\s*/, "");
+      shots.push({
+        trackName: name,
+        startSeconds: entry.startSeconds,
+        endSeconds: entry.endSeconds,
+        windowCount: 1,
+        sampleReason: entry.reason || undefined,
+        sampleIntent: intentLine,
+      });
+    }
+  }
+  // Show the agent's custom grade when present (richer than the preset name); otherwise
+  // fall back to the named preset; otherwise note that no look was applied.
+  let lookLine: string;
+  if (colorGrade) {
+    const gradeBits: string[] = [];
+    if (colorGrade.contrast != null) gradeBits.push(`contrast ${colorGrade.contrast.toFixed(2)}`);
+    if (colorGrade.saturation != null) gradeBits.push(`saturation ${colorGrade.saturation.toFixed(2)}`);
+    if (colorGrade.brightness != null && colorGrade.brightness !== 0) gradeBits.push(`brightness ${colorGrade.brightness.toFixed(2)}`);
+    if (colorGrade.gamma != null && colorGrade.gamma !== 1) gradeBits.push(`gamma ${colorGrade.gamma.toFixed(2)}`);
+    if (colorGrade.rgbMix) {
+      const { rr, gg, bb } = colorGrade.rgbMix;
+      const mix = [rr, gg, bb].filter((v) => v != null).map((v) => v!.toFixed(2)).join(" / ");
+      if (mix) gradeBits.push(`RGB ${mix}`);
+    }
+    if (colorGrade.hueShift != null && Math.abs(colorGrade.hueShift) >= 1) gradeBits.push(`hue ${colorGrade.hueShift.toFixed(0)}°`);
+    if (colorGrade.vignette != null && colorGrade.vignette > 0.05) gradeBits.push(`vignette ${colorGrade.vignette.toFixed(2)}`);
+    if (colorGrade.blur != null && colorGrade.blur > 0.5) gradeBits.push(`blur ${colorGrade.blur.toFixed(1)}`);
+    if (colorGrade.sharpen != null && colorGrade.sharpen > 0.05) gradeBits.push(`sharpen ${colorGrade.sharpen.toFixed(2)}`);
+    if (colorGrade.grain != null && colorGrade.grain > 0.5) gradeBits.push(`grain ${colorGrade.grain.toFixed(1)}`);
+    const gradeName = colorGrade.name?.trim() || lookPreset || "custom";
+    const params = gradeBits.length ? gradeBits.join(", ") : "neutral parameters";
+    const rationale = colorGrade.reason?.trim();
+    lookLine = rationale
+      ? `Look: ${gradeName} (custom grade) — ${params}.\nWhy: ${rationale}`
+      : `Look: ${gradeName} (custom grade) — ${params}.`;
+  } else if (lookPreset && lookPreset !== "none") {
+    lookLine = `Look: ${lookPreset} — applied as a global color grade on the final render.`;
+  } else {
+    lookLine = `Look: none — no color grade applied (override with a Look chip if you want one).`;
+  }
+  const shotLines = shots.map((shot, index) => {
+    const duration = Math.max(0, shot.endSeconds - shot.startSeconds);
+    const detail = shot.sampleIntent ? ` (${shot.sampleIntent})` : "";
+    return `${index + 1}. ${shot.trackName} ${formatTime(shot.startSeconds)}–${formatTime(shot.endSeconds)} (${duration.toFixed(1)}s)${detail}`;
+  });
+  const head = `${lookLine}\n\nVisual plan — ${shots.length} shot${shots.length === 1 ? "" : "s"}:`;
+  return [head, ...shotLines].join("\n");
 }
 
 // Pick "nice" tick marks (1/2/5/10/15/30/60... seconds) so the ruler shows ~6-10 labels.
@@ -4193,13 +4322,16 @@ export function VideoEditorWindowApp() {
   const [selectedRange, setSelectedRange] = useState<{ start: number; end: number } | undefined>(initialPayloadRef.current?.range);
   const [playhead, setPlayhead] = useState(initialPayloadRef.current?.playhead ?? 0);
   const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
-  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("1");
+  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("2");
   const [agentVideoModel, setAgentVideoModel] = useState(() => initialAgentVideoModelRef.current ?? DEFAULT_AGENT_VIDEO_MODEL);
   const [agentVideoEditModel, setAgentVideoEditModel] = useState(() => initialAgentVideoEditModelRef.current ?? initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
   const [agentVideoInstructions, setAgentVideoInstructions] = useState(() => initialAgentVideoInstructionsRef.current ?? "");
   const [agentEditProgress, setAgentEditProgress] = useState<{ stage: string; message: string; current: number; total: number; elapsedSeconds: number } | null>(null);
   const [agentEditScript, setAgentEditScript] = useState<AgentVideoScriptEntry[]>([]);
   const [mainVideoEdit, setMainVideoEdit] = useState<MainVideoEdit>({ script: [] });
+  // Export aspect ratio for the editor window (separate state from the main App).
+  // "original" copies bytes; "square"/"portrait916" reencode with letterbox/pillarbox.
+  const [exportAspect, setExportAspect] = useState<ExportAspect>("original");
   const [programPlaying, setProgramPlaying] = useState(false);
   const [programPreviewSize, setProgramPreviewSize] = useState<"small" | "medium" | "large">("medium");
   const [videoEditHistory, setVideoEditHistory] = useState<VideoEditHistoryItem[]>([]);
@@ -4513,7 +4645,7 @@ export function VideoEditorWindowApp() {
     setBusy(true);
     try {
       if (mainVideoEdit.outputPath) {
-        const result = await api.exportRenderedVideo(mainVideoEdit.outputPath, outputPath);
+        const result = await api.exportRenderedVideo(mainVideoEdit.outputPath, outputPath, exportAspect);
         setStatus(`Exported Main video ${result.path}`);
       } else {
         const trackIds = selectedVideoTrackIds();
@@ -4522,7 +4654,7 @@ export function VideoEditorWindowApp() {
           return;
         }
         const range = renderRangeSamples();
-        await api.renderVideoMix(session.id, outputPath, range?.startSample, range?.endSample, trackIds);
+        await api.renderVideoMix(session.id, outputPath, range?.startSample, range?.endSample, trackIds, exportAspect);
         setStatus(`Rendered raw selected tracks ${outputPath}`);
       }
     } catch (error) {
@@ -4691,6 +4823,17 @@ export function VideoEditorWindowApp() {
             <button type="button" onClick={() => void openCameraPreview()} disabled={selectedTracks.length === 0}>
               Show Canvas Preview
             </button>
+            <select
+              className="aspect-select"
+              value={exportAspect}
+              onChange={(event) => setExportAspect(event.target.value as ExportAspect)}
+              title="Output aspect ratio for export (black bars added; source not cropped)"
+              disabled={busy}
+            >
+              <option value="original">Original</option>
+              <option value="square">Square 1:1</option>
+              <option value="portrait916">Portrait 9:16</option>
+            </select>
             <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedTracks.length === 0}>
               <Download size={15} /> Export MP4
             </button>
