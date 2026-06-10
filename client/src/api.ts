@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AbJudgeResponse, AgentColorGrade, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog, VideoFilterPreset } from "../../shared/types";
+import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog, VideoFilterPreset } from "../../shared/types";
 
 function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {
@@ -16,6 +16,10 @@ export type AgentVideoProgressEvent = { stage: string; message: string; current:
 export type LlmChunkEvent = { phase: string; text: string };
 export type LlmStatsEvent = { phase: string; promptTokens: number; responseTokens: number; elapsedMs: number };
 export type ExportAspect = "original" | "square" | "portrait916";
+// "fast" copies the preview cache or transcodes with -preset veryfast. "high" uses
+// -preset slow -crf 17 -b:a 320k. When a script is present, "high" also re-renders
+// from the original camera sources instead of copying the preview cache.
+export type ExportQuality = "fast" | "high";
 
 export const api = {
   config: () => tauriInvoke<{ ollamaBaseUrl: string; ollamaModel: string }>("get_config"),
@@ -77,18 +81,22 @@ export const api = {
   renderMix: (sessionId: string, outputPath: string) => tauriInvoke<{ path: string }>("render_mix", { sessionId, outputPath }),
   saveVideoRecording: (sessionId: string, trackId: string, fileName: string, mimeType: string, startSample: number, durationMs: number, dataBase64: string, createAudioTrack = false, sourceOffsetMs = 0) =>
     tauriInvoke<MixProject>("save_video_recording", { sessionId, trackId, fileName, mimeType, startSample, durationMs, dataBase64, createAudioTrack, sourceOffsetMs }),
-  renderVideoMix: (sessionId: string, outputPath: string, startSample?: number, endSample?: number, trackIds?: string[], aspectRatio?: ExportAspect) =>
-    tauriInvoke<{ path: string }>("render_video_mix", { sessionId, outputPath, startSample, endSample, trackIds, aspectRatio }),
-  exportRenderedVideo: (sourcePath: string, outputPath: string, aspectRatio?: ExportAspect) =>
-    tauriInvoke<{ path: string }>("export_rendered_video", { sourcePath, outputPath, aspectRatio }),
+  renderVideoMix: (sessionId: string, outputPath: string, startSample?: number, endSample?: number, trackIds?: string[], aspectRatio?: ExportAspect, quality?: ExportQuality) =>
+    tauriInvoke<{ path: string }>("render_video_mix", { sessionId, outputPath, startSample, endSample, trackIds, aspectRatio, quality }),
+  exportRenderedVideo: (sourcePath: string, outputPath: string, aspectRatio?: ExportAspect, quality?: ExportQuality) =>
+    tauriInvoke<{ path: string }>("export_rendered_video", { sourcePath, outputPath, aspectRatio, quality }),
   renderAutoVideoEdit: (sessionId: string, outputPath: string, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number) =>
     tauriInvoke<{ path: string }>("render_auto_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds }),
   renderAgentVideoEdit: (sessionId: string, outputPath: string | undefined, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number, ollamaBaseUrl: string, visionModel: string, editModel: string, instructions: string, planOnly?: boolean) =>
-    tauriInvoke<{ path: string; script: AgentVideoScriptEntry[]; lookPreset?: VideoFilterPreset; colorGrade?: AgentColorGrade }>("render_agent_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds, ollamaBaseUrl, visionModel, editModel, instructions, planOnly }),
-  renderVideoFromScript: (sessionId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade) =>
-    tauriInvoke<{ path: string; durationMs: number }>("render_video_from_script", { sessionId, sourceTrackIds, startSample, endSample, script, lookPreset, colorGrade }),
-  rerenderAgentEdit: (sessionId: string, trackId: string, clipId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade) =>
-    tauriInvoke<MixProject>("rerender_agent_edit", { sessionId, trackId, clipId, sourceTrackIds, startSample, endSample, script, lookPreset, colorGrade }),
+    tauriInvoke<{ path: string; script: AgentVideoScriptEntry[]; lookPreset?: VideoFilterPreset; colorGrade?: AgentColorGrade; videoEffects?: AgentVideoEffects }>("render_agent_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds, ollamaBaseUrl, visionModel, editModel, instructions, planOnly }),
+  applyClipEffects: (sessionId: string, trackId: string, clipId: string, instructions: string, ollamaBaseUrl?: string, visionModel?: string) =>
+    tauriInvoke<{ project: MixProject; lookPreset?: VideoFilterPreset; colorGrade?: AgentColorGrade; videoEffects?: AgentVideoEffects; sourceSummary: string }>("apply_clip_effects", { sessionId, trackId, clipId, instructions, ollamaBaseUrl, visionModel }),
+  revertClipVideo: (sessionId: string, trackId: string, clipId: string) =>
+    tauriInvoke<MixProject>("revert_clip_video", { sessionId, trackId, clipId }),
+  renderVideoFromScript: (sessionId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade, videoEffects?: AgentVideoEffects, quality?: ExportQuality) =>
+    tauriInvoke<{ path: string; durationMs: number }>("render_video_from_script", { sessionId, sourceTrackIds, startSample, endSample, script, lookPreset, colorGrade, videoEffects, quality }),
+  rerenderAgentEdit: (sessionId: string, trackId: string, clipId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade, videoEffects?: AgentVideoEffects) =>
+    tauriInvoke<MixProject>("rerender_agent_edit", { sessionId, trackId, clipId, sourceTrackIds, startSample, endSample, script, lookPreset, colorGrade, videoEffects }),
   fitCanvasToFootage: (sessionId: string) => tauriInvoke<MixProject>("fit_canvas_to_footage", { sessionId }),
   judgeMixAb: (sessionId: string, apiKey: string, model = "gemini-flash-latest") =>
     tauriInvoke<AbJudgeResponse>("judge_mix_ab", { sessionId, options: { provider: "gemini", model, apiKey } }),

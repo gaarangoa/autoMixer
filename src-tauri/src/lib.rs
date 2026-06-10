@@ -134,6 +134,8 @@ pub fn run() {
             commands::export_rendered_video,
             commands::render_auto_video_edit,
             commands::render_agent_video_edit,
+            commands::apply_clip_effects,
+            commands::revert_clip_video,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AutoMixer");

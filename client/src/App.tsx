@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Camera, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, Square, Trash2, Upload, Video } from "lucide-react";
-import type { AbJudgeResponse, AgentColorGrade, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
+import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { api, type ExportAspect } from "./api";
+import { api, type ExportAspect, type ExportQuality } from "./api";
 
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "gpt-oss:20b";
@@ -179,10 +179,17 @@ export function App() {
   // "dreamy faded film"...). Takes priority over the Look chip during renders. Cleared when
   // the user clicks a Look chip so the chip override is honored.
   const [agentColorGrade, setAgentColorGrade] = useState<AgentColorGrade | null>(null);
+  // Whole-edit video effects (fade in/out, speed). Persists across Process/re-render so
+  // a fade you asked for via Send is still honored when you tweak the Look chip.
+  const [agentVideoEffects, setAgentVideoEffects] = useState<AgentVideoEffects | null>(null);
   // Final-export aspect ratio. "original" copies bytes / keeps current canvas size;
   // "square" letterboxes into 1:1; "portrait916" into 9:16 (phone). Used by both
   // Export MP4 buttons (main + editor). Black bars fill the padding.
   const [exportAspect, setExportAspect] = useState<ExportAspect>("original");
+  // Export encoder quality. "high" re-renders from camera sources with
+  // -preset slow -crf 17 -b:a 320k (visually lossless, much slower). "fast" reuses
+  // the preview cache (-preset veryfast). Default high so quality is the default.
+  const [exportQuality, setExportQuality] = useState<ExportQuality>("high");
   // The plan the agent produced from the last Send. The user reviews/edits it then
   // clicks Process to actually render. Null = no plan pending.
   const [agentPlan, setAgentPlan] = useState<AgentVideoScriptEntry[] | null>(null);
@@ -2294,7 +2301,7 @@ export function App() {
     if (!outputPath) return;
     setBusy(true);
     try {
-      await api.renderVideoMix(session.id, outputPath, range?.startSample, range?.endSample, selectedVideoTrackIds, exportAspect);
+      await api.renderVideoMix(session.id, outputPath, range?.startSample, range?.endSample, selectedVideoTrackIds, exportAspect, exportQuality);
       const rangeText = range ? ` (${formatTime(range.startSample / session.sampleRate)}-${formatTime(range.endSample / session.sampleRate)})` : "";
       setMessages((items) => [...items, { role: "system", text: `Rendered ${selectedVideoTrackIds.length} selected video track${selectedVideoTrackIds.length === 1 ? "" : "s"}${rangeText} ${outputPath}` }]);
     } catch (error) {
@@ -2392,7 +2399,8 @@ export function App() {
       }
       // Custom free-form grade (preferred over the preset on the render side).
       setAgentColorGrade(result.colorGrade ?? null);
-      const planSummary = summarizeAgentPlan(result.script, result.lookPreset, result.colorGrade);
+      setAgentVideoEffects(result.videoEffects ?? null);
+      const planSummary = summarizeAgentPlan(result.script, result.lookPreset, result.colorGrade, result.videoEffects);
       setVideoChatMessages((items) => [...items, {
         role: "agent",
         text: `Planned ${result.script.length} shots${rangeText}.\n\n${planSummary}\n\nReview the plan and click Process to render.`,
@@ -2433,6 +2441,7 @@ export function App() {
         agentPlan,
         agentEditLook && agentEditLook !== "none" ? agentEditLook : undefined,
         agentColorGrade ?? undefined,
+        agentVideoEffects ?? undefined,
       );
       const existingTrack = agentEditContext
         ? session.tracks.find((track) => track.id === agentEditContext.trackId)
@@ -2498,6 +2507,11 @@ export function App() {
         range?.endSample,
         agentEditScript,
         look && look !== "none" ? look : undefined,
+        // Clicking a Look chip clears the agent's custom grade (handled at the chip
+        // onClick), so we don't pass colorGrade here. Effects persist across chip
+        // changes — a requested fade-in should still apply when the user tries Cinema.
+        undefined,
+        agentVideoEffects ?? undefined,
       );
       setProject(updated);
       setAgentEditStatus("Re-rendered the edit.");
@@ -2535,8 +2549,31 @@ export function App() {
     });
     if (!outputPath) return;
     try {
-      const result = await api.exportRenderedVideo(sourcePath, outputPath, exportAspect);
-      pushSystem(`Saved ${result.path}`);
+      // High-quality path: if we still have the agent edit's script + context, re-render
+      // from the original camera sources with -preset slow -crf 17 -b:a 320k, then route
+      // the new high-q file through the aspect transcoder. Otherwise fall back to copying
+      // the preview cache (can't make a lossy cache lossless after the fact).
+      const canHQRender = exportQuality === "high"
+        && agentEditContext
+        && agentEditScript.length > 0
+        && agentPlanContext;
+      let intermediateSource = sourcePath;
+      if (canHQRender && agentPlanContext) {
+        const hq = await api.renderVideoFromScript(
+          session.id,
+          agentPlanContext.sourceTrackIds,
+          agentPlanContext.startSample,
+          agentPlanContext.endSample,
+          agentEditScript,
+          agentEditLook && agentEditLook !== "none" ? agentEditLook : undefined,
+          agentColorGrade ?? undefined,
+          agentVideoEffects ?? undefined,
+          "high",
+        );
+        intermediateSource = hq.path;
+      }
+      const result = await api.exportRenderedVideo(intermediateSource, outputPath, exportAspect, exportQuality);
+      pushSystem(`Saved ${result.path}${canHQRender ? " (high quality, re-rendered from sources)" : exportQuality === "high" ? " (high quality, transcoded)" : " (fast copy)"}`);
     } catch (error) {
       pushSystem(error);
     }
@@ -2600,6 +2637,18 @@ export function App() {
     setVideoChatDraft("");
   }
 
+  // Pull the focused video clip out of selectedClip — only when it points at a video
+  // track. Audio clips and ruler-range selections don't qualify; in those cases the
+  // chat falls through to the multicam agent flow.
+  const focusedVideoClip = (() => {
+    if (!session || !selectedClip) return null;
+    const track = session.tracks.find((t) => t.id === selectedClip.trackId);
+    if (!track || track.kind !== "video") return null;
+    const clip = (track.videoClips ?? []).find((c) => c.id === selectedClip.clipId);
+    if (!clip) return null;
+    return { trackId: track.id, clipId: clip.id, name: clip.name ?? track.name };
+  })();
+
   async function runAgentVideoEditFromDraft() {
     const draft = videoChatDraft.trim();
     const currentInstructions = agentVideoInstructions.trim();
@@ -2609,7 +2658,77 @@ export function App() {
       setVideoChatMessages((items) => [...items, { role: "user", text: draft, createdAt: new Date().toISOString() }]);
       setVideoChatDraft("");
     }
+    // Focused-clip mode: a single video clip is selected → apply look/effects ONLY to
+    // that clip's source range. Bypasses the multicam agent (no cuts, no frame
+    // selection). One vision call + keyword fallback. Renders in seconds.
+    if (focusedVideoClip) {
+      await applyEffectsToFocusedClip(draft || instructions);
+      return;
+    }
     await renderAgentVideoEdit(Number(agentIntervalSeconds), instructions);
+  }
+
+  // Restore the focused clip to the pristine recording stored on the first effects
+  // render. No LLM, no ffmpeg — just swaps the clip's source-id/offset back.
+  async function revertFocusedClip() {
+    if (!session || !focusedVideoClip) return;
+    setBusy(true);
+    setAgentEditStatus(`Reverting "${focusedVideoClip.name}" to original…`);
+    try {
+      const updated = await api.revertClipVideo(session.id, focusedVideoClip.trackId, focusedVideoClip.clipId);
+      setProject(updated);
+      setAgentColorGrade(null);
+      setAgentVideoEffects(null);
+      setVideoChatMessages((items) => [...items, {
+        role: "agent",
+        text: `Reverted "${focusedVideoClip.name}" to the original recording.`,
+        createdAt: new Date().toISOString(),
+      }]);
+      setAgentEditStatus(`Reverted "${focusedVideoClip.name}".`);
+    } catch (error) {
+      pushSystem(error);
+      setAgentEditStatus(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyEffectsToFocusedClip(text: string) {
+    if (!session || !focusedVideoClip) return;
+    if (!text.trim()) {
+      pushSystem("Type what you want for the focused clip (e.g. \"cinematic, fade in 1s\").");
+      return;
+    }
+    setBusy(true);
+    setAgentEditStatus(`Editing "${focusedVideoClip.name}"…`);
+    try {
+      const ollamaUrl = localStorage.getItem("autoMixer.ollamaUrl") ?? undefined;
+      const visionModel = localStorage.getItem("autoMixer.agentVideoModel") ?? undefined;
+      const result = await api.applyClipEffects(
+        session.id,
+        focusedVideoClip.trackId,
+        focusedVideoClip.clipId,
+        text,
+        ollamaUrl ?? undefined,
+        visionModel ?? undefined,
+      );
+      setProject(result.project);
+      if (result.lookPreset && result.lookPreset !== "none") setAgentEditLook(result.lookPreset);
+      setAgentColorGrade(result.colorGrade ?? null);
+      setAgentVideoEffects(result.videoEffects ?? null);
+      const summary = summarizeClipEditResult(focusedVideoClip.name, result.lookPreset, result.colorGrade, result.videoEffects, result.sourceSummary);
+      setVideoChatMessages((items) => [...items, {
+        role: "agent",
+        text: summary,
+        createdAt: new Date().toISOString(),
+      }]);
+      setAgentEditStatus(`Updated "${focusedVideoClip.name}".`);
+    } catch (error) {
+      pushSystem(error);
+      setAgentEditStatus(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   function pushSystem(error: unknown) {
@@ -2856,6 +2975,16 @@ export function App() {
                   <option value="original">Original</option>
                   <option value="square">Square 1:1</option>
                   <option value="portrait916">Portrait 9:16</option>
+                </select>
+                <select
+                  className="aspect-select"
+                  value={exportQuality}
+                  onChange={(event) => setExportQuality(event.target.value as ExportQuality)}
+                  title="Encoder quality. Hi-Q = -preset slow -crf 17 -b:a 320k (visually lossless). Fast = -preset veryfast (~3-5x faster, smaller file)."
+                  disabled={busy}
+                >
+                  <option value="high">Hi-Q (slow)</option>
+                  <option value="fast">Fast</option>
                 </select>
                 <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
                   <Download size={15} /> Export MP4
@@ -3592,12 +3721,28 @@ export function App() {
                     className={`look-chip${agentEditLook === preset ? " active" : ""}`}
                     onClick={() => {
                       setAgentEditLook(preset);
-                      // Clicking a chip means "use this preset, not the agent's custom grade".
+                      // Clicking a chip = "use this preset, not the agent's custom grade".
                       setAgentColorGrade(null);
+                      // Focused-clip mode: apply (or revert) to JUST that clip — never
+                      // touch the agent edit track. "Original" → revert the clip to its
+                      // pristine recording (no LLM, no ffmpeg).
+                      if (focusedVideoClip) {
+                        if (preset === "none") {
+                          void revertFocusedClip();
+                        } else {
+                          void applyEffectsToFocusedClip(preset);
+                        }
+                        return;
+                      }
+                      // No focused clip — re-render the multicam agent edit if one exists.
                       if (agentEditContext && agentEditScript.length > 0) void rerenderEdit(preset);
                     }}
                     disabled={busy}
-                    title={agentEditContext ? `Re-render the current edit with the ${preset} look` : "Run the agent once first"}
+                    title={focusedVideoClip
+                      ? (preset === "none"
+                          ? `Revert "${focusedVideoClip.name}" to the original recording`
+                          : `Apply ${preset} to "${focusedVideoClip.name}"`)
+                      : (agentEditContext ? `Re-render the current edit with the ${preset} look` : "Run the agent or select a clip first")}
                   >
                     {preset === "none" ? "Original" : preset[0].toUpperCase() + preset.slice(1)}
                   </button>
@@ -3621,6 +3766,16 @@ export function App() {
                   <option value="original">Original</option>
                   <option value="square">Square 1:1</option>
                   <option value="portrait916">Portrait 9:16</option>
+                </select>
+                <select
+                  className="aspect-select"
+                  value={exportQuality}
+                  onChange={(event) => setExportQuality(event.target.value as ExportQuality)}
+                  title="Encoder quality. Hi-Q re-renders from camera sources at -preset slow -crf 17 -b:a 320k (slower). Fast copies the preview cache."
+                  disabled={busy}
+                >
+                  <option value="high">Hi-Q (slow)</option>
+                  <option value="fast">Fast (copy)</option>
                 </select>
                 <button
                   type="button"
@@ -3657,6 +3812,14 @@ export function App() {
               </div>
             ) : agentEditStatus ? <div className="agent-editor-status compact">{agentEditStatus}</div> : null}
 
+            {focusedVideoClip ? (
+              <div className="focused-clip-badge">
+                <span>Editing clip: <strong>{focusedVideoClip.name}</strong></span>
+                <button type="button" onClick={() => setSelectedClip(undefined)} title="Defocus and go back to agent mode">
+                  ×
+                </button>
+              </div>
+            ) : null}
             <div className="video-history">
               {videoChatMessages.length === 0 ? (
                 <span className="video-history-empty">Prompts you send to the video agent appear here.</span>
@@ -3730,10 +3893,12 @@ export function App() {
                     void runAgentVideoEditFromDraft();
                   }
                 }}
-                placeholder="Tell the video agent what to do..."
+                placeholder={focusedVideoClip
+                  ? `Edit "${focusedVideoClip.name}" — e.g. "cinematic, fade in 1s"`
+                  : "Tell the video agent what to do..."}
               />
-              <button type="submit" className="primary" disabled={busy || selectedVideoTracksForEditor.length === 0}>
-                Send
+              <button type="submit" className="primary" disabled={busy || (!focusedVideoClip && selectedVideoTracksForEditor.length === 0)}>
+                {focusedVideoClip ? "Apply to clip" : "Send"}
               </button>
             </form>
 
@@ -3918,7 +4083,12 @@ export function App() {
 // Collapses consecutive windows that picked the same camera into one "shot" line so the
 // user sees the visual structure (which cameras, in what order, for how long) rather
 // than per-window noise. Returns markdown-ish text suitable for the chat bubble.
-function summarizeAgentPlan(script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade | null): string {
+function summarizeAgentPlan(
+  script: AgentVideoScriptEntry[],
+  lookPreset?: VideoFilterPreset,
+  colorGrade?: AgentColorGrade | null,
+  videoEffects?: AgentVideoEffects | null,
+): string {
   if (!script.length) return "No shots planned.";
   type Shot = { trackName: string; startSeconds: number; endSeconds: number; windowCount: number; sampleReason?: string; sampleIntent?: string };
   const shots: Shot[] = [];
@@ -3977,8 +4147,69 @@ function summarizeAgentPlan(script: AgentVideoScriptEntry[], lookPreset?: VideoF
     const detail = shot.sampleIntent ? ` (${shot.sampleIntent})` : "";
     return `${index + 1}. ${shot.trackName} ${formatTime(shot.startSeconds)}–${formatTime(shot.endSeconds)} (${duration.toFixed(1)}s)${detail}`;
   });
-  const head = `${lookLine}\n\nVisual plan — ${shots.length} shot${shots.length === 1 ? "" : "s"}:`;
+  // Effects line: fade in/out + speed, with the agent's rationale when present.
+  let effectsLine: string | undefined;
+  if (videoEffects) {
+    const bits: string[] = [];
+    if (videoEffects.fadeInSeconds != null && videoEffects.fadeInSeconds > 0) bits.push(`fade in ${videoEffects.fadeInSeconds.toFixed(1)}s`);
+    if (videoEffects.fadeOutSeconds != null && videoEffects.fadeOutSeconds > 0) bits.push(`fade out ${videoEffects.fadeOutSeconds.toFixed(1)}s`);
+    if (videoEffects.speedFactor != null && Math.abs(videoEffects.speedFactor - 1) >= 0.005) bits.push(`speed ${videoEffects.speedFactor.toFixed(2)}x`);
+    if (bits.length) {
+      const rationale = videoEffects.reason?.trim();
+      effectsLine = rationale
+        ? `Effects: ${bits.join(", ")}.\nWhy: ${rationale}`
+        : `Effects: ${bits.join(", ")}.`;
+    }
+  }
+  const head = effectsLine
+    ? `${lookLine}\n\n${effectsLine}\n\nVisual plan — ${shots.length} shot${shots.length === 1 ? "" : "s"}:`
+    : `${lookLine}\n\nVisual plan — ${shots.length} shot${shots.length === 1 ? "" : "s"}:`;
   return [head, ...shotLines].join("\n");
+}
+
+// Chat summary for the single-clip direct-edit path. No shot list (it's one clip);
+// shows the look name, the grade params if present, the effects, and a tag noting
+// whether each came from the vision model or the keyword detector.
+function summarizeClipEditResult(
+  clipName: string,
+  lookPreset?: VideoFilterPreset,
+  colorGrade?: AgentColorGrade | null,
+  videoEffects?: AgentVideoEffects | null,
+  sourceSummary?: string,
+): string {
+  const lines: string[] = [`Updated "${clipName}" in place.`];
+  if (colorGrade) {
+    const bits: string[] = [];
+    if (colorGrade.contrast != null) bits.push(`contrast ${colorGrade.contrast.toFixed(2)}`);
+    if (colorGrade.saturation != null) bits.push(`saturation ${colorGrade.saturation.toFixed(2)}`);
+    if (colorGrade.brightness != null && colorGrade.brightness !== 0) bits.push(`brightness ${colorGrade.brightness.toFixed(2)}`);
+    if (colorGrade.gamma != null && colorGrade.gamma !== 1) bits.push(`gamma ${colorGrade.gamma.toFixed(2)}`);
+    if (colorGrade.rgbMix) {
+      const { rr, gg, bb } = colorGrade.rgbMix;
+      const mix = [rr, gg, bb].filter((v) => v != null).map((v) => v!.toFixed(2)).join(" / ");
+      if (mix) bits.push(`RGB ${mix}`);
+    }
+    if (colorGrade.vignette != null && colorGrade.vignette > 0.05) bits.push(`vignette ${colorGrade.vignette.toFixed(2)}`);
+    if (colorGrade.sharpen != null && colorGrade.sharpen > 0.05) bits.push(`sharpen ${colorGrade.sharpen.toFixed(2)}`);
+    if (colorGrade.grain != null && colorGrade.grain > 0.5) bits.push(`grain ${colorGrade.grain.toFixed(1)}`);
+    const gradeName = colorGrade.name?.trim() || lookPreset || "custom";
+    lines.push(`Look: ${gradeName} — ${bits.length ? bits.join(", ") : "neutral"}.`);
+    if (colorGrade.reason?.trim()) lines.push(`Why: ${colorGrade.reason.trim()}`);
+  } else if (lookPreset && lookPreset !== "none") {
+    lines.push(`Look: ${lookPreset} preset.`);
+  }
+  if (videoEffects) {
+    const bits: string[] = [];
+    if (videoEffects.fadeInSeconds != null && videoEffects.fadeInSeconds > 0) bits.push(`fade in ${videoEffects.fadeInSeconds.toFixed(1)}s`);
+    if (videoEffects.fadeOutSeconds != null && videoEffects.fadeOutSeconds > 0) bits.push(`fade out ${videoEffects.fadeOutSeconds.toFixed(1)}s`);
+    if (videoEffects.speedFactor != null && Math.abs(videoEffects.speedFactor - 1) >= 0.005) bits.push(`speed ${videoEffects.speedFactor.toFixed(2)}x`);
+    if (bits.length) {
+      lines.push(`Effects: ${bits.join(", ")}.`);
+      if (videoEffects.reason?.trim()) lines.push(`Why: ${videoEffects.reason.trim()}`);
+    }
+  }
+  if (sourceSummary) lines.push(`(${sourceSummary})`);
+  return lines.join("\n");
 }
 
 // Pick "nice" tick marks (1/2/5/10/15/30/60... seconds) so the ruler shows ~6-10 labels.

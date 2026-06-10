@@ -464,6 +464,39 @@ button:disabled {
   color: #d9f7e8;
 }
 
+/* Focused-clip badge — appears above the agent chat input when a video clip is
+   selected. Click X to defocus and return to multicam agent mode. */
+.focused-clip-badge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  margin: 0 0 6px 0;
+  border: 1px solid #ffd166;
+  border-radius: 6px;
+  background: #2a2418;
+  color: #ffe49c;
+  font-size: 12px;
+}
+.focused-clip-badge strong {
+  color: #ffd166;
+}
+.focused-clip-badge button {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #ffd166;
+  font-size: 16px;
+  cursor: pointer;
+}
+.focused-clip-badge button:hover {
+  background: #3a3220;
+}
+
 /* Click-to-apply preset chips for the agent video edit. Active chip is highlighted; clicking re-renders. */
 .look-picker {
   display: flex;

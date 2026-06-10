@@ -163,6 +163,16 @@ export type AgentColorGrade = {
   grain?: number | null;
 };
 
+// Whole-edit effects (fade in/out, speed) applied after cuts + color grade.
+// Same lifecycle as the color grade: agent emits → backend renders → frontend
+// shows in the chat summary. Backend clamps every field before use.
+export type AgentVideoEffects = {
+  reason?: string | null;
+  fadeInSeconds?: number | null;
+  fadeOutSeconds?: number | null;
+  speedFactor?: number | null;
+};
+
 export type AgentVideoScriptEntry = {
   windowIndex: number;
   totalWindows: number;

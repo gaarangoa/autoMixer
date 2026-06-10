@@ -180,6 +180,9 @@ impl SessionStore {
             // The agent edit is a finished, full-frame composite — fill the canvas
             // rather than falling back to a small picture-in-picture default.
             layout: Some(VideoLayout::default()),
+            pristine_video_source_file_id: None,
+            pristine_source_offset_ms: None,
+            pristine_duration_samples: None,
         });
         project.session.source_files.push(placeholder);
         project.session.video_source_files.push(source);
@@ -219,6 +222,14 @@ impl SessionStore {
             .map_err(|error| format!("Could not store rendered video: {error}"))?;
 
         let duration_samples = ((duration_ms as f64 / 1000.0) * sample_rate as f64).round() as u64;
+        // Snapshot the pre-edit source as the pristine on the FIRST replace; later
+        // replaces leave the original snapshot alone so a revert always lands back
+        // on the raw recording, not on a previously graded version.
+        if clip.pristine_video_source_file_id.is_none() {
+            clip.pristine_video_source_file_id = Some(clip.video_source_file_id.clone());
+            clip.pristine_source_offset_ms = Some(clip.source_offset_ms);
+            clip.pristine_duration_samples = Some(clip.end_sample.saturating_sub(clip.start_sample));
+        }
         clip.video_source_file_id = source_id.clone();
         clip.source_offset_ms = 0;
         clip.end_sample = clip.start_sample + duration_samples.max(1);
@@ -235,6 +246,42 @@ impl SessionStore {
             mime_type: "video/mp4".into(),
             duration_ms,
         });
+        self.save(&project)?;
+        Ok(project)
+    }
+
+    /// Restore a video clip to its original (un-graded) recording by swapping its
+    /// source-id, offset and duration back to the pristine snapshot saved on the
+    /// first effects render. No-op if no pristine snapshot exists — meaning the
+    /// clip has never been re-rendered, so it's already the original.
+    pub fn revert_clip_to_pristine(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        clip_id: &str,
+    ) -> Result<MixProject, String> {
+        let mut project = self.get_project(session_id)?;
+        let track = project
+            .session
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| format!("Unknown track {track_id}"))?;
+        let clip = track
+            .video_clips
+            .iter_mut()
+            .find(|clip| clip.id == clip_id)
+            .ok_or_else(|| format!("Unknown video clip {clip_id}"))?;
+        let Some(pristine_id) = clip.pristine_video_source_file_id.take() else {
+            return Ok(project); // Nothing to revert.
+        };
+        let pristine_offset = clip.pristine_source_offset_ms.take().unwrap_or(0);
+        let pristine_duration = clip.pristine_duration_samples.take().unwrap_or_else(
+            || clip.end_sample.saturating_sub(clip.start_sample),
+        );
+        clip.video_source_file_id = pristine_id;
+        clip.source_offset_ms = pristine_offset;
+        clip.end_sample = clip.start_sample + pristine_duration.max(1);
         self.save(&project)?;
         Ok(project)
     }
@@ -375,6 +422,9 @@ impl SessionStore {
             end_sample: adjusted_start + duration_samples.max(1),
             source_offset_ms,
             layout: None,
+            pristine_video_source_file_id: None,
+            pristine_source_offset_ms: None,
+            pristine_duration_samples: None,
         });
         project.session.video_source_files.push(source);
         self.save(&project)?;

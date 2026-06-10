@@ -54,6 +54,30 @@ pub struct RenderResponse {
     path: String,
 }
 
+/// Response from the single-clip direct-edit path. The frontend receives the
+/// updated project (so the swapped-in clip shows up) and a description of what
+/// the agent actually applied, for the chat summary.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyClipEffectsResponse {
+    project: MixProject,
+    look_preset: Option<crate::model::VideoFilterPreset>,
+    color_grade: Option<AgentColorGrade>,
+    video_effects: Option<AgentVideoEffects>,
+    // Short label of what the source for each field was: "llm", "keywords", or "none".
+    // Lets the UI tell the user how much the vision model contributed.
+    source_summary: String,
+}
+
+/// Per-clip effects JSON returned by the single-shot vision call. All fields
+/// optional — the LLM can leave them out and we fall back to keyword detection.
+#[derive(Deserialize)]
+struct ClipEffectsChoice {
+    look_preset: Option<String>,
+    color_grade: Option<AgentColorGrade>,
+    video_effects: Option<AgentVideoEffects>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentVideoEditResponse {
@@ -66,6 +90,8 @@ pub struct AgentVideoEditResponse {
     // Free-form color grade derived from the user's instructions. Used as the actual
     // render filter when present; otherwise the named look_preset (or nothing) is used.
     color_grade: Option<AgentColorGrade>,
+    // Whole-edit effects (fade in/out, speed) applied after the cuts + grade.
+    video_effects: Option<AgentVideoEffects>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -216,6 +242,10 @@ struct AgentMergedChoice {
     // builds a safe ffmpeg filter chain. We use the first non-empty grade across windows
     // — same user prompt drives them all, so no aggregation needed.
     color_grade: Option<AgentColorGrade>,
+    // Whole-edit effects (fades, speed) requested by the user. Same first-non-empty-wins
+    // aggregation across windows. Keyword pre-detection in Rust seeds a fallback so the
+    // user always gets effects even when the vision model ignores this field.
+    video_effects: Option<AgentVideoEffects>,
 }
 
 /// Free-form color-grade parameters the agent can emit per user instructions.
@@ -248,6 +278,24 @@ pub struct RgbMix {
     pub rr: Option<f32>,
     pub gg: Option<f32>,
     pub bb: Option<f32>,
+}
+
+/// Whole-edit video effects applied AFTER the cuts + color grade. Fades touch both
+/// video and audio together so transitions feel correct. All fields optional; the
+/// backend clamps each one before building the ffmpeg filter chain. Like the color
+/// grade, no raw filter strings are accepted from the model.
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentVideoEffects {
+    // Free-text rationale (1-2 sentences). Shown in the chat under "Why:".
+    pub reason: Option<String>,
+    // Fade-in length in seconds. Applied to video and audio together starting at 0.
+    pub fade_in_seconds: Option<f32>,
+    // Fade-out length in seconds. Ends at the very end of the rendered clip.
+    pub fade_out_seconds: Option<f32>,
+    // Playback-rate multiplier (1.0 = normal, 0.5 = half speed, 2.0 = double).
+    // Affects video PTS and audio tempo together so they stay in sync.
+    pub speed_factor: Option<f32>,
 }
 
 #[tauri::command]
@@ -1227,6 +1275,8 @@ pub fn render_video_mix(
     end_sample: Option<u64>,
     track_ids: Option<Vec<String>>,
     aspect_ratio: Option<String>,
+    // "high" = `-preset slow -crf 17 -b:a 320k`; otherwise the previous fast defaults.
+    quality: Option<String>,
 ) -> Result<RenderResponse, String> {
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
     let path = normalize_mp4_path(PathBuf::from(output_path));
@@ -1274,13 +1324,25 @@ pub fn render_video_mix(
         .arg("-map")
         .arg(format!("{}:a:0", video_inputs.len()));
 
-    let output = command
+    command
         .arg("-c:v")
         .arg("libx264")
         .arg("-pix_fmt")
         .arg("yuv420p")
-        .arg("-c:a")
-        .arg("aac")
+        .arg("-movflags")
+        .arg("+faststart");
+    if quality.as_deref() == Some("high") {
+        command
+            .arg("-preset").arg("slow")
+            .arg("-crf").arg("17")
+            .arg("-c:a").arg("aac")
+            .arg("-b:a").arg("320k");
+    } else {
+        command
+            .arg("-preset").arg("veryfast")
+            .arg("-c:a").arg("aac");
+    }
+    let output = command
         .arg("-shortest")
         .arg(&path)
         .output()
@@ -1293,7 +1355,7 @@ pub fn render_video_mix(
 }
 
 #[tauri::command]
-pub fn export_rendered_video(source_path: String, output_path: String, aspect_ratio: Option<String>) -> Result<RenderResponse, String> {
+pub fn export_rendered_video(source_path: String, output_path: String, aspect_ratio: Option<String>, quality: Option<String>) -> Result<RenderResponse, String> {
     let source = PathBuf::from(source_path);
     if !source.exists() {
         return Err("The Main video render is missing. Run Agent Edit again before exporting.".into());
@@ -1312,16 +1374,25 @@ pub fn export_rendered_video(source_path: String, output_path: String, aspect_ra
             let filter = format!(
                 "scale={t_w}:{t_h}:force_original_aspect_ratio=decrease,pad={t_w}:{t_h}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p"
             );
-            let output = Command::new("ffmpeg")
-                .arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
+            let mut cmd = Command::new("ffmpeg");
+            cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
                 .arg("-i").arg(&source)
                 .arg("-vf").arg(&filter)
                 .arg("-c:v").arg("libx264")
                 .arg("-pix_fmt").arg("yuv420p")
-                .arg("-movflags").arg("+faststart")
-                .arg("-c:a").arg("copy")
-                .arg(&path)
-                .output()
+                .arg("-movflags").arg("+faststart");
+            if quality.as_deref() == Some("high") {
+                // Re-encode the padded video with the final-export quality knobs and
+                // re-encode audio at 320 kbps. Copying audio when re-encoding video at
+                // a different rate would risk container hiccups in some players.
+                cmd.arg("-preset").arg("slow").arg("-crf").arg("17")
+                    .arg("-c:a").arg("aac").arg("-b:a").arg("320k");
+            } else {
+                // Fast aspect transcode — keep audio bit-for-bit so we don't lose more.
+                cmd.arg("-preset").arg("veryfast")
+                    .arg("-c:a").arg("copy");
+            }
+            let output = cmd.arg(&path).output()
                 .map_err(|error| format!("Could not run ffmpeg: {error}"))?;
             if !output.status.success() {
                 return Err(format!(
@@ -1415,6 +1486,171 @@ pub fn render_auto_video_edit(
         return Err(format!("ffmpeg auto video edit failed: {}", stderr.trim()));
     }
     Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+}
+
+/// Direct-edit path for a single video clip. Takes the user's chat text, extracts a
+/// sample frame, runs ONE vision call to refine look/grade/effects, falls back to
+/// deterministic keyword detection per-field where the LLM left things blank, then
+/// ffmpeg-renders only that clip's source range with the resolved filter chain and
+/// swaps the result in via `replace_track_video`. No multicam, no cuts, no per-window
+/// loop — instant compared to the agent edit. Returns what was applied for the chat.
+#[tauri::command]
+pub async fn apply_clip_effects(
+    state: State<'_, AppState>,
+    session_id: String,
+    track_id: String,
+    clip_id: String,
+    instructions: String,
+    ollama_base_url: Option<String>,
+    vision_model: Option<String>,
+) -> Result<ApplyClipEffectsResponse, String> {
+    let project = state.store.lock().map_err(|e| e.to_string())?.get_project(&session_id)?;
+    let track = project.session.tracks.iter().find(|t| t.id == track_id)
+        .ok_or("Track not found")?;
+    if !matches!(track.kind, crate::model::TrackKind::Video) {
+        return Err("Selected track is not a video track.".into());
+    }
+    let clip = track.video_clips.iter().find(|c| c.id == clip_id)
+        .ok_or("Clip not found on the selected track")?
+        .clone();
+    let source = project.session.video_source_files.iter()
+        .find(|s| s.id == clip.video_source_file_id)
+        .ok_or("Clip's video source file is missing")?
+        .clone();
+    let source_path = PathBuf::from(&source.path);
+    if !source_path.exists() {
+        return Err("The clip's source video file is no longer on disk.".into());
+    }
+    let source_offset_s = clip.source_offset_ms as f64 / 1000.0;
+    let duration_samples = clip.end_sample.saturating_sub(clip.start_sample);
+    let duration_s = duration_samples as f64 / project.session.sample_rate as f64;
+    if duration_s <= 0.0 {
+        return Err("Clip has zero duration; nothing to edit.".into());
+    }
+
+    // 1. Keyword baseline from the user's text — runs in microseconds and seeds the
+    //    LLM in case it returns nothing for some field.
+    let (kw_look, kw_grade) = infer_look_from_instructions(&instructions);
+    let kw_effects = infer_effects_from_instructions(&instructions);
+
+    // 2. LLM refinement: extract one frame at the clip's midpoint, ask the vision
+    //    model to refine. Best-effort — failures are silent and the keyword baseline
+    //    still ships, so the user always sees a change.
+    let temp_dir = state.config.data_dir.join("clip-edit").join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir_all(&temp_dir).map_err(|e| format!("Could not prepare temp dir: {e}"))?;
+    let frame_path = temp_dir.join("frame.jpg");
+    let frame_time_in_source = source_offset_s + (duration_s / 2.0);
+    let _ = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .arg("-ss").arg(format!("{frame_time_in_source:.3}"))
+        .arg("-i").arg(&source_path)
+        .args(["-frames:v", "1", "-q:v", "8", "-vf", "scale=512:512:force_original_aspect_ratio=decrease"])
+        .arg(&frame_path)
+        .status();
+    let llm_choice: Option<ClipEffectsChoice> = if frame_path.exists() {
+        let bytes = fs::read(&frame_path).ok();
+        if let Some(bytes) = bytes {
+            let base_url = ollama_base_url
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| state.config.ollama_base_url.clone())
+                .trim_end_matches('/')
+                .to_string();
+            let model = vision_model
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "qwen2.5vl:latest".to_string());
+            let frame_b64 = BASE64_STANDARD.encode(bytes);
+            analyze_clip_effects(&base_url, &model, frame_b64, &instructions).await.ok()
+        } else { None }
+    } else { None };
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    // 3. Merge: LLM wins where present; keyword fallback per-field.
+    let llm_look = llm_choice.as_ref()
+        .and_then(|c| c.look_preset.as_deref())
+        .and_then(parse_video_filter_preset);
+    let llm_grade = llm_choice.as_ref().and_then(|c| c.color_grade.clone())
+        .filter(|g| build_color_grade_filter(g).is_some());
+    let llm_effects = llm_choice.as_ref().and_then(|c| c.video_effects.clone())
+        .filter(|e| e.fade_in_seconds.is_some() || e.fade_out_seconds.is_some() || e.speed_factor.is_some());
+    let look_source = if llm_look.is_some() { "llm" } else if kw_look.is_some() { "keywords" } else { "none" };
+    let grade_source = if llm_grade.is_some() { "llm" } else if kw_grade.is_some() { "keywords" } else { "none" };
+    let effects_source = if llm_effects.is_some() { "llm" } else if kw_effects.is_some() { "keywords" } else { "none" };
+    let chosen_look = llm_look.or(kw_look);
+    let chosen_grade = llm_grade.or(kw_grade);
+    let chosen_effects = llm_effects.or(kw_effects);
+
+    if chosen_look.is_none() && chosen_grade.is_none() && chosen_effects.is_none() {
+        return Err("Could not detect any visual change in your message. Try words like \"cinematic\", \"warm\", \"fade in 2 seconds\", or \"slow down\".".into());
+    }
+
+    // 4. Build filter chains and render only the clip's source range to a new mp4.
+    let grade_filter = chosen_grade.as_ref().and_then(build_color_grade_filter);
+    let (veff_chain, aeff_chain, _speed) = chosen_effects.as_ref()
+        .map(|e| build_effects_filters(e, duration_s))
+        .unwrap_or((None, None, 1.0));
+    let mut vparts: Vec<String> = Vec::new();
+    if let Some(g) = grade_filter { vparts.push(g); }
+    if let Some(v) = veff_chain { vparts.push(v); }
+    let vf = if vparts.is_empty() { None } else { Some(vparts.join(",")) };
+
+    let renders_dir = state.store.lock().map_err(|e| e.to_string())?.renders_dir();
+    fs::create_dir_all(&renders_dir).map_err(|e| e.to_string())?;
+    let output_path = renders_dir.join(format!("clip-edit-{}.mp4", uuid::Uuid::new_v4()));
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
+        .arg("-ss").arg(format!("{source_offset_s:.3}"))
+        .arg("-t").arg(format!("{duration_s:.3}"))
+        .arg("-i").arg(&source_path);
+    if let Some(filter) = vf { cmd.arg("-vf").arg(filter); }
+    if let Some(af) = aeff_chain { cmd.arg("-af").arg(af); }
+    cmd.args([
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", "-r", "30", "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
+        "-c:a", "aac", "-shortest",
+    ]).arg(&output_path);
+    let out = cmd.output().map_err(|e| format!("Could not run ffmpeg: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("ffmpeg clip edit failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+
+    // 5. Swap the rendered file into the clip in place.
+    let duration_ms = (duration_s * 1000.0).round() as u64;
+    let updated = state.store.lock().map_err(|e| e.to_string())?
+        .replace_track_video(&session_id, &track_id, &clip_id, &output_path, duration_ms.max(1))?;
+    let _ = fs::remove_file(&output_path);
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&updated.session)?;
+        sync_session_to_engine(&mut audio, &updated.session);
+        audio.publish_automation(&updated.session);
+    }
+
+    Ok(ApplyClipEffectsResponse {
+        project: updated,
+        look_preset: chosen_look,
+        color_grade: chosen_grade,
+        video_effects: chosen_effects,
+        source_summary: format!("look:{look_source} grade:{grade_source} effects:{effects_source}"),
+    })
+}
+
+/// Revert a video clip to the pristine recording (the source it had before any
+/// effects/grade render). Cheap — no ffmpeg, no LLM; just swaps the clip's
+/// source-id/offset/duration back to the saved snapshot.
+#[tauri::command]
+pub fn revert_clip_video(
+    state: State<'_, AppState>,
+    session_id: String,
+    track_id: String,
+    clip_id: String,
+) -> Result<MixProject, String> {
+    let updated = state.store.lock().map_err(|e| e.to_string())?
+        .revert_clip_to_pristine(&session_id, &track_id, &clip_id)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&updated.session)?;
+        sync_session_to_engine(&mut audio, &updated.session);
+        audio.publish_automation(&updated.session);
+    }
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -1528,7 +1764,7 @@ pub async fn render_agent_video_edit(
     );
     let temp_dir = state.config.data_dir.join("agent-video-edit").join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&temp_dir).map_err(|error| format!("Could not prepare agent frame cache: {error}"))?;
-    let (segments, script, agent_look_preset, agent_color_grade) = build_agent_edit_segments(
+    let (segments, script, agent_look_preset, agent_color_grade, agent_effects) = build_agent_edit_segments(
         &app,
         &started,
         &video_inputs,
@@ -1548,7 +1784,10 @@ pub async fn render_agent_video_edit(
         emit_agent_progress(&app, &started, "fallback", &format!("Vision agent failed; using automatic cuts. {error}"), 0, total_windows);
         let segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
         let script = build_fallback_agent_script(&video_inputs, &segments, range_start, range_end, total_windows, project.session.sample_rate, &error);
-        (segments, script, None, None)
+        // Even on agent failure, honor explicit keyword effects from the instructions.
+        let kw_effects = instructions.as_deref().and_then(infer_effects_from_instructions);
+        let (kw_look, kw_grade) = instructions.as_deref().map(infer_look_from_instructions).unwrap_or((None, None));
+        (segments, script, kw_look, kw_grade, kw_effects)
     });
     let _ = fs::remove_dir_all(&temp_dir);
     if segments.is_empty() {
@@ -1558,7 +1797,7 @@ pub async fn render_agent_video_edit(
 
     if plan_only.unwrap_or(false) {
         emit_agent_progress(&app, &started, "done", "Plan ready for review.", total_windows, total_windows);
-        return Ok(AgentVideoEditResponse { path: String::new(), script, look_preset: agent_look_preset, color_grade: agent_color_grade });
+        return Ok(AgentVideoEditResponse { path: String::new(), script, look_preset: agent_look_preset, color_grade: agent_color_grade, video_effects: agent_effects });
     }
 
     emit_agent_progress(&app, &started, "audio", "Using analyzed mix audio for video export...", total_windows, total_windows);
@@ -1571,13 +1810,13 @@ pub async fn render_agent_video_edit(
         agent_look_preset.as_ref().map(|preset| format!("{:?}", preset)).unwrap_or_else(|| "no grade".to_string())
     };
     emit_agent_progress(&app, &started, "rendering", &format!("Rendering {} selected cuts to MP4 ({look_label})...", segments.len()), total_windows, total_windows);
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &path, agent_look_preset.clone(), grade_filter)
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &path, agent_look_preset.clone(), grade_filter, agent_effects.clone(), false)
         .map_err(|error| {
             emit_agent_progress(&app, &started, "error", "ffmpeg failed while rendering the agent edit.", total_windows, total_windows);
             error
         })?;
     emit_agent_progress(&app, &started, "done", "Agent Video Edit complete.", total_windows, total_windows);
-    Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script, look_preset: agent_look_preset, color_grade: agent_color_grade })
+    Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script, look_preset: agent_look_preset, color_grade: agent_color_grade, video_effects: agent_effects })
 }
 
 /// Render a sequence of edit segments (each picking one source clip for a time span)
@@ -1595,6 +1834,12 @@ fn render_segments_ffmpeg(
     // Free-form ffmpeg filter chain (already built by build_color_grade_filter, so
     // every segment is clamped & safe). Wraps the final [v] output. None = no grade.
     color_grade_filter: Option<String>,
+    // Whole-edit effects (fade in/out, speed) applied AFTER the grade.
+    effects: Option<AgentVideoEffects>,
+    // Encoder quality. False = `-preset veryfast` + default CRF + AAC default
+    // (fast preview); true = `-preset slow -crf 17 -b:a 320k` (visually lossless,
+    // ~5-10x slower). Used by the final-export path; preview renders pass false.
+    high_quality: bool,
 ) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
@@ -1604,54 +1849,88 @@ fn render_segments_ffmpeg(
     if range_start > 0 {
         command.arg("-ss").arg(format!("{:.3}", range_start as f64 / session.sample_rate as f64));
     }
+    let range_duration_s = range_end.saturating_sub(range_start) as f64 / session.sample_rate as f64;
     command
         .arg("-t")
-        .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / session.sample_rate as f64))
+        .arg(format!("{range_duration_s:.3}"))
         .arg("-i")
         .arg(audio_path);
 
     let base_filter = build_auto_edit_filter(video_inputs, segments, session, range_start, range_end, look_override);
-    // If the agent emitted a custom grade, append it to the chain by renaming the
-    // last [v] to [vraw] and feeding it through the grade filter to produce [v].
-    let filter = match color_grade_filter {
-        Some(chain) if !chain.is_empty() => {
+    let (video_post_chain, audio_chain, _speed) = effects
+        .as_ref()
+        .map(|e| build_effects_filters(e, range_duration_s))
+        .unwrap_or((None, None, 1.0));
+    // Build the post-[v] chain: grade then video effects, joined by commas. Both are
+    // already comma-separated filter strings, so we can flatten them.
+    let mut post_parts: Vec<String> = Vec::new();
+    if let Some(g) = color_grade_filter.as_ref().filter(|s| !s.is_empty()) {
+        post_parts.push(g.clone());
+    }
+    if let Some(v) = video_post_chain.as_ref().filter(|s| !s.is_empty()) {
+        post_parts.push(v.clone());
+    }
+    let combined_post = if post_parts.is_empty() { None } else { Some(post_parts.join(",")) };
+    let audio_index = video_inputs.len();
+    // Wrap the base filter with post-video chain when present.
+    let filter_with_video = match combined_post {
+        Some(chain) => {
             let mut s = base_filter.replace("[v]", "[vraw]");
             s.push(';');
             s.push_str(&format!("[vraw]{chain},format=yuv420p[v]"));
             s
         }
-        _ => base_filter,
+        None => base_filter,
+    };
+    // Add audio effects to filter_complex too when present. Otherwise map the audio
+    // input directly (unchanged from the pre-effects behavior).
+    let (final_filter, audio_map) = match audio_chain {
+        Some(chain) if !chain.is_empty() => {
+            let mut s = filter_with_video;
+            s.push(';');
+            s.push_str(&format!("[{audio_index}:a:0]{chain}[a]"));
+            (s, "[a]".to_string())
+        }
+        _ => (filter_with_video, format!("{audio_index}:a:0")),
     };
     command
         .arg("-filter_complex")
-        .arg(filter)
+        .arg(final_filter)
         .arg("-map")
         .arg("[v]")
         .arg("-map")
-        .arg(format!("{}:a:0", video_inputs.len()));
+        .arg(audio_map);
 
-    let output = command
+    command
         .arg("-c:v")
         .arg("libx264")
-        .arg("-preset")
-        .arg("veryfast")
-        .arg("-r")
-        .arg("30")
-        // Force a keyframe every 30 frames (1s) so the player can seek anywhere quickly
-        // and the playhead-driven `<video>.currentTime = ...` calls don't have to decode
-        // a long GOP just to display a single frame.
-        .arg("-g")
-        .arg("30")
-        .arg("-keyint_min")
-        .arg("30")
-        .arg("-sc_threshold")
-        .arg("0")
         .arg("-pix_fmt")
         .arg("yuv420p")
         .arg("-movflags")
         .arg("+faststart")
-        .arg("-c:a")
-        .arg("aac")
+        .arg("-r")
+        .arg("30");
+    if high_quality {
+        // Visually-lossless final export: slow preset, CRF 17, AAC 320 kbps.
+        // Longer GOP (60) for better compression — final output is for delivery,
+        // not for the in-app scrubber.
+        command
+            .arg("-preset").arg("slow")
+            .arg("-crf").arg("17")
+            .arg("-g").arg("60")
+            .arg("-c:a").arg("aac")
+            .arg("-b:a").arg("320k");
+    } else {
+        // Fast preview render: short GOP so the in-app `<video>.currentTime = ...`
+        // scrubber doesn't decode long GOPs to display one frame.
+        command
+            .arg("-preset").arg("veryfast")
+            .arg("-g").arg("30")
+            .arg("-keyint_min").arg("30")
+            .arg("-sc_threshold").arg("0")
+            .arg("-c:a").arg("aac");
+    }
+    let output = command
         .arg("-shortest")
         .arg(output_path)
         .output()
@@ -1725,6 +2004,10 @@ pub fn render_video_from_script(
     script: Vec<AgentVideoScriptEntry>,
     look_preset: Option<crate::model::VideoFilterPreset>,
     color_grade: Option<AgentColorGrade>,
+    video_effects: Option<AgentVideoEffects>,
+    // "high" = final-export encoder (slow + CRF 17 + AAC 320k); anything else
+    // (None / "fast" / "preview") = fast preview encoder.
+    quality: Option<String>,
 ) -> Result<RenderFromScriptResponse, String> {
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
     let full_end = session_duration_samples(&project.session);
@@ -1756,7 +2039,8 @@ pub fn render_video_from_script(
     audio::render_mix(&project.session, &audio_path)?;
     let output_path = renders_dir.join(format!("agent-edit-{}.mp4", uuid::Uuid::new_v4()));
     let grade_filter = color_grade.as_ref().and_then(build_color_grade_filter);
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset, grade_filter)?;
+    let high_quality = quality.as_deref() == Some("high");
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset, grade_filter, video_effects, high_quality)?;
 
     let duration_ms = (((range_end.saturating_sub(range_start)) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64;
     Ok(RenderFromScriptResponse {
@@ -1780,6 +2064,7 @@ pub fn rerender_agent_edit(
     script: Vec<AgentVideoScriptEntry>,
     look_preset: Option<crate::model::VideoFilterPreset>,
     color_grade: Option<AgentColorGrade>,
+    video_effects: Option<AgentVideoEffects>,
 ) -> Result<MixProject, String> {
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
     let full_end = session_duration_samples(&project.session);
@@ -1812,7 +2097,9 @@ pub fn rerender_agent_edit(
     audio::render_mix(&project.session, &audio_path)?;
     let output_path = renders_dir.join(format!("rerender-{}.mp4", uuid::Uuid::new_v4()));
     let grade_filter = color_grade.as_ref().and_then(build_color_grade_filter);
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset, grade_filter)?;
+    // Re-render path stays at preview quality — it's invoked from Look chip clicks
+    // and similar quick iteration. Final export uses render_video_from_script(quality=high).
+    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset, grade_filter, video_effects, false)?;
 
     let duration_ms = (((range_end.saturating_sub(range_start)) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64;
     let updated = state
@@ -2245,6 +2532,157 @@ pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFi
     };
     let grade = if build_color_grade_filter(&grade).is_some() { Some(grade) } else { None };
     (preset, grade)
+}
+
+/// Scan the user's instructions for video-effect keywords ("fade in", "fade out",
+/// "speed up", "slow down") and produce a default AgentVideoEffects. The LLM can
+/// override; if it doesn't, this keeps the user's natural request honored.
+/// Numeric capture: matches "<number>(s|sec|seconds)" near the phrase so the user
+/// can say "fade out 2s" or "half-second fade in" (parsed as 0.5 via the word match).
+pub fn infer_effects_from_instructions(text: &str) -> Option<AgentVideoEffects> {
+    let t = text.to_lowercase();
+    let mut effects = AgentVideoEffects::default();
+    let mut hits: Vec<String> = Vec::new();
+
+    // Tiny helper: find the first number (int or decimal) in a substring window
+    // around the keyword. Returns seconds. Falls back to a default when missing.
+    fn nearby_seconds(text: &str, anchor: &str, default_s: f32) -> f32 {
+        let Some(at) = text.find(anchor) else { return default_s; };
+        // 30 chars on each side is plenty for "fade out at the end 1.5s".
+        let lo = at.saturating_sub(30);
+        let hi = (at + anchor.len() + 30).min(text.len());
+        let window = &text[lo..hi];
+        // Greedy first match for `\d+(?:\.\d+)?` without a regex dep.
+        let mut acc = String::new();
+        let mut started = false;
+        for ch in window.chars() {
+            if ch.is_ascii_digit() || (ch == '.' && started && !acc.contains('.')) {
+                acc.push(ch);
+                started = true;
+            } else if started {
+                break;
+            }
+        }
+        if acc.is_empty() {
+            // Word-number fallback for "half" / "one" / "two" / "three" near the anchor.
+            if window.contains("half") { return 0.5; }
+            if window.contains("one ") || window.ends_with("one") { return 1.0; }
+            if window.contains("two") { return 2.0; }
+            if window.contains("three") { return 3.0; }
+            return default_s;
+        }
+        acc.parse::<f32>().unwrap_or(default_s)
+    }
+
+    if t.contains("fade in") || t.contains("fade-in") || t.contains("fadein") {
+        let s = nearby_seconds(&t, "fade in", 1.5).clamp(0.0, 10.0);
+        effects.fade_in_seconds = Some(s);
+        hits.push(format!("fade in {s:.1}s"));
+    }
+    if t.contains("fade out") || t.contains("fade-out") || t.contains("fadeout") {
+        let s = nearby_seconds(&t, "fade out", 1.5).clamp(0.0, 10.0);
+        effects.fade_out_seconds = Some(s);
+        hits.push(format!("fade out {s:.1}s"));
+    }
+    // Generic "fade" without direction = apply to both ends.
+    if (t.contains("fade") || t.contains("dissolve")) && effects.fade_in_seconds.is_none() && effects.fade_out_seconds.is_none() {
+        effects.fade_in_seconds = Some(1.0);
+        effects.fade_out_seconds = Some(1.5);
+        hits.push("fade in/out".to_string());
+    }
+    if t.contains("speed up") || t.contains("faster") || t.contains("speed it up") {
+        // Optional explicit factor "2x"/"1.5x" near the phrase.
+        let factor = {
+            let f = if let Some(at) = t.find('x') {
+                let lo = at.saturating_sub(6);
+                let window = &t[lo..at];
+                let mut acc = String::new();
+                let mut started = false;
+                for ch in window.chars().rev() {
+                    if ch.is_ascii_digit() || (ch == '.' && started && !acc.contains('.')) {
+                        acc.insert(0, ch);
+                        started = true;
+                    } else if started {
+                        break;
+                    }
+                }
+                acc.parse::<f32>().ok()
+            } else { None };
+            f.unwrap_or(1.5)
+        };
+        effects.speed_factor = Some(factor.clamp(1.0, 4.0));
+        hits.push(format!("speed {:.2}x", effects.speed_factor.unwrap()));
+    }
+    if t.contains("slow down") || t.contains("slower") || t.contains("slow-mo") {
+        effects.speed_factor = Some(0.5);
+        hits.push("slow down 0.50x".to_string());
+    }
+
+    if hits.is_empty() { return None; }
+    effects.reason = Some(format!(
+        "Inferred from instruction keywords ({}) — applied to the final video.",
+        hits.join(", ")
+    ));
+    Some(effects)
+}
+
+/// Translate an `AgentVideoEffects` into ready-to-use ffmpeg filter chains for both
+/// the video and audio streams. Returns `(video_chain, audio_chain, applied_speed)`.
+/// `total_duration_s` is the unscaled length of the source range; the returned chain
+/// places the fade-out at the post-speed final duration so it lands at the very end.
+pub fn build_effects_filters(effects: &AgentVideoEffects, total_duration_s: f64) -> (Option<String>, Option<String>, f32) {
+    fn clamp_finite(v: Option<f32>, lo: f32, hi: f32) -> Option<f32> {
+        let x = v?;
+        if !x.is_finite() { return None; }
+        Some(x.clamp(lo, hi))
+    }
+    let speed = clamp_finite(effects.speed_factor, 0.25, 4.0).unwrap_or(1.0);
+    let fade_in = clamp_finite(effects.fade_in_seconds, 0.0, 10.0).filter(|s| *s > 0.001);
+    let fade_out = clamp_finite(effects.fade_out_seconds, 0.0, 10.0).filter(|s| *s > 0.001);
+    let final_duration = (total_duration_s / speed as f64).max(0.01);
+
+    let mut vparts: Vec<String> = Vec::new();
+    if (speed - 1.0).abs() > 0.001 {
+        // setpts multiplies the PTS — to play faster (speed > 1) we shrink PTS by 1/speed.
+        vparts.push(format!("setpts={:.4}*PTS", 1.0 / speed));
+    }
+    if let Some(s) = fade_in {
+        // Fade from black at the start.
+        vparts.push(format!("fade=t=in:st=0:d={s:.3}"));
+    }
+    if let Some(s) = fade_out {
+        let st = ((final_duration as f32) - s).max(0.0);
+        vparts.push(format!("fade=t=out:st={st:.3}:d={s:.3}"));
+    }
+    let video_chain = if vparts.is_empty() { None } else { Some(vparts.join(",")) };
+
+    let mut aparts: Vec<String> = Vec::new();
+    if (speed - 1.0).abs() > 0.001 {
+        // atempo is limited to [0.5, 100.0] per filter, so we chain stages when the
+        // requested factor falls outside that range. With our clamp 0.25..4 we need at
+        // most one extra stage on the slow side and one on the fast side.
+        let mut remaining = speed;
+        while remaining > 2.0 {
+            aparts.push("atempo=2.0".to_string());
+            remaining /= 2.0;
+        }
+        while remaining < 0.5 {
+            aparts.push("atempo=0.5".to_string());
+            remaining /= 0.5;
+        }
+        if (remaining - 1.0).abs() > 0.001 {
+            aparts.push(format!("atempo={remaining:.3}"));
+        }
+    }
+    if let Some(s) = fade_in {
+        aparts.push(format!("afade=t=in:st=0:d={s:.3}"));
+    }
+    if let Some(s) = fade_out {
+        let st = ((final_duration as f32) - s).max(0.0);
+        aparts.push(format!("afade=t=out:st={st:.3}:d={s:.3}"));
+    }
+    let audio_chain = if aparts.is_empty() { None } else { Some(aparts.join(",")) };
+    (video_chain, audio_chain, speed)
 }
 
 /// Build a safe ffmpeg filter chain from the agent's free-form color-grade
@@ -2798,7 +3236,7 @@ async fn build_agent_edit_segments(
     instructions: Option<&str>,
     audio_analysis: Option<&RenderedAudioAnalysis>,
     temp_dir: &Path,
-) -> Result<(Vec<AutoEditSegment>, Vec<AgentVideoScriptEntry>, Option<crate::model::VideoFilterPreset>, Option<AgentColorGrade>), String> {
+) -> Result<(Vec<AutoEditSegment>, Vec<AgentVideoScriptEntry>, Option<crate::model::VideoFilterPreset>, Option<AgentColorGrade>, Option<AgentVideoEffects>), String> {
     let sample_rate = session.sample_rate;
     let mut segments: Vec<AutoEditSegment> = Vec::new();
     let mut script = Vec::new();
@@ -2820,6 +3258,13 @@ async fn build_agent_edit_segments(
     if let Some(preset) = keyword_look.as_ref() {
         *look_votes.entry(format!("{:?}", preset).to_lowercase()).or_insert(0) += 1;
     }
+    // Same idea for whole-edit effects (fade in/out, speed). LLM can override per
+    // window via the `video_effects` field; otherwise the keyword detector wins.
+    let keyword_effects = match instructions {
+        Some(text) if !text.is_empty() => infer_effects_from_instructions(text),
+        _ => None,
+    };
+    let mut first_video_effects: Option<AgentVideoEffects> = None;
     let mut cursor = range_start;
     let total_windows = range_end.saturating_sub(range_start).div_ceil(interval_samples).max(1) as u32;
     let mut window_index = 0_u32;
@@ -2969,6 +3414,7 @@ async fn build_agent_edit_segments(
                 continuity_plan: Some("Use the only available readable shot.".into()),
                 look_preset: None,
                 color_grade: None,
+                video_effects: None,
             })
         };
         // `edit_model` is unused now that vision + decide are merged into one
@@ -3015,6 +3461,17 @@ async fn build_agent_edit_segments(
                 // empty/neutral objects the model emits when no look is requested.
                 if build_color_grade_filter(&grade).is_some() {
                     first_color_grade = Some(grade);
+                }
+            }
+        }
+        if first_video_effects.is_none() {
+            if let Some(effects) = merged.as_ref().and_then(|m| m.video_effects.clone()) {
+                // Only adopt if any field is actually populated.
+                if effects.fade_in_seconds.is_some()
+                    || effects.fade_out_seconds.is_some()
+                    || effects.speed_factor.is_some()
+                {
+                    first_video_effects = Some(effects);
                 }
             }
         }
@@ -3286,7 +3743,8 @@ async fn build_agent_edit_segments(
     // Same fallback for the free-form grade: prefer what the model actually emitted,
     // otherwise use the deterministic grade derived from instruction keywords.
     let chosen_grade = first_color_grade.or(keyword_grade);
-    Ok((segments, script, chosen_look, chosen_grade))
+    let chosen_effects = first_video_effects.or(keyword_effects);
+    Ok((segments, script, chosen_look, chosen_grade, chosen_effects))
 }
 
 fn extract_video_frame(clip: &VideoRenderClip, sample: u64, session: &MixSession, output_path: &Path) -> Result<(), String> {
@@ -3501,13 +3959,41 @@ async fn analyze_and_decide_window(
          - grain: 0..30 (subtle film grain)\n\
          If the user gave no look direction, use \"look_preset\": \"none\" and omit color_grade.\n\
          For the color_grade.reason field, write 1-2 sentences mapping the user's exact words to the parameters you picked: e.g., \"You asked for epic/cinematic so I lifted contrast to 1.12 and warmed the highlights via rgbMix rr=1.10. The 'brighter, clearer' note pushed brightness +0.05 and sharpen 0.6.\" Be concrete about which word drove which knob.\n\
+         Also pick `video_effects` for the WHOLE edit (fade in/out, speed). Fields are optional; emit only what the user asked for: fadeInSeconds (0..10), fadeOutSeconds (0..10), speedFactor (0.25..4, 1=normal). If the user said \"fade in 2 seconds\", set fadeInSeconds=2. If \"slow-mo\", set speedFactor=0.5. If \"speed it up 2x\", set speedFactor=2. Include video_effects.reason explaining which user word drove each.\n\
          Reply only as JSON with this exact shape:\n\
-         {{\"window_summary\": \"one sentence summarizing the available visual choices\", \"candidate_labels\": [\"label1\", \"label2\"], \"candidate_notes\": [\"Image 1 note\", \"Image 2 note\"], \"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"hold continuity | wide context | hands detail | face/reaction | motion accent | pacing variation\", \"reason\": \"one specific sentence using visual + audio evidence\", \"continuity_plan\": \"how this supports the surrounding edit\", \"look_preset\": \"none|warm|cool|mono|punch|dream|cinema|noir|moody|vintage|golden|cold\", \"color_grade\": {{\"name\": \"epic cinema\", \"reason\": \"1-2 sentences mapping the user's words to these knobs\", \"brightness\": 0.0, \"contrast\": 1.12, \"saturation\": 1.05, \"gamma\": 1.0, \"rgbMix\": {{\"rr\": 1.10, \"gg\": 0.96, \"bb\": 0.85}}, \"hueShift\": 0, \"vignette\": 0.25, \"blur\": 0, \"sharpen\": 0.4, \"grain\": 2}}}}"
+         {{\"window_summary\": \"one sentence summarizing the available visual choices\", \"candidate_labels\": [\"label1\", \"label2\"], \"candidate_notes\": [\"Image 1 note\", \"Image 2 note\"], \"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"hold continuity | wide context | hands detail | face/reaction | motion accent | pacing variation\", \"reason\": \"one specific sentence using visual + audio evidence\", \"continuity_plan\": \"how this supports the surrounding edit\", \"look_preset\": \"none|warm|cool|mono|punch|dream|cinema|noir|moody|vintage|golden|cold\", \"color_grade\": {{\"name\": \"epic cinema\", \"reason\": \"1-2 sentences mapping the user's words to these knobs\", \"brightness\": 0.0, \"contrast\": 1.12, \"saturation\": 1.05, \"gamma\": 1.0, \"rgbMix\": {{\"rr\": 1.10, \"gg\": 0.96, \"bb\": 0.85}}, \"hueShift\": 0, \"vignette\": 0.25, \"blur\": 0, \"sharpen\": 0.4, \"grain\": 2}}, \"video_effects\": {{\"reason\": \"why these effects\", \"fadeInSeconds\": 1.0, \"fadeOutSeconds\": 1.5, \"speedFactor\": 1.0}}}}"
     );
     let parsed = call_ollama_chat(base_url, model, prompt, Some(images)).await?;
     let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
     serde_json::from_str::<AgentMergedChoice>(&extracted)
         .map_err(|error| format!("Could not parse merged agent decision: {error}"))
+}
+
+/// Single vision call for the clip-direct-edit path. Asks the model to pick a
+/// look_preset + color_grade + video_effects based on the user's instructions and
+/// ONE sample frame from the clip. No cuts, no per-window iteration. Returns
+/// best-effort — missing fields fall back to keyword detection.
+async fn analyze_clip_effects(
+    base_url: &str,
+    model: &str,
+    frame_b64: String,
+    instructions: &str,
+) -> Result<ClipEffectsChoice, String> {
+    let prompt = format!(
+        "You are designing a color grade + effects for a SINGLE recorded video clip. The user wants visual improvements only — no cuts, no multicam.\n\
+         User instructions:\n{instructions}\n\n\
+         Look at the sample frame and pick effects that match the user's words.\n\
+         look_preset: one of none, warm, cool, mono, punch, dream, cinema, noir, moody, vintage, golden, cold.\n\
+         color_grade (optional): {{name, reason, brightness(-0.5..0.5), contrast(0.4..2), saturation(0..2.5), gamma(0.5..1.8), rgbMix{{rr,gg,bb (0.4..1.6 each)}}, hueShift(-180..180), vignette(0..1), blur(0..8), sharpen(0..2), grain(0..30)}}.\n\
+         video_effects (optional): {{reason, fadeInSeconds(0..10), fadeOutSeconds(0..10), speedFactor(0.25..4)}}.\n\
+         For each field, write a short rationale (color_grade.reason, video_effects.reason) that maps which user word drove which knob.\n\
+         Reply only as JSON with this shape:\n\
+         {{\"look_preset\": \"cinema\", \"color_grade\": {{\"name\": \"epic cinema\", \"reason\": \"...\", \"contrast\": 1.12, \"rgbMix\": {{\"rr\": 1.10, \"bb\": 0.85}}, \"vignette\": 0.25, \"sharpen\": 0.4, \"grain\": 1.5}}, \"video_effects\": {{\"reason\": \"...\", \"fadeInSeconds\": 1, \"fadeOutSeconds\": 2}}}}"
+    );
+    let parsed = call_ollama_chat(base_url, model, prompt, Some(vec![frame_b64])).await?;
+    let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
+    serde_json::from_str::<ClipEffectsChoice>(&extracted)
+        .map_err(|error| format!("Could not parse clip-effects response: {error}"))
 }
 
 async fn call_ollama_chat(

@@ -163,6 +163,15 @@ pub struct VideoClipRegion {
     pub source_offset_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<VideoLayout>,
+    // Backup of the source-id, offset and duration BEFORE the first effects render.
+    // Set on the first call to replace_track_video and never overwritten afterwards.
+    // Lets `revert_clip_video` restore the original recording without any grade/effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pristine_video_source_file_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pristine_source_offset_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pristine_duration_samples: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
