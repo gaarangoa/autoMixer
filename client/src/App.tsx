@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { AlertCircle, Camera, CheckCircle2, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, Info, Keyboard, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, Square, Trash2, Upload, Video, X } from "lucide-react";
+import { AlertCircle, Camera, CheckCircle2, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, Info, Keyboard, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, SkipBack, SlidersHorizontal, Square, Trash2, Upload, Video, X } from "lucide-react";
 import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -245,6 +245,9 @@ export function App() {
   // Pending in-app confirmation dialog (replaces window.confirm).
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  // Mixer console dock visibility, persisted so the workspace layout survives restarts.
+  const [mixerOpen, setMixerOpen] = useState(() => localStorage.getItem("autoMixer.mixerOpen") !== "0");
+  useEffect(() => { localStorage.setItem("autoMixer.mixerOpen", mixerOpen ? "1" : "0"); }, [mixerOpen]);
   const busyRef = useRef(false);
   useEffect(() => { busyRef.current = busy; }, [busy]);
 
@@ -1468,6 +1471,19 @@ export function App() {
     setProject(updated);
   }
 
+  async function setTrackSend(track: Track, kind: "reverb" | "delay", levelDb: number) {
+    if (!session) return;
+    try {
+      const action = kind === "reverb"
+        ? { tool: "set_reverb_send" as const, trackId: track.id, levelDb }
+        : { tool: "set_delay_send" as const, trackId: track.id, levelDb };
+      const updated = await api.applyActions(session.id, [action], "Manual send change");
+      setProject(updated);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
   function toggleTrackSelection(trackId: string) {
     setSelectedClip(undefined);
     // Keep a global ruler region — only per-track ranges (with trackId) get cleared.
@@ -2275,6 +2291,13 @@ export function App() {
     setPlaying(false);
   }
 
+  // Transport "return to zero" — stop playback and park the playhead at 0:00.
+  async function goToStart() {
+    await stop();
+    pausedAtRef.current = 0;
+    setPlayhead(0);
+  }
+
   async function resetSession() {
     if (!session) return;
     const confirmed = await confirmAction({
@@ -3041,14 +3064,34 @@ export function App() {
                 </div>
               ) : null}
             </div>
-            <span>{session.tracks.length} tracks · {formatTime(playhead)} / {formatTime(duration)}</span>
+          </div>
+          <div className="transport-center">
+            <div className="topbar-group" role="group" aria-label="Transport">
+              <button onClick={() => void goToStart()} title="Jump to start"><SkipBack size={15} /></button>
+              <button
+                className={`transport-play ${playing ? "playing" : ""}`}
+                onClick={() => void togglePlay()}
+                title={playing ? "Pause (Space)" : "Play (Space)"}
+              >
+                {playing ? <Pause size={18} /> : <Play size={18} />}
+              </button>
+              <button onClick={() => void stop()} title="Stop"><Square size={15} /></button>
+            </div>
+            <div className="lcd">
+              <div className="lcd-main">
+                <span className="lcd-time">{formatLcdTime(playhead)}</span>
+                <span className="lcd-total">/ {formatTime(duration)}</span>
+                {session.bpm ? <span className="lcd-bars">{formatBars(playhead, session.bpm)}</span> : null}
+              </div>
+              <div className="lcd-sub">
+                <span>{session.tracks.length} TRK</span>
+                <span>{Math.round(session.sampleRate / 100) / 10} kHz</span>
+                {session.bpm ? <span>{Math.round(session.bpm)} BPM</span> : null}
+                <TransportMeter />
+              </div>
+            </div>
           </div>
           <div className="transport">
-            <div className="topbar-group" role="group" aria-label="Transport">
-              <button className="transport-play" onClick={() => void togglePlay()} title={playing ? "Pause (Space)" : "Play (Space)"}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
-              <button onClick={() => void stop()} title="Stop"><Square size={16} /></button>
-            </div>
-            <span className="topbar-sep" aria-hidden="true" />
             <div className="topbar-group" role="group" aria-label="Editing tools">
               <button
                 onClick={() => setAddTrackMenuOpen(true)}
@@ -3092,6 +3135,14 @@ export function App() {
             </div>
             <span className="topbar-sep" aria-hidden="true" />
             <div className="topbar-group" role="group" aria-label="File and help">
+              <button
+                className={mixerOpen ? "active" : ""}
+                onClick={() => setMixerOpen((open) => !open)}
+                title={mixerOpen ? "Hide the mixer console" : "Show the mixer console"}
+                aria-pressed={mixerOpen}
+              >
+                <SlidersHorizontal size={18} />
+              </button>
               <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={18} /></button>
               <button className="upload" onClick={() => void importFiles()} title="Import audio">
                 <Upload size={18} />
@@ -3462,6 +3513,7 @@ export function App() {
               <TimeRuler
                 duration={duration}
                 playhead={playhead}
+                bpm={session.bpm}
                 selection={selectedRange}
                 loopActive={!!(loopSection && selectedRange &&
                   Math.abs(loopSection.start - Math.min(selectedRange.start, selectedRange.end)) < 0.01 &&
@@ -3718,6 +3770,21 @@ export function App() {
             </div>
           </div>
         </div>
+
+        {mixerOpen ? (
+          <MixerDock
+            session={session}
+            focusedTrackId={focusedTrackId}
+            onFocusTrack={(trackId) => setFocusedTrackId(trackId)}
+            onChange={(track, patch) => void updateTrack(track, patch)}
+            onSend={(track, kind, levelDb) => void setTrackSend(track, kind, levelDb)}
+            masterGainDb={session.master.gainDb}
+            onMasterGain={async (gainDb) => {
+              const updated = await api.setMasterGain(session.id, gainDb);
+              setProject(updated);
+            }}
+          />
+        ) : null}
 
         <MasterBar
           gainDb={session.master.gainDb}
@@ -4480,6 +4547,7 @@ function TimeRuler({
   playhead,
   selection,
   loopActive,
+  bpm,
   onSeek,
   onSelect,
   onClear,
@@ -4489,6 +4557,7 @@ function TimeRuler({
   playhead: number;
   selection?: { start: number; end: number };
   loopActive: boolean;
+  bpm?: number;
   onSeek: (seconds: number) => void;
   onSelect: (start: number, end: number) => void;
   onClear: () => void;
@@ -4576,6 +4645,25 @@ function TimeRuler({
     }
   };
   const ticks = buildRulerTicks(duration);
+  // Bar marks when the session has a tempo. Memoized: the ruler re-renders at
+  // playhead rate, but the bar grid only changes with bpm/duration.
+  const barMarks = useMemo(() => {
+    if (!bpm || bpm <= 0 || duration <= 0) return [];
+    const barSeconds = 240 / bpm;
+    const totalBars = Math.floor(duration / barSeconds) + 1;
+    const labelEvery = totalBars > 96 ? 8 : totalBars > 48 ? 4 : totalBars > 24 ? 2 : 1;
+    const renderEvery = totalBars > 240 ? labelEvery : 1;
+    const marks: { bar: number; left: number; labeled: boolean }[] = [];
+    for (let bar = 1; bar <= totalBars; bar++) {
+      if ((bar - 1) % renderEvery !== 0) continue;
+      marks.push({
+        bar,
+        left: (((bar - 1) * barSeconds) / duration) * 100,
+        labeled: (bar - 1) % labelEvery === 0,
+      });
+    }
+    return marks;
+  }, [bpm, duration]);
   const cursorPct = duration > 0 ? Math.max(0, Math.min(100, (playhead / duration) * 100)) : 0;
   const selStart = selection ? Math.min(selection.start, selection.end) : 0;
   const selEnd = selection ? Math.max(selection.start, selection.end) : 0;
@@ -4595,6 +4683,15 @@ function TimeRuler({
         {ticks.map((tick) => (
           <div key={tick} className="time-ruler-tick" style={{ left: `${duration > 0 ? (tick / duration) * 100 : 0}%` }}>
             <span>{formatTime(tick)}</span>
+          </div>
+        ))}
+        {barMarks.map((mark) => (
+          <div
+            key={`bar-${mark.bar}`}
+            className={`time-ruler-bar ${mark.labeled ? "labeled" : ""}`}
+            style={{ left: `${mark.left}%` }}
+          >
+            {mark.labeled ? <span>{mark.bar}</span> : null}
           </div>
         ))}
         {selection && selWidthPct > 0.05 ? (
@@ -7044,6 +7141,283 @@ function MasterBar({ gainDb, onChange }: { gainDb: number; onChange: (gainDb: nu
   );
 }
 
+// ---------------- Mixer console ----------------
+
+// Bottom-dock mixer: one channel strip per track plus a master strip.
+// Subscribes to engine meters itself so the 30 Hz updates stay local.
+function MixerDock({
+  session,
+  focusedTrackId,
+  onFocusTrack,
+  onChange,
+  onSend,
+  masterGainDb,
+  onMasterGain,
+}: {
+  session: MixSession;
+  focusedTrackId?: string;
+  onFocusTrack: (trackId: string) => void;
+  onChange: (track: Track, patch: Partial<Track>) => void;
+  onSend: (track: Track, kind: "reverb" | "delay", levelDb: number) => void;
+  masterGainDb: number;
+  onMasterGain: (gainDb: number) => void | Promise<void>;
+}) {
+  const [trackPeaks, setTrackPeaks] = useState<number[]>([]);
+  const [masterPeak, setMasterPeak] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api.onMeters((event) => {
+      setTrackPeaks(event.trackPeaks);
+      setMasterPeak(event.masterPeak);
+    })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch(() => undefined);
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+  return (
+    <div className="mixer-dock">
+      <div className="mixer-strips">
+        {session.tracks.map((track, index) => (
+          <ChannelStrip
+            key={track.id}
+            track={track}
+            peak={trackPeaks[index] ?? 0}
+            focused={focusedTrackId === track.id}
+            onFocus={() => onFocusTrack(track.id)}
+            onChange={onChange}
+            onSend={onSend}
+          />
+        ))}
+        <MasterStrip gainDb={masterGainDb} peak={masterPeak} onChange={onMasterGain} />
+      </div>
+    </div>
+  );
+}
+
+function ChannelStrip({
+  track,
+  peak,
+  focused,
+  onFocus,
+  onChange,
+  onSend,
+}: {
+  track: Track;
+  peak: number;
+  focused: boolean;
+  onFocus: () => void;
+  onChange: (track: Track, patch: Partial<Track>) => void;
+  onSend: (track: Track, kind: "reverb" | "delay", levelDb: number) => void;
+}) {
+  const [gain, setGain] = useState(track.gainDb);
+  useEffect(() => { setGain(track.gainDb); }, [track.gainDb]);
+  const [pan, setPan] = useState(track.pan);
+  useEffect(() => { setPan(track.pan); }, [track.pan]);
+  return (
+    <div
+      className={`mixer-strip ${focused ? "focused" : ""}`}
+      style={{ ["--track-color" as string]: track.color }}
+      onPointerDown={onFocus}
+    >
+      <div className="strip-sends">
+        <StripMini label="REV" hint="Reverb send" min={-60} max={0} value={track.sends?.reverbDb ?? -60} onCommit={(v) => onSend(track, "reverb", v)} />
+        <StripMini label="DLY" hint="Delay send" min={-60} max={0} value={track.sends?.delayDb ?? -60} onCommit={(v) => onSend(track, "delay", v)} />
+      </div>
+      <div className="strip-pan" title="Pan. Double-click to recenter.">
+        <input
+          type="range"
+          min={-1}
+          max={1}
+          step={0.05}
+          value={pan}
+          onChange={(event) => setPan(Number(event.target.value))}
+          onPointerUp={() => onChange(track, { pan })}
+          onKeyUp={() => onChange(track, { pan })}
+          onDoubleClick={() => { setPan(0); onChange(track, { pan: 0 }); }}
+          aria-label={`${track.name} pan`}
+        />
+        <span>{formatPan(pan)}</span>
+      </div>
+      <div className="strip-body">
+        <Fader
+          value={gain}
+          min={-24}
+          max={12}
+          label={`${track.name} volume`}
+          onInput={setGain}
+          onCommit={(v) => { setGain(v); onChange(track, { gainDb: v }); }}
+        />
+        <div className="strip-meter" aria-hidden="true">
+          <span style={{ height: `${Math.max(0, Math.min(100, peak * 100))}%` }} />
+        </div>
+      </div>
+      <div className="strip-gain">{formatDb(gain)}</div>
+      <div className="strip-buttons">
+        <button
+          className={`strip-mute ${track.muted ? "active" : ""}`}
+          onClick={(event) => { event.stopPropagation(); onChange(track, { muted: !track.muted }); }}
+          title={track.muted ? "Unmute" : "Mute"}
+          aria-pressed={track.muted}
+        >M</button>
+        <button
+          className={`strip-solo ${track.solo ? "active" : ""}`}
+          onClick={(event) => { event.stopPropagation(); onChange(track, { solo: !track.solo }); }}
+          title={track.solo ? "Unsolo" : "Solo"}
+          aria-pressed={track.solo}
+        >S</button>
+      </div>
+      <div className="strip-name" title={track.name}>
+        {track.kind === "video" ? <Video size={10} /> : null}
+        <span>{track.name}</span>
+      </div>
+    </div>
+  );
+}
+
+function MasterStrip({
+  gainDb,
+  peak,
+  onChange,
+}: {
+  gainDb: number;
+  peak: number;
+  onChange: (gainDb: number) => void | Promise<void>;
+}) {
+  const [gain, setGain] = useState(gainDb);
+  useEffect(() => { setGain(gainDb); }, [gainDb]);
+  return (
+    <div className="mixer-strip master">
+      <div className="strip-sends" aria-hidden="true" />
+      <div className="strip-pan" aria-hidden="true" />
+      <div className="strip-body">
+        <Fader
+          value={gain}
+          min={-24}
+          max={12}
+          label="Master volume"
+          onInput={setGain}
+          onCommit={(v) => { setGain(v); void onChange(v); }}
+        />
+        <div className="strip-meter" aria-hidden="true">
+          <span style={{ height: `${Math.max(0, Math.min(100, peak * 100))}%` }} />
+        </div>
+      </div>
+      <div className="strip-gain">{formatDb(gain)}</div>
+      <div className="strip-buttons" aria-hidden="true" />
+      <div className="strip-name master-label"><span>MASTER</span></div>
+    </div>
+  );
+}
+
+// Vertical fader: pointer-driven, 0.5 dB steps, arrow keys for keyboard users,
+// double-click returns to unity.
+function Fader({
+  value,
+  min,
+  max,
+  label,
+  onInput,
+  onCommit,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  label: string;
+  onInput: (value: number) => void;
+  onCommit: (value: number) => void;
+}) {
+  const grooveRef = useRef<HTMLDivElement>(null);
+  const draggingRef = useRef(false);
+  const valueFromPointer = (clientY: number) => {
+    const rect = grooveRef.current?.getBoundingClientRect();
+    if (!rect || rect.height <= 0) return value;
+    const ratio = 1 - Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+    return Math.round((min + ratio * (max - min)) * 2) / 2;
+  };
+  const pct = ((Math.max(min, Math.min(max, value)) - min) / (max - min)) * 100;
+  const zeroPct = ((0 - min) / (max - min)) * 100;
+  return (
+    <div
+      className="fader"
+      role="slider"
+      tabIndex={0}
+      aria-label={label}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuenow={Math.round(value * 10) / 10}
+      aria-valuetext={formatDb(value)}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        draggingRef.current = true;
+        event.currentTarget.setPointerCapture(event.pointerId);
+        onInput(valueFromPointer(event.clientY));
+      }}
+      onPointerMove={(event) => {
+        if (draggingRef.current) onInput(valueFromPointer(event.clientY));
+      }}
+      onPointerUp={(event) => {
+        if (!draggingRef.current) return;
+        draggingRef.current = false;
+        event.currentTarget.releasePointerCapture(event.pointerId);
+        onCommit(valueFromPointer(event.clientY));
+      }}
+      onDoubleClick={() => onCommit(0)}
+      onKeyDown={(event) => {
+        const step = event.shiftKey ? 0.1 : 0.5;
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          onCommit(Math.min(max, Math.round((value + step) * 10) / 10));
+        } else if (event.key === "ArrowDown") {
+          event.preventDefault();
+          onCommit(Math.max(min, Math.round((value - step) * 10) / 10));
+        }
+      }}
+      title="Drag to set level. Double-click for 0 dB."
+    >
+      <div className="fader-groove" ref={grooveRef}>
+        <div className="fader-zero" style={{ bottom: `${zeroPct}%` }} />
+        <div className="fader-cap" style={{ bottom: `calc(${pct}% - 9px)` }} />
+      </div>
+    </div>
+  );
+}
+
+function StripMini({
+  label,
+  hint,
+  value,
+  min,
+  max,
+  onCommit,
+}: {
+  label: string;
+  hint: string;
+  value: number;
+  min: number;
+  max: number;
+  onCommit: (value: number) => void;
+}) {
+  const [local, setLocal] = useState(value);
+  useEffect(() => { setLocal(value); }, [value]);
+  return (
+    <label className="strip-mini" title={`${hint}: ${formatDb(local)}`}>
+      <span>{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={0.5}
+        value={local}
+        onChange={(event) => setLocal(Number(event.target.value))}
+        onPointerUp={() => onCommit(local)}
+        onKeyUp={() => onCommit(local)}
+        aria-label={hint}
+      />
+    </label>
+  );
+}
+
 const AUTO_MIX_STAGES = [
   { id: "raw_session_prep", label: "Raw session prep" },
   { id: "prep_intent", label: "Prep / intent" },
@@ -7159,6 +7533,44 @@ function formatTime(seconds: number) {
   const min = Math.floor(safe / 60);
   const sec = Math.floor(safe % 60).toString().padStart(2, "0");
   return `${min}:${sec}`;
+}
+
+// Musical position as bar.beat.sixteenth (4/4 assumed), 1-based like Cubase.
+function formatBars(seconds: number, bpm: number) {
+  const beats = Math.max(0, seconds) * bpm / 60;
+  const bar = Math.floor(beats / 4) + 1;
+  const beat = Math.floor(beats % 4) + 1;
+  const sixteenth = Math.floor((beats % 1) * 4) + 1;
+  return `${bar}.${beat}.${sixteenth}`;
+}
+
+// Transport LCD readout: m:ss.t with tenths, DAW-style.
+function formatLcdTime(seconds: number) {
+  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  const min = Math.floor(safe / 60);
+  const sec = Math.floor(safe % 60).toString().padStart(2, "0");
+  const tenths = Math.floor((safe % 1) * 10);
+  return `${min}:${sec}.${tenths}`;
+}
+
+// Master output meter in the transport LCD. Subscribes to engine meter events
+// itself so the 30 Hz updates re-render only this tiny component.
+function TransportMeter() {
+  const [peak, setPeak] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api.onMeters((event) => setPeak(event.masterPeak))
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch(() => undefined);
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+  const pct = Math.max(0, Math.min(100, peak * 100));
+  return (
+    <div className="lcd-meter" title="Master output level">
+      <span style={{ width: `${pct}%` }} />
+    </div>
+  );
 }
 
 function buildAbJudgeFixPrompt(result: AbJudgeResponse) {

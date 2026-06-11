@@ -5736,3 +5736,550 @@ button:disabled {
   color: var(--text-dim);
   text-align: center;
 }
+
+/* ============================================================
+   DAW reskin — studio-hardware surface language.
+   Flat dense panels, hairline borders, LCD transport, LED toggles.
+   Overrides the base tokens: keep this section last.
+   ============================================================ */
+
+:root {
+  --radius-sm: 2px;
+  --radius: 4px;
+  --radius-lg: 6px;
+  --bg-app: #08090b;
+  --bg-main: #0b0d10;
+  --bg-panel: #101316;
+  --bg-panel-2: #14181d;
+  --bg-elevated: #1a1f25;
+  --bg-hover: #222931;
+  --bg-input: #07080a;
+  --line-soft: rgba(255, 255, 255, 0.05);
+  --line: rgba(255, 255, 255, 0.09);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --lcd-glow: rgba(154, 215, 239, 0.35);
+}
+
+/* --- Topbar as hardware fascia: brand | transport+LCD | tools --- */
+.topbar {
+  display: grid;
+  /* Side columns never collapse below their content, so the toolbar does not
+     wrap; the transport stays centered whenever there is room. */
+  grid-template-columns: minmax(max-content, 1fr) auto minmax(max-content, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 8px 14px;
+  background: linear-gradient(180deg, #181d23 0%, #11151a 55%, #0e1216 100%);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.7);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+@media (max-width: 1380px) {
+  /* The OS title bar already says AutoMixer — drop the fascia brand to keep
+     the transport centered on narrower windows. */
+  .topbar h1 { display: none; }
+}
+
+.transport {
+  flex-wrap: nowrap;
+}
+
+.topbar-group {
+  gap: 2px;
+}
+
+.title-block {
+  grid-template-columns: auto auto;
+  grid-template-areas: "brand session";
+  column-gap: 12px;
+}
+
+.topbar h1 {
+  font-size: var(--text-md);
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.transport-center {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Flat toolbar buttons: quiet until hovered, like DAW toolbars. */
+.topbar .topbar-group button {
+  height: 32px;
+  min-width: 32px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: var(--radius);
+}
+
+.topbar .topbar-group button:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: transparent;
+  color: var(--text);
+}
+
+.topbar .topbar-group button.active {
+  color: var(--amber);
+  background: rgba(230, 190, 99, 0.12);
+  border-color: rgba(230, 190, 99, 0.35);
+}
+
+.topbar .bypass-toggle,
+.topbar .ai-bulk {
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, #1b2127, #14181d);
+  color: var(--text-muted);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+/* Transport cluster: physical buttons. */
+.topbar .topbar-group button.transport-play {
+  min-width: 46px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, #1c2228, #14181c);
+  color: var(--text);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+.topbar .topbar-group button.transport-play:hover {
+  background: linear-gradient(180deg, #222931, #181d22);
+}
+
+.topbar .topbar-group button.transport-play.playing {
+  color: #7ef0a8;
+  border-color: rgba(98, 201, 138, 0.55);
+  background: linear-gradient(180deg, rgba(98, 201, 138, 0.22), rgba(98, 201, 138, 0.08));
+  box-shadow: 0 0 12px rgba(98, 201, 138, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* --- The LCD --- */
+.lcd {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  min-width: 170px;
+  padding: 5px 12px 5px;
+  border: 1px solid rgba(0, 0, 0, 0.85);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, #03070a, #071013);
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.65), 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.lcd-main {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.lcd-time {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: var(--accent-strong);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 8px var(--lcd-glow);
+}
+
+.lcd-total {
+  font-size: 10.5px;
+  color: rgba(154, 215, 239, 0.5);
+  font-variant-numeric: tabular-nums;
+}
+
+.lcd-sub {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: rgba(154, 215, 239, 0.45);
+  text-transform: uppercase;
+}
+
+.lcd-meter {
+  flex: 1;
+  min-width: 52px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.lcd-meter > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--green) 0%, var(--green) 62%, var(--amber) 82%, var(--red) 100%);
+  transition: width 50ms linear;
+}
+
+@media (max-width: 1280px) {
+  .lcd-sub { display: none; }
+  .lcd { min-width: 128px; }
+}
+
+@media (max-width: 1060px) {
+  .lcd { display: none; }
+}
+
+/* --- Track heads: color strip + LED-style R/M/S --- */
+.track-head {
+  position: relative;
+}
+
+.track-head::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--track-color, transparent);
+  opacity: 0.9;
+}
+
+.track-head > button {
+  width: 20px;
+  height: 18px;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.6);
+  background: linear-gradient(180deg, #20262c, #161b20);
+  color: var(--text-dim);
+  font-size: 9px;
+  font-weight: 700;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.track-head > button:hover {
+  color: var(--text);
+  background: linear-gradient(180deg, #272e36, #1a2026);
+}
+
+.track-head > .record-arm.active {
+  color: #fff;
+  border-color: rgba(255, 90, 100, 0.8);
+  background: linear-gradient(180deg, #c2434d, #8e2f37);
+  box-shadow: 0 0 8px rgba(255, 90, 100, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.track-head > .mute-btn.active {
+  color: #2b2410;
+  border-color: rgba(230, 190, 99, 0.8);
+  background: linear-gradient(180deg, #e6be63, #c89e44);
+  box-shadow: 0 0 8px rgba(230, 190, 99, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+
+.track-head > .solo-btn.active {
+  color: #0d2417;
+  border-color: rgba(98, 201, 138, 0.8);
+  background: linear-gradient(180deg, #62c98a, #44a76c);
+  box-shadow: 0 0 8px rgba(98, 201, 138, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+
+/* --- Wells and panels --- */
+.timeline {
+  box-shadow: inset 0 8px 14px -10px rgba(0, 0, 0, 0.9);
+}
+
+.assistant {
+  border-left: 1px solid rgba(0, 0, 0, 0.7);
+  box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.03);
+}
+
+.track-inspector {
+  border-right: 1px solid rgba(0, 0, 0, 0.7);
+  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.02);
+}
+
+.master-bar {
+  border-top: 1px solid rgba(0, 0, 0, 0.7);
+  background: linear-gradient(180deg, #14181d, #0e1216);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+/* Faders: accent thumbs everywhere. */
+input[type="range"] {
+  accent-color: var(--accent);
+}
+
+/* ============================================================
+   Mixer console dock + bars/beats display
+   ============================================================ */
+
+.mixer-dock {
+  flex: 0 0 auto;
+  border-top: 1px solid rgba(0, 0, 0, 0.75);
+  background: linear-gradient(180deg, #15191e 0%, #101316 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.mixer-strips {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  height: 236px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.mixer-strip {
+  flex: 0 0 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 5px 5px;
+  border: 1px solid rgba(0, 0, 0, 0.55);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, #181d23, #12161b);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  cursor: default;
+  user-select: none;
+}
+
+.mixer-strip.focused {
+  border-color: rgba(111, 183, 216, 0.45);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 0 0 1px rgba(111, 183, 216, 0.25);
+}
+
+.mixer-strip.master {
+  flex-basis: 72px;
+  margin-left: 8px;
+  border-color: rgba(230, 190, 99, 0.3);
+  background: linear-gradient(180deg, #1c1f1a, #14150f);
+}
+
+.strip-sends {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 30px;
+}
+
+.strip-mini {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  align-items: center;
+  gap: 3px;
+}
+
+.strip-mini span {
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.strip-mini input[type="range"] {
+  width: 100%;
+  height: 10px;
+  margin: 0;
+}
+
+.strip-pan {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  min-height: 26px;
+}
+
+.strip-pan input[type="range"] {
+  width: 100%;
+  height: 10px;
+  margin: 0;
+}
+
+.strip-pan span {
+  font-size: 8.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.strip-body {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  min-height: 0;
+}
+
+/* --- Fader --- */
+.fader {
+  display: flex;
+  justify-content: center;
+  width: 26px;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.fader:focus-visible {
+  outline: 2px solid rgba(111, 183, 216, 0.48);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.fader-groove {
+  position: relative;
+  width: 4px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #04060a, #0a0e12);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.fader-zero {
+  position: absolute;
+  left: -6px;
+  right: -6px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.fader-cap {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 22px;
+  height: 18px;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.8);
+  background: linear-gradient(180deg, #3a424c 0%, #262c34 45%, #1c2127 50%, #262c34 55%, #171c21 100%);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.fader-cap::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  top: 50%;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+/* --- Strip meter --- */
+.strip-meter {
+  position: relative;
+  width: 5px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.55);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.7);
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+}
+
+.strip-meter > span {
+  display: block;
+  width: 100%;
+  background: linear-gradient(0deg, var(--green) 0%, var(--green) 62%, var(--amber) 82%, var(--red) 100%);
+  transition: height 50ms linear;
+}
+
+.strip-gain {
+  text-align: center;
+  font-size: 9px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.strip-buttons {
+  display: flex;
+  justify-content: center;
+  gap: 3px;
+  min-height: 18px;
+}
+
+.strip-buttons button {
+  width: 20px;
+  height: 18px;
+  padding: 0;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.6);
+  background: linear-gradient(180deg, #20262c, #161b20);
+  color: var(--text-dim);
+  font-size: 9px;
+  font-weight: 700;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.strip-buttons .strip-mute.active {
+  color: #2b2410;
+  border-color: rgba(230, 190, 99, 0.8);
+  background: linear-gradient(180deg, #e6be63, #c89e44);
+  box-shadow: 0 0 8px rgba(230, 190, 99, 0.4);
+}
+
+.strip-buttons .strip-solo.active {
+  color: #0d2417;
+  border-color: rgba(98, 201, 138, 0.8);
+  background: linear-gradient(180deg, #62c98a, #44a76c);
+  box-shadow: 0 0 8px rgba(98, 201, 138, 0.4);
+}
+
+.strip-name {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-height: 16px;
+  padding: 2px 3px 1px;
+  border-top: 2px solid var(--track-color, var(--line));
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+.strip-name span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.strip-name.master-label {
+  border-top-color: var(--amber);
+  color: var(--amber);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+/* --- Bars/beats --- */
+.lcd-bars {
+  margin-left: 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: rgba(230, 190, 99, 0.85);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 6px rgba(230, 190, 99, 0.3);
+}
+
+.time-ruler-bar {
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  height: 5px;
+  background: rgba(230, 190, 99, 0.28);
+  pointer-events: none;
+}
+
+.time-ruler-bar.labeled {
+  height: 8px;
+  background: rgba(230, 190, 99, 0.5);
+}
+
+.time-ruler-bar.labeled span {
+  position: absolute;
+  bottom: 1px;
+  left: 3px;
+  font-size: 8px;
+  color: rgba(230, 190, 99, 0.6);
+  font-variant-numeric: tabular-nums;
+}
