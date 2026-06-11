@@ -71,6 +71,10 @@ type VideoEditorWindowPayload = {
   playhead: number;
 };
 
+type MixerWindowPayload = {
+  sessionId: string;
+};
+
 type CameraCanvasLayerModel = {
   id: string;
   track: CameraPreviewTrack;
@@ -120,6 +124,7 @@ export function App() {
   const videoRecordersRef = useRef<Record<string, { recorder: MediaRecorder; stream: MediaStream; previewElement: HTMLVideoElement; chunks: Blob[]; startSample: number; startedAt: number; mimeType: string; createAudioTrack: boolean; transportOffsetMs: number }>>({});
   const cameraPreviewWindowRef = useRef<WebviewWindow | null>(null);
   const videoEditorWindowRef = useRef<WebviewWindow | null>(null);
+  const mixerWindowRef = useRef<WebviewWindow | null>(null);
   const trackLanesRef = useRef<HTMLDivElement>(null);
   const [project, setProject] = useState<MixProject>();
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
@@ -245,9 +250,7 @@ export function App() {
   // Pending in-app confirmation dialog (replaces window.confirm).
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
-  // Mixer console dock visibility, persisted so the workspace layout survives restarts.
-  const [mixerOpen, setMixerOpen] = useState(() => localStorage.getItem("autoMixer.mixerOpen") !== "0");
-  useEffect(() => { localStorage.setItem("autoMixer.mixerOpen", mixerOpen ? "1" : "0"); }, [mixerOpen]);
+  const [mixerWindowOpen, setMixerWindowOpen] = useState(false);
   const busyRef = useRef(false);
   useEffect(() => { busyRef.current = busy; }, [busy]);
 
@@ -379,6 +382,20 @@ export function App() {
   useEffect(() => {
     void bootstrap();
   }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<{ sessionId: string }>("mixer:session-updated", (event) => {
+      if (!session || event.payload.sessionId !== session.id) return;
+      void api.getSession(session.id).then(setProject).catch(pushSystem);
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [session?.id]);
+
+  useEffect(() => {
+    if (!session || !mixerWindowOpen) return;
+    void mixerWindowRef.current?.emit("mixer:update", { sessionId: session.id } satisfies MixerWindowPayload).catch(() => undefined);
+  }, [session?.id, project, mixerWindowOpen]);
 
   useEffect(() => {
     void api.listMixerProfiles().then(setProfilePresets).catch(() => undefined);
@@ -1325,6 +1342,50 @@ export function App() {
     }
   }
 
+  async function openMixerWindow() {
+    if (!session) return;
+    const payload: MixerWindowPayload = { sessionId: session.id };
+    try {
+      const query = new URLSearchParams({ mixer: "1", sessionId: session.id });
+      let mixer = await WebviewWindow.getByLabel("mixer");
+      if (!mixer) {
+        mixer = new WebviewWindow("mixer", {
+          url: `/?${query.toString()}`,
+          title: `${session.name} Mixer`,
+          width: 1180,
+          height: 430,
+          minWidth: 760,
+          minHeight: 320,
+          resizable: true,
+          center: true,
+        });
+        mixerWindowRef.current = mixer;
+        setMixerWindowOpen(true);
+        const createdMixer = mixer;
+        createdMixer.once("tauri://created", () => {
+          void createdMixer.emit("mixer:update", payload);
+        });
+        createdMixer.once("tauri://destroyed", () => {
+          if (mixerWindowRef.current === createdMixer) mixerWindowRef.current = null;
+          setMixerWindowOpen(false);
+        });
+        createdMixer.once("tauri://error", (event) => {
+          setMixerWindowOpen(false);
+          pushSystem(`Could not open mixer window: ${String(event.payload)}`);
+        });
+      } else {
+        mixerWindowRef.current = mixer;
+        setMixerWindowOpen(true);
+        await mixer.emit("mixer:update", payload).catch(() => undefined);
+      }
+      await mixer.show().catch(() => undefined);
+      await mixer.setTitle(`${session.name} Mixer`).catch(() => undefined);
+      await mixer.setFocus().catch(() => undefined);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
   async function startVideoRecordingsAt(startSeconds: number) {
     if (!session) return true;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
@@ -1469,19 +1530,6 @@ export function App() {
     if (!actions.length) return;
     const updated = await api.applyActions(session.id, actions, "Manual control change");
     setProject(updated);
-  }
-
-  async function setTrackSend(track: Track, kind: "reverb" | "delay", levelDb: number) {
-    if (!session) return;
-    try {
-      const action = kind === "reverb"
-        ? { tool: "set_reverb_send" as const, trackId: track.id, levelDb }
-        : { tool: "set_delay_send" as const, trackId: track.id, levelDb };
-      const updated = await api.applyActions(session.id, [action], "Manual send change");
-      setProject(updated);
-    } catch (error) {
-      pushSystem(error);
-    }
   }
 
   function toggleTrackSelection(trackId: string) {
@@ -3136,10 +3184,10 @@ export function App() {
             <span className="topbar-sep" aria-hidden="true" />
             <div className="topbar-group" role="group" aria-label="File and help">
               <button
-                className={mixerOpen ? "active" : ""}
-                onClick={() => setMixerOpen((open) => !open)}
-                title={mixerOpen ? "Hide the mixer console" : "Show the mixer console"}
-                aria-pressed={mixerOpen}
+                className={mixerWindowOpen ? "active" : ""}
+                onClick={() => void openMixerWindow()}
+                title={mixerWindowOpen ? "Focus mixer window" : "Open mixer window"}
+                aria-pressed={mixerWindowOpen}
               >
                 <SlidersHorizontal size={18} />
               </button>
@@ -3770,21 +3818,6 @@ export function App() {
             </div>
           </div>
         </div>
-
-        {mixerOpen ? (
-          <MixerDock
-            session={session}
-            focusedTrackId={focusedTrackId}
-            onFocusTrack={(trackId) => setFocusedTrackId(trackId)}
-            onChange={(track, patch) => void updateTrack(track, patch)}
-            onSend={(track, kind, levelDb) => void setTrackSend(track, kind, levelDb)}
-            masterGainDb={session.master.gainDb}
-            onMasterGain={async (gainDb) => {
-              const updated = await api.setMasterGain(session.id, gainDb);
-              setProject(updated);
-            }}
-          />
-        ) : null}
 
         <MasterBar
           gainDb={session.master.gainDb}
@@ -4883,6 +4916,112 @@ function readVideoEditorPayloadFromUrl(): VideoEditorWindowPayload | undefined {
     range: Number.isFinite(start) && Number.isFinite(end) ? { start: Math.min(start, end), end: Math.max(start, end) } : undefined,
     playhead: 0,
   };
+}
+
+function readMixerPayloadFromUrl(): MixerWindowPayload | undefined {
+  const params = new URLSearchParams(window.location.search);
+  const sessionId = params.get("sessionId") ?? "";
+  return sessionId ? { sessionId } : undefined;
+}
+
+export function MixerWindowApp() {
+  const initialPayloadRef = useRef<MixerWindowPayload | undefined>(readMixerPayloadFromUrl());
+  const [project, setProject] = useState<MixProject>();
+  const [focusedTrackId, setFocusedTrackId] = useState<string | undefined>();
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState<string | null>(null);
+  const session = project?.session;
+
+  useEffect(() => {
+    void loadMixerSession(initialPayloadRef.current?.sessionId);
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<MixerWindowPayload>("mixer:update", (event) => {
+      void loadMixerSession(event.payload.sessionId);
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
+  async function loadMixerSession(sessionId?: string) {
+    if (!sessionId) {
+      setStatus("Open the mixer from the main AutoMixer window.");
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const loaded = await api.getSession(sessionId);
+      setProject(loaded);
+      setStatus(null);
+      void getCurrentWebviewWindow().setTitle(`${loaded.session.name} Mixer`).catch(() => undefined);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function publishUpdate(updated: MixProject) {
+    setProject(updated);
+    await emit("mixer:session-updated", { sessionId: updated.session.id }).catch(() => undefined);
+  }
+
+  async function updateMixerTrack(track: Track, patch: Partial<Track>) {
+    if (!session) return;
+    const actions: MixAction[] = [];
+    if (patch.gainDb !== undefined) actions.push({ tool: "set_track_gain" as const, trackId: track.id, gainDb: patch.gainDb });
+    if (patch.pan !== undefined) actions.push({ tool: "set_track_pan" as const, trackId: track.id, pan: patch.pan });
+    if (patch.muted !== undefined) actions.push({ tool: "mute_track" as const, trackId: track.id, muted: patch.muted });
+    if (patch.solo !== undefined) actions.push({ tool: "solo_track" as const, trackId: track.id, solo: patch.solo });
+    if (actions.length === 0) return;
+    try {
+      await publishUpdate(await api.applyActions(session.id, actions, "Mixer window control change"));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function setMixerMasterGain(gainDb: number) {
+    if (!session) return;
+    try {
+      await publishUpdate(await api.setMasterGain(session.id, gainDb));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  if (loading) {
+    return <main className="mixer-window loading">Loading mixer...</main>;
+  }
+
+  if (!session) {
+    return (
+      <main className="mixer-window mixer-window-empty">
+        <strong>Mixer unavailable</strong>
+        <span>{status ?? "No session loaded."}</span>
+      </main>
+    );
+  }
+
+  return (
+    <main className="mixer-window">
+      <div className="mixer-window-head">
+        <strong>{session.name}</strong>
+        <span>{session.tracks.length} tracks</span>
+        {status ? <em>{status}</em> : null}
+      </div>
+      <MixerDock
+        session={session}
+        focusedTrackId={focusedTrackId}
+        onFocusTrack={setFocusedTrackId}
+        onChange={(track, patch) => void updateMixerTrack(track, patch)}
+        masterGainDb={session.master.gainDb}
+        onMasterGain={(gainDb) => void setMixerMasterGain(gainDb)}
+      />
+    </main>
+  );
 }
 
 export function VideoEditorWindowApp() {
@@ -7150,7 +7289,6 @@ function MixerDock({
   focusedTrackId,
   onFocusTrack,
   onChange,
-  onSend,
   masterGainDb,
   onMasterGain,
 }: {
@@ -7158,7 +7296,6 @@ function MixerDock({
   focusedTrackId?: string;
   onFocusTrack: (trackId: string) => void;
   onChange: (track: Track, patch: Partial<Track>) => void;
-  onSend: (track: Track, kind: "reverb" | "delay", levelDb: number) => void;
   masterGainDb: number;
   onMasterGain: (gainDb: number) => void | Promise<void>;
 }) {
@@ -7186,7 +7323,6 @@ function MixerDock({
             focused={focusedTrackId === track.id}
             onFocus={() => onFocusTrack(track.id)}
             onChange={onChange}
-            onSend={onSend}
           />
         ))}
         <MasterStrip gainDb={masterGainDb} peak={masterPeak} onChange={onMasterGain} />
@@ -7201,14 +7337,12 @@ function ChannelStrip({
   focused,
   onFocus,
   onChange,
-  onSend,
 }: {
   track: Track;
   peak: number;
   focused: boolean;
   onFocus: () => void;
   onChange: (track: Track, patch: Partial<Track>) => void;
-  onSend: (track: Track, kind: "reverb" | "delay", levelDb: number) => void;
 }) {
   const [gain, setGain] = useState(track.gainDb);
   useEffect(() => { setGain(track.gainDb); }, [track.gainDb]);
@@ -7220,10 +7354,6 @@ function ChannelStrip({
       style={{ ["--track-color" as string]: track.color }}
       onPointerDown={onFocus}
     >
-      <div className="strip-sends">
-        <StripMini label="REV" hint="Reverb send" min={-60} max={0} value={track.sends?.reverbDb ?? -60} onCommit={(v) => onSend(track, "reverb", v)} />
-        <StripMini label="DLY" hint="Delay send" min={-60} max={0} value={track.sends?.delayDb ?? -60} onCommit={(v) => onSend(track, "delay", v)} />
-      </div>
       <div className="strip-pan" title="Pan. Double-click to recenter.">
         <input
           type="range"
@@ -7288,7 +7418,6 @@ function MasterStrip({
   useEffect(() => { setGain(gainDb); }, [gainDb]);
   return (
     <div className="mixer-strip master">
-      <div className="strip-sends" aria-hidden="true" />
       <div className="strip-pan" aria-hidden="true" />
       <div className="strip-body">
         <Fader
@@ -7376,45 +7505,13 @@ function Fader({
       title="Drag to set level. Double-click for 0 dB."
     >
       <div className="fader-groove" ref={grooveRef}>
+        <div className="fader-scale" aria-hidden="true">
+          {[100, 75, 50, 25, 0].map((tick) => <span key={tick} style={{ bottom: `${tick}%` }} />)}
+        </div>
         <div className="fader-zero" style={{ bottom: `${zeroPct}%` }} />
         <div className="fader-cap" style={{ bottom: `calc(${pct}% - 9px)` }} />
       </div>
     </div>
-  );
-}
-
-function StripMini({
-  label,
-  hint,
-  value,
-  min,
-  max,
-  onCommit,
-}: {
-  label: string;
-  hint: string;
-  value: number;
-  min: number;
-  max: number;
-  onCommit: (value: number) => void;
-}) {
-  const [local, setLocal] = useState(value);
-  useEffect(() => { setLocal(value); }, [value]);
-  return (
-    <label className="strip-mini" title={`${hint}: ${formatDb(local)}`}>
-      <span>{label}</span>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={0.5}
-        value={local}
-        onChange={(event) => setLocal(Number(event.target.value))}
-        onPointerUp={() => onCommit(local)}
-        onKeyUp={() => onCommit(local)}
-        aria-label={hint}
-      />
-    </label>
   );
 }
 
