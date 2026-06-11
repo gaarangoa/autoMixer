@@ -40,6 +40,7 @@ struct UiConfig {
 #[derive(Serialize)]
 struct ModelsResponse {
     models: Vec<String>,
+    provider: String,
 }
 
 #[derive(Serialize)]
@@ -126,9 +127,9 @@ async fn get_config(State(state): State<WebState>) -> Json<UiConfig> {
 
 async fn list_ollama_models(State(state): State<WebState>, Query(query): Query<ModelsQuery>) -> WebResult<ModelsResponse> {
     let base_url = query.base_url.unwrap_or(state.config.ollama_base_url);
-    assistant::list_ollama_models(base_url)
+    assistant::list_models(base_url)
         .await
-        .map(|models| Json(ModelsResponse { models }))
+        .map(|(provider, models)| Json(ModelsResponse { models, provider: provider.label().to_string() }))
         .map_err(error)
 }
 

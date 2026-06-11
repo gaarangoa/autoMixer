@@ -24,7 +24,10 @@ export type ExportQuality = "fast" | "high";
 export const api = {
   config: () => tauriInvoke<{ ollamaBaseUrl: string; ollamaModel: string }>("get_config"),
   restartApp: () => tauriInvoke<void>("restart_app"),
-  ollamaModels: (baseUrl: string) => tauriInvoke<{ models: string[] }>("list_ollama_models", { baseUrl }),
+  cancelAgent: () => tauriInvoke<void>("cancel_agent"),
+  // Lists models from the server at baseUrl — Ollama, vLLM, or llama.cpp (the
+  // backend auto-detects the protocol). `provider` is the detected server kind.
+  ollamaModels: (baseUrl: string) => tauriInvoke<{ models: string[]; provider: string }>("list_ollama_models", { baseUrl }),
   inputDevices: () => tauriInvoke<{ devices: string[] }>("list_input_devices"),
   inputDeviceChannelCount: (inputDevice?: string) => tauriInvoke<number>("list_input_device_channels", { inputDevice }),
   skills: () => tauriInvoke<SkillCatalog>("get_skill_catalog"),

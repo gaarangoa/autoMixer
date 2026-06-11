@@ -19,7 +19,7 @@ use crate::{
 
 use crate::assistant::{
     ai_stem_preservation_block, build_capability_snapshot, expand_skills_from_actions,
-    extract_json_object, mixing_fundamentals_block, ollama_generate, profile_block, sections_block,
+    extract_json_object, llm_generate, mixing_fundamentals_block, profile_block, sections_block,
     substitute_quoted, AccumulatingObserver, LlmObserver,
 };
 
@@ -285,17 +285,22 @@ pub async fn run_stage(
     let aliased_prompt = substitute_quoted(&prompt, &track_aliases, true);
 
     let phase = stage.id();
-    let call = match ollama_generate(&base_url, &model, &aliased_prompt, ACTION_TIMEOUT_MS, phase, observer.as_ref()).await {
+    let call = match llm_generate(&base_url, &model, &aliased_prompt, ACTION_TIMEOUT_MS, phase, observer.as_ref()).await {
         Some(c) => c,
         None => {
+            let cancelled = crate::assistant::agent_cancelled();
             return Ok(StageReport {
                 stage_id: stage.id().into(),
                 display_name: stage.display_name().into(),
-                status: "error".into(),
+                status: if cancelled { "cancelled".into() } else { "error".into() },
                 action_count: 0,
                 explanation: None,
                 warnings: Vec::new(),
-                error: Some(format!("Ollama did not respond ({model}).")),
+                error: Some(if cancelled {
+                    crate::assistant::CANCELLED_MESSAGE.to_string()
+                } else {
+                    format!("The model server did not respond ({model}).")
+                }),
                 tokens: 0,
                 elapsed_ms: 0,
             });
@@ -1096,7 +1101,7 @@ mod tests {
         ] {
             let prompt = substitute_quoted(&build_stage_prompt(&session, stage), &track_aliases, true);
             let observer = TestObserver::new();
-            let call = ollama_generate(&base_url, &model, &prompt, 600_000, stage.id(), &observer)
+            let call = llm_generate(&base_url, &model, &prompt, 600_000, stage.id(), &observer)
                 .await
                 .unwrap_or_else(|| panic!("{}: Ollama did not respond", stage.id()));
             let raw_real = substitute_quoted(&call.response, &track_aliases, false);

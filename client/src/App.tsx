@@ -1,15 +1,30 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { Camera, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, Square, Trash2, Upload, Video } from "lucide-react";
+import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { AlertCircle, Camera, CheckCircle2, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, Info, Keyboard, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, Square, Trash2, Upload, Video, X } from "lucide-react";
 import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { WebviewWindow, getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getVersion } from "@tauri-apps/api/app";
 import { api, type ExportAspect, type ExportQuality } from "./api";
 
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "gpt-oss:20b";
 const DEFAULT_AGENT_VIDEO_MODEL = "qwen2.5vl:latest";
+
+const IS_MAC = typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent);
+const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
+const ALT_KEY = IS_MAC ? "⌥" : "Alt";
+const SHIFT_KEY = IS_MAC ? "⇧" : "Shift";
+
+type Toast = { id: number; kind: "success" | "error" | "info"; text: string };
+
+type ConfirmRequest = {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  resolve: (accepted: boolean) => void;
+};
 
 type CameraPreviewTrack = {
   id: string;
@@ -222,6 +237,16 @@ export function App() {
   // For mono tracks: [chIdx]. For stereo: [leftIdx, rightIdx]. Empty/undefined = default 0/0+1.
   const [trackInputChannels, setTrackInputChannels] = useState<Record<string, number[]>>({});
   const [liveRecordingPeaks, setLiveRecordingPeaks] = useState<number[]>([]);
+  // Transient notifications (errors, action confirmations). Rendered in a fixed
+  // stack so feedback is visible even when the chat log is scrolled away.
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const toastIdRef = useRef(0);
+  const toastTimersRef = useRef<Record<number, number>>({});
+  // Pending in-app confirmation dialog (replaces window.confirm).
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const busyRef = useRef(false);
+  useEffect(() => { busyRef.current = busy; }, [busy]);
 
   const session = project?.session;
   const chatLogRef = useRef<HTMLDivElement>(null);
@@ -245,6 +270,68 @@ export function App() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [selectedClip, session]);
+
+  // Global shortcuts: Space (play/pause), Cmd/Ctrl+Z (undo), Shift+Cmd/Ctrl+Z or
+  // Cmd/Ctrl+Y (redo), ? (shortcut help), Escape (close overlays).
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const inEditable = !!target?.closest("input, textarea, select, [contenteditable=\"true\"]");
+      const mod = event.metaKey || event.ctrlKey;
+      if (event.key === "Escape") {
+        setShortcutsOpen(false);
+        setAddTrackMenuOpen(false);
+        setSessionMenuOpen(false);
+        return;
+      }
+      if (inEditable) return;
+      if (mod && !event.altKey && (event.key === "z" || event.key === "Z")) {
+        event.preventDefault();
+        if (busyRef.current) return;
+        if (event.shiftKey) void doRedo(); else void doUndo();
+        return;
+      }
+      if (mod && !event.altKey && !event.shiftKey && (event.key === "y" || event.key === "Y")) {
+        event.preventDefault();
+        if (busyRef.current) return;
+        void doRedo();
+        return;
+      }
+      if (event.key === " " && !mod && !event.altKey && !event.shiftKey) {
+        if (target?.closest("button, a, [role=\"menu\"]")) return;
+        event.preventDefault();
+        void togglePlayRef.current();
+        return;
+      }
+      if (event.key === "?" && !mod) {
+        event.preventDefault();
+        setShortcutsOpen((open) => !open);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [session?.id]);
+
+  // Keyboard handling for the confirmation dialog: Escape cancels, Enter confirms.
+  // Capture phase so timeline/selection Escape handlers do not also fire.
+  useEffect(() => {
+    if (!confirmRequest) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        confirmRequest.resolve(false);
+        setConfirmRequest(null);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        confirmRequest.resolve(true);
+        setConfirmRequest(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [confirmRequest]);
 
   const lastLoadedSessionRef = useRef<string | undefined>(undefined);
   useEffect(() => {
@@ -293,6 +380,26 @@ export function App() {
   useEffect(() => {
     void api.listMixerProfiles().then(setProfilePresets).catch(() => undefined);
     void api.inputDevices().then((result) => setInputDevices(result.devices)).catch(() => undefined);
+  }, []);
+
+  // Keep the OS window title in sync with the open session, like any
+  // document-based app ("thunder — AutoMixer").
+  useEffect(() => {
+    if (!session?.name) return;
+    try {
+      void getCurrentWebviewWindow().setTitle(`${session.name} — AutoMixer`).catch(() => undefined);
+    } catch {
+      // Not running inside Tauri (plain-browser dev) — skip.
+    }
+  }, [session?.name]);
+
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    try {
+      void getVersion().then(setAppVersion).catch(() => undefined);
+    } catch {
+      // Not running inside Tauri — leave the version blank.
+    }
   }, []);
 
   async function applyProfilePreset(preset: ProfilePreset) {
@@ -907,7 +1014,12 @@ export function App() {
 
   async function deleteCurrentSession() {
     if (!session) return;
-    if (!window.confirm(`Delete session "${session.name}"? This cannot be undone.`)) return;
+    const confirmed = await confirmAction({
+      title: "Delete session",
+      message: `Delete session "${session.name}"? This cannot be undone.`,
+      confirmLabel: "Delete session",
+    });
+    if (!confirmed) return;
     setBusy(true);
     try {
       await api.deleteSession(session.id);
@@ -939,6 +1051,7 @@ export function App() {
     try {
       await api.exportProjectBundle(session.id, folder);
       setMessages((items) => [...items, { role: "system", text: `Saved bundle to ${folder}` }]);
+      pushToast("success", `Saved project bundle to ${folder}`);
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -958,6 +1071,7 @@ export function App() {
       setSelectedTrackIds([]);
       setSelectedRegionIds([]);
       await refreshSessionList();
+      pushToast("success", `Loaded project bundle "${loaded.session.name}"`);
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -995,9 +1109,9 @@ export function App() {
       const result = await api.ollamaModels(ollamaUrl);
       const models = result.models.filter(Boolean);
       setModelOptions(Array.from(new Set([...models, ollamaModel, agentVideoModel, agentVideoEditModel])));
-      setModelStatus(`${models.length} model${models.length === 1 ? "" : "s"}`);
+      setModelStatus(`${models.length} model${models.length === 1 ? "" : "s"} · ${result.provider}`);
     } catch (error) {
-      setModelStatus(error instanceof Error ? error.message : "Could not reach Ollama");
+      setModelStatus(error instanceof Error ? error.message : "Could not reach the model server");
     } finally {
       setModelsLoading(false);
     }
@@ -1439,11 +1553,12 @@ export function App() {
     }
     const tracks = session.tracks.filter((track) => selectedTrackIds.includes(track.id));
     if (tracks.length === 0) return;
-    const confirmed = window.confirm(
-      tracks.length === 1
+    const confirmed = await confirmAction({
+      title: tracks.length === 1 ? "Delete track" : "Delete tracks",
+      message: tracks.length === 1
         ? `Delete track "${tracks[0].name}"?`
-        : `Delete ${tracks.length} selected tracks?`
-    );
+        : `Delete ${tracks.length} selected tracks?`,
+    });
     if (!confirmed) return;
     setBusy(true);
     try {
@@ -1760,7 +1875,7 @@ export function App() {
       pushSystem("Stop recording before deleting the recording track.");
       return;
     }
-    const confirmed = window.confirm(`Delete track "${track.name}"?`);
+    const confirmed = await confirmAction({ title: "Delete track", message: `Delete track "${track.name}"?` });
     if (!confirmed) return;
     setBusy(true);
     try {
@@ -1786,7 +1901,7 @@ export function App() {
       pushSystem("Stop recording before deleting clips on the recording track.");
       return;
     }
-    const confirmed = window.confirm(`Delete recording "${clip.name ?? track.name}"?`);
+    const confirmed = await confirmAction({ title: "Delete clip", message: `Delete recording "${clip.name ?? track.name}"?` });
     if (!confirmed) return;
     setBusy(true);
     try {
@@ -1906,17 +2021,16 @@ export function App() {
     }
   }
 
-  // Stop a running/mistaken agent run by restarting the app. Flush the conversation
-  // first so the debounced chat save can't be cut off by the immediate restart.
-  async function stopAndRestart() {
-    if (session) {
-      try {
-        await api.saveChatMessages(session.id, messages);
-      } catch {
-        // best effort; restart anyway
-      }
+  // Cancel the in-flight agent run (chat turn, auto-mix pipeline, or video agent
+  // edit). The backend aborts between model calls; the pending request returns with
+  // "Stopped by user." which pushSystem reports as a neutral notice, not an error.
+  async function stopAgentRun() {
+    try {
+      await api.cancelAgent();
+      pushToast("info", "Stopping the agent run…");
+    } catch (error) {
+      pushSystem(error);
     }
-    await api.restartApp();
   }
 
   async function doUndo() {
@@ -2163,7 +2277,11 @@ export function App() {
 
   async function resetSession() {
     if (!session) return;
-    const confirmed = window.confirm("Clear all tracks, history, and chat to start a fresh session?");
+    const confirmed = await confirmAction({
+      title: "Reset session",
+      message: "Clear all tracks, history, and chat to start a fresh session?",
+      confirmLabel: "Clear session",
+    });
     if (!confirmed) return;
     setBusy(true);
     try {
@@ -2274,6 +2392,7 @@ export function App() {
     try {
       await api.renderMix(session.id, outputPath);
       setMessages((items) => [...items, { role: "system", text: `Rendered ${outputPath}` }]);
+      pushToast("success", `Exported WAV to ${outputPath}`);
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -2304,6 +2423,7 @@ export function App() {
       await api.renderVideoMix(session.id, outputPath, range?.startSample, range?.endSample, selectedVideoTrackIds, exportAspect, exportQuality);
       const rangeText = range ? ` (${formatTime(range.startSample / session.sampleRate)}-${formatTime(range.endSample / session.sampleRate)})` : "";
       setMessages((items) => [...items, { role: "system", text: `Rendered ${selectedVideoTrackIds.length} selected video track${selectedVideoTrackIds.length === 1 ? "" : "s"}${rangeText} ${outputPath}` }]);
+      pushToast("success", `Exported MP4 to ${outputPath}`);
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -2318,11 +2438,9 @@ export function App() {
       pushSystem("Select one or more video tracks before running Auto Video Edit.");
       return;
     }
-    const intervalText = window.prompt("Cut/sample interval in seconds", "1");
-    if (intervalText === null) return;
-    const sampleIntervalSeconds = Number(intervalText);
+    const sampleIntervalSeconds = Number(agentIntervalSeconds);
     if (!Number.isFinite(sampleIntervalSeconds) || sampleIntervalSeconds <= 0) {
-      pushSystem("Use a positive number for the Auto Video Edit interval.");
+      pushSystem("Set a positive cut interval (seconds) in the video panel before running Quick Edit.");
       return;
     }
     const range = selectedRange
@@ -2739,6 +2857,39 @@ export function App() {
       try { text = JSON.stringify(error); } catch { text = String(error); }
     } else text = String(error ?? "Unexpected error");
     setMessages((items) => [...items, { role: "system", text }]);
+    // A user-initiated stop is expected, not an error.
+    if (/stopped by user/i.test(text)) pushToast("info", "Agent run stopped.");
+    else pushToast("error", text);
+  }
+
+  function pushToast(kind: Toast["kind"], text: string) {
+    const id = ++toastIdRef.current;
+    // Keep the stack short — older toasts roll off instead of piling up.
+    setToasts((items) => [...items.slice(-3), { id, kind, text }]);
+    toastTimersRef.current[id] = window.setTimeout(() => dismissToast(id), kind === "error" ? 8000 : 4500);
+  }
+
+  function dismissToast(id: number) {
+    window.clearTimeout(toastTimersRef.current[id]);
+    delete toastTimersRef.current[id];
+    setToasts((items) => items.filter((item) => item.id !== id));
+  }
+
+  // In-app replacement for window.confirm — resolves true when the user confirms.
+  function confirmAction(options: { title: string; message: string; confirmLabel?: string }): Promise<boolean> {
+    return new Promise((resolve) => {
+      setConfirmRequest({
+        title: options.title,
+        message: options.message,
+        confirmLabel: options.confirmLabel ?? "Delete",
+        resolve,
+      });
+    });
+  }
+
+  function resolveConfirm(accepted: boolean) {
+    confirmRequest?.resolve(accepted);
+    setConfirmRequest(null);
   }
 
   if (loading) return <main className="loading">Loading AutoMixer...</main>;
@@ -2893,48 +3044,62 @@ export function App() {
             <span>{session.tracks.length} tracks · {formatTime(playhead)} / {formatTime(duration)}</span>
           </div>
           <div className="transport">
-            <button onClick={() => void togglePlay()} title={playing ? "Pause" : "Play"}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
-            <button
-              onClick={() => setAddTrackMenuOpen(true)}
-              disabled={busy}
-              title="Add a track"
-              aria-haspopup="dialog"
-            >
-              <Plus size={18} />
-            </button>
-            <button
-              className={cutToolActive ? "active" : ""}
-              onClick={() => setCutToolActive((on) => !on)}
-              disabled={busy}
-              title={cutToolActive ? "Cut tool active. Click again to disable." : "Cut tool — click a clip to split it"}
-              aria-pressed={cutToolActive}
-            >
-              <Scissors size={18} />
-            </button>
-            <button onClick={() => void stop()} title="Stop"><Square size={18} /></button>
-            <button
-              className={`bypass-toggle ${bypass ? "bypass-active" : ""}`}
-              onClick={() => void toggleBypass()}
-              title={bypass ? "Hearing ORIGINAL (no processing). Click for the mix." : "Hearing the MIX (with all processing). Click for the original."}
-              aria-pressed={bypass}
-            >
-              <GitCompareArrows size={16} />
-              <span className="bypass-label">{bypass ? "ORIG" : "MIX"}</span>
-            </button>
-            <button onClick={doUndo} title="Undo"><RotateCcw size={18} /></button>
-            <button onClick={doRedo} title="Redo"><RotateCw size={18} /></button>
-            <button
-              className={`ai-bulk ${session.tracks.length > 0 && session.tracks.every((t) => t.aiGenerated) ? "active" : ""}`}
-              onClick={() => void toggleAllAi()}
-              disabled={busy || session.tracks.length === 0}
-              title="Toggle AI-generated flag on all tracks (Suno, demucs, etc.). The agent uses gentler EQ/compression and lower reverb on AI stems."
-            >
-              All AI
-            </button>
-            <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={18} /></button>
-            <button className="upload" onClick={() => void importFiles()} title="Import audio">
-              <Upload size={18} />
-            </button>
+            <div className="topbar-group" role="group" aria-label="Transport">
+              <button className="transport-play" onClick={() => void togglePlay()} title={playing ? "Pause (Space)" : "Play (Space)"}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
+              <button onClick={() => void stop()} title="Stop"><Square size={16} /></button>
+            </div>
+            <span className="topbar-sep" aria-hidden="true" />
+            <div className="topbar-group" role="group" aria-label="Editing tools">
+              <button
+                onClick={() => setAddTrackMenuOpen(true)}
+                disabled={busy}
+                title="Add a track"
+                aria-haspopup="dialog"
+              >
+                <Plus size={18} />
+              </button>
+              <button
+                className={cutToolActive ? "active" : ""}
+                onClick={() => setCutToolActive((on) => !on)}
+                disabled={busy}
+                title={cutToolActive ? "Cut tool active. Click again to disable." : "Cut tool — click a clip to split it"}
+                aria-pressed={cutToolActive}
+              >
+                <Scissors size={18} />
+              </button>
+              <button onClick={doUndo} disabled={busy} title={`Undo (${MOD_KEY}Z)`}><RotateCcw size={18} /></button>
+              <button onClick={doRedo} disabled={busy} title={`Redo (${SHIFT_KEY}${MOD_KEY}Z)`}><RotateCw size={18} /></button>
+            </div>
+            <span className="topbar-sep" aria-hidden="true" />
+            <div className="topbar-group" role="group" aria-label="Monitoring">
+              <button
+                className={`bypass-toggle ${bypass ? "bypass-active" : ""}`}
+                onClick={() => void toggleBypass()}
+                title={bypass ? "Hearing ORIGINAL (no processing). Click for the mix." : "Hearing the MIX (with all processing). Click for the original."}
+                aria-pressed={bypass}
+              >
+                <GitCompareArrows size={16} />
+                <span className="bypass-label">{bypass ? "ORIG" : "MIX"}</span>
+              </button>
+              <button
+                className={`ai-bulk ${session.tracks.length > 0 && session.tracks.every((t) => t.aiGenerated) ? "active" : ""}`}
+                onClick={() => void toggleAllAi()}
+                disabled={busy || session.tracks.length === 0}
+                title="Toggle AI-generated flag on all tracks (Suno, demucs, etc.). The agent uses gentler EQ/compression and lower reverb on AI stems."
+              >
+                All AI
+              </button>
+            </div>
+            <span className="topbar-sep" aria-hidden="true" />
+            <div className="topbar-group" role="group" aria-label="File and help">
+              <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={18} /></button>
+              <button className="upload" onClick={() => void importFiles()} title="Import audio">
+                <Upload size={18} />
+              </button>
+              <button onClick={() => setShortcutsOpen(true)} title="Keyboard shortcuts (?)" aria-haspopup="dialog">
+                <Keyboard size={18} />
+              </button>
+            </div>
           </div>
         </header>
 
@@ -2989,7 +3154,12 @@ export function App() {
                 <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
                   <Download size={15} /> Export MP4
                 </button>
-                <button type="button" onClick={() => void renderAutoVideoEdit()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
+                <button
+                  type="button"
+                  onClick={() => void renderAutoVideoEdit()}
+                  disabled={busy || selectedVideoTracksForEditor.length === 0}
+                  title={`Auto-cut between the selected cameras every ${agentIntervalSeconds || "2"}s (no AI) and export the result`}
+                >
                   Quick Edit
                 </button>
                 <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
@@ -3372,7 +3542,16 @@ export function App() {
               {session.tracks.length === 0 ? (
                 <div className="empty">
                   <Upload size={28} />
-                  <span>Import stems to start mixing.</span>
+                  <span>This session is empty.</span>
+                  <div className="empty-actions">
+                    <button type="button" onClick={() => void importFiles()} disabled={busy}>
+                      <Upload size={15} /> Import stems
+                    </button>
+                    <button type="button" onClick={() => setAddTrackMenuOpen(true)} disabled={busy}>
+                      <Plus size={15} /> Add a track
+                    </button>
+                  </div>
+                  <small>Import audio stems, or add a recording / video track to capture takes.</small>
                 </div>
               ) : (() => {
                 const alignmentCandidates = session.tracks.flatMap((candidateTrack) => {
@@ -3554,17 +3733,17 @@ export function App() {
           <div className="assistant-title">
             <MessageSquare size={18} />
             <div className="mode-toggle">
-              <button className={mode === "interactive" ? "active" : ""} onClick={() => setMode("interactive")}>Chat</button>
-              <button className={mode === "auto" ? "active" : ""} onClick={() => setMode("auto")}>Auto-mix</button>
-              <button className={mode === "video" ? "active" : ""} onClick={() => setMode("video")}>Video</button>
+              <button className={mode === "interactive" ? "active" : ""} onClick={() => setMode("interactive")} title="Chat with the assistant about mix changes">Chat</button>
+              <button className={mode === "auto" ? "active" : ""} onClick={() => setMode("auto")} title="Run the staged autonomous mixing pipeline">Auto-mix</button>
+              <button className={mode === "video" ? "active" : ""} onClick={() => setMode("video")} title="Multicam video editing assistant">Video</button>
             </div>
           </div>
           <div className="assistant-head-actions">
-            {busy ? (
+            {busy || autoMixRunning ? (
               <button
                 className="chat-stop"
-                onClick={() => void stopAndRestart()}
-                title="Stop the current agent run by restarting the app"
+                onClick={() => void stopAgentRun()}
+                title="Stop the current agent run"
               >
                 <Square size={14} />
                 <span>Stop</span>
@@ -3578,9 +3757,12 @@ export function App() {
         {settingsOpen ? (
           <div className="llm-settings">
             <label>
-              Ollama URL
+              Model server URL
               <input value={ollamaUrl} onChange={(event) => setOllamaUrl(event.target.value)} placeholder={DEFAULT_OLLAMA_URL} />
             </label>
+            <div className="llm-hint">
+              Ollama (:11434), vLLM (:8000), or llama.cpp (:8080) — the protocol is detected automatically.
+            </div>
             <label>
               Model
               <select value={ollamaModel} onChange={(event) => setOllamaModel(event.target.value)}>
@@ -3637,6 +3819,7 @@ export function App() {
                 {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
               </select>
             </label>
+            {appVersion ? <div className="llm-about">AutoMixer v{appVersion}</div> : null}
           </div>
         ) : null}
         <div className={`reasoning-panel ${reasoningOpen ? "open" : ""}`}>
@@ -3690,6 +3873,7 @@ export function App() {
               setAutoMixStages([]);
               void api.startAutoMix(session.id, stageIds, ollamaUrl, ollamaModel);
             }}
+            onStop={() => void stopAgentRun()}
           />
         ) : mode === "video" ? (
           <div className="assistant-video-panel">
@@ -4075,6 +4259,73 @@ export function App() {
           </div>
         </>
       ) : null}
+      {confirmRequest ? (
+        <div className="confirm-backdrop" onPointerDown={() => resolveConfirm(false)}>
+          <div
+            className="confirm-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-label={confirmRequest.title}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <strong>{confirmRequest.title}</strong>
+            <p>{confirmRequest.message}</p>
+            <div className="confirm-actions">
+              <button type="button" autoFocus onClick={() => resolveConfirm(false)}>Cancel</button>
+              <button type="button" className="confirm-danger" onClick={() => resolveConfirm(true)}>{confirmRequest.confirmLabel}</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {shortcutsOpen ? (
+        <div className="confirm-backdrop" onPointerDown={() => setShortcutsOpen(false)}>
+          <div
+            className="shortcuts-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Keyboard shortcuts"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="shortcuts-head">
+              <strong>Keyboard shortcuts</strong>
+              <button type="button" className="add-track-modal-close" onClick={() => setShortcutsOpen(false)} aria-label="Close">×</button>
+            </div>
+            <div className="shortcuts-grid">
+              {[
+                ["Space", "Play / pause"],
+                [`${MOD_KEY}Z`, "Undo"],
+                [`${SHIFT_KEY}${MOD_KEY}Z`, "Redo"],
+                ["← →", `Nudge selected clip 10 ms (${ALT_KEY} = 100 ms, ${SHIFT_KEY} = 1 ms)`],
+                ["↑ ↓", `Select previous / next track (${SHIFT_KEY} extends)`],
+                ["Delete", "Delete selected clip, range, or selection"],
+                [`${SHIFT_KEY} Delete`, "Delete selected tracks"],
+                ["Esc", "Clear selection / close dialogs"],
+                [`${MOD_KEY}Enter`, "Send chat or video instruction"],
+                [`${MOD_KEY} click`, "Multi-select tracks or clips"],
+                [`${SHIFT_KEY} click section`, "Scope the chat to that section"],
+                [`${ALT_KEY} click section`, "Loop that section"],
+                ["?", "Show this help"],
+              ].map(([keys, label]) => (
+                <div className="shortcuts-row" key={keys}>
+                  <kbd>{keys}</kbd>
+                  <span>{label}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+      <div className="toast-stack" role="status" aria-live="polite">
+        {toasts.map((toast) => (
+          <div key={toast.id} className={`toast toast-${toast.kind}`}>
+            {toast.kind === "success" ? <CheckCircle2 size={15} /> : toast.kind === "error" ? <AlertCircle size={15} /> : <Info size={15} />}
+            <span className="toast-text">{toast.text}</span>
+            <button type="button" onClick={() => dismissToast(toast.id)} aria-label="Dismiss notification">
+              <X size={13} />
+            </button>
+          </div>
+        ))}
+      </div>
     </main>
   );
 }
@@ -6159,7 +6410,7 @@ function TrackInspector({
                 </>
               );
             })()}
-            <label className="inspector-field">
+            <label className="inspector-field" title="Input gain. Double-click the slider to reset to 0 dB.">
               <span>In</span>
               <input
                 type="range"
@@ -6168,10 +6419,11 @@ function TrackInspector({
                 step="0.5"
                 value={inputGainDb}
                 onChange={(event) => onInputGainChange(track.id, Number(event.target.value))}
+                onDoubleClick={() => onInputGainChange(track.id, 0)}
               />
               <em>{formatDb(inputGainDb)}</em>
             </label>
-            <label className="inspector-field" title="Compensates the recording's placement on the timeline to align with what was actually playing. Positive ms = shift earlier.">
+            <label className="inspector-field" title="Compensates the recording's placement on the timeline to align with what was actually playing. Positive ms = shift earlier. Double-click the slider to reset.">
               <span>Latency</span>
               <input
                 type="range"
@@ -6180,6 +6432,7 @@ function TrackInspector({
                 step="1"
                 value={track.inputLatencyMs ?? 0}
                 onChange={(event) => onChange(track, { inputLatencyMs: Number(event.target.value) })}
+                onDoubleClick={() => onChange(track, { inputLatencyMs: 0 })}
               />
               <em>{(track.inputLatencyMs ?? 0)} ms</em>
             </label>
@@ -6188,15 +6441,31 @@ function TrackInspector({
       </div>
       <div className="inspector-section">
         <div className="inspector-section-title">Channel</div>
-        <label className="inspector-field">
+        <label className="inspector-field" title="Track volume. Double-click the slider to reset to 0 dB.">
           <span>Vol</span>
-          <input type="range" min="-24" max="12" step="0.5" value={track.gainDb} onChange={(event) => onChange(track, { gainDb: Number(event.target.value) })} />
+          <input
+            type="range"
+            min="-24"
+            max="12"
+            step="0.5"
+            value={track.gainDb}
+            onChange={(event) => onChange(track, { gainDb: Number(event.target.value) })}
+            onDoubleClick={() => onChange(track, { gainDb: 0 })}
+          />
           <em>{formatDb(track.gainDb)}</em>
         </label>
-        <label className="inspector-field">
+        <label className="inspector-field" title="Stereo pan. Double-click the slider to recenter.">
           <span>Pan</span>
-          <input type="range" min="-1" max="1" step="0.05" value={track.pan} onChange={(event) => onChange(track, { pan: Number(event.target.value) })} />
-          <em>{track.pan.toFixed(2)}</em>
+          <input
+            type="range"
+            min="-1"
+            max="1"
+            step="0.05"
+            value={track.pan}
+            onChange={(event) => onChange(track, { pan: Number(event.target.value) })}
+            onDoubleClick={() => onChange(track, { pan: 0 })}
+          />
+          <em>{formatPan(track.pan)}</em>
         </label>
         <label className="inspector-check">
           <input type="checkbox" checked={!!track.aiGenerated} onChange={(event) => onChange(track, { aiGenerated: event.target.checked })} />
@@ -6507,13 +6776,13 @@ function TrackRow({
   );
 }
 
-function VideoStrip({ color }: { color: string }) {
+const VideoStrip = memo(function VideoStrip({ color }: { color: string }) {
   return (
     <div className="video-strip" style={{ backgroundColor: color }}>
       <Video size={18} />
     </div>
   );
-}
+});
 
 function nearestAlignment(seconds: number, candidates: number[], originalSeconds: number) {
   let best: number | undefined;
@@ -6625,7 +6894,9 @@ function ProgramPreviewVideo({
   );
 }
 
-function Waveform({ peaks, color }: { peaks?: number[]; color: string }) {
+// Memoized: peaks arrays are stable references on the project object, so the
+// canvas neither re-renders nor redraws during playhead/meter updates.
+const Waveform = memo(function Waveform({ peaks, color }: { peaks?: number[]; color: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -6676,7 +6947,7 @@ function Waveform({ peaks, color }: { peaks?: number[]; color: string }) {
     };
   }, [peaks, color]);
   return <canvas ref={canvasRef} />;
-}
+});
 
 function LiveWaveform({ peaks, color }: { peaks: number[]; color: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -6762,8 +7033,10 @@ function MasterBar({ gainDb, onChange }: { gainDb: number; onChange: (gainDb: nu
         onChange={(event) => setLocal(Number(event.target.value))}
         onPointerUp={() => void onChange(local)}
         onKeyUp={() => void onChange(local)}
+        onDoubleClick={() => { setLocal(0); void onChange(0); }}
+        title="Master output gain. Double-click to reset to 0 dB."
       />
-      <span className="master-value">{formatDb(local)}</span>
+      <span className={`master-value ${local !== 0 ? "nonzero" : ""}`}>{formatDb(local)}</span>
       <button type="button" className="master-reset" onClick={() => { setLocal(0); void onChange(0); }} title="Reset to 0 dB">
         0 dB
       </button>
@@ -6788,12 +7061,14 @@ function AutoMixView({
   stages,
   running,
   disabled,
-  onStart
+  onStart,
+  onStop
 }: {
   stages: { stageId: string; displayName: string; status: string; actionCount: number; warnings: string[]; error?: string; tokens: number; elapsedMs: number; explanation?: string }[];
   running: boolean;
   disabled: boolean;
   onStart: (stageIds: string[]) => void;
+  onStop: () => void;
 }) {
   const [selected, setSelected] = useState<string[]>(AUTO_MIX_STAGES.map((s) => s.id));
   return (
@@ -6823,6 +7098,16 @@ function AutoMixView({
         >
           {running ? "Running…" : "Start auto-mix"}
         </button>
+        {running ? (
+          <button
+            className="auto-mix-stop"
+            onClick={onStop}
+            title="Stop after the current model call — finished stages keep their changes"
+          >
+            <Square size={13} />
+            <span>Stop</span>
+          </button>
+        ) : null}
       </div>
       <div className="auto-mix-stages">
         {stages.length === 0 ? (
@@ -6836,12 +7121,12 @@ function AutoMixView({
                 {s.tokens > 0 ? <span className="auto-mix-stage-meta">{s.tokens.toLocaleString()} tok · {(s.elapsedMs / 1000).toFixed(1)}s</span> : null}
               </div>
               {s.explanation ? <div className="auto-mix-stage-explanation">{s.explanation}</div> : null}
-              {s.status !== "running" ? (
+              {s.status !== "running" && s.status !== "cancelled" ? (
                 <div className="auto-mix-stage-actions">
                   {s.actionCount} action{s.actionCount === 1 ? "" : "s"} applied
                 </div>
               ) : null}
-              {s.error ? <div className="auto-mix-stage-error">{s.error}</div> : null}
+              {s.error && s.status !== "cancelled" ? <div className="auto-mix-stage-error">{s.error}</div> : null}
               {s.warnings.length > 0 ? (
                 <ul className="auto-mix-stage-warnings">
                   {s.warnings.map((w, i) => <li key={i}>{w}</li>)}
@@ -7000,19 +7285,21 @@ function AssistantTurn({
             <span>{diffRows.length} change{diffRows.length === 1 ? "" : "s"}</span>
           </button>
         ) : null}
-        {toggleState !== "locked" ? (
-          <button
-            type="button"
-            className={`turn-toggle ${toggleState}`}
-            onClick={onToggle}
-            disabled={toggleDisabled}
-            title={toggleState === "on" ? "Bypass this turn" : "Re-enable this turn"}
-            aria-pressed={toggleState === "on"}
-          >
-            <Power size={14} />
-            <span>{toggleState === "on" ? "On" : "Off"}</span>
-          </button>
-        ) : null}
+        <button
+          type="button"
+          className={`turn-toggle ${toggleState}`}
+          onClick={onToggle}
+          disabled={toggleDisabled || toggleState === "locked"}
+          title={
+            toggleState === "locked"
+              ? "This turn made no project changes, so there is nothing to bypass"
+              : toggleState === "on" ? "Bypass this turn" : "Re-enable this turn"
+          }
+          aria-pressed={toggleState === "on"}
+        >
+          <Power size={14} />
+          <span>{toggleState === "locked" ? "No changes" : toggleState === "on" ? "On" : "Off"}</span>
+        </button>
       </div>
       {whyOpen && hasRationale ? (
         <div className="turn-rationale">{message.rationale}</div>
@@ -7054,17 +7341,22 @@ function findLatestAbJudge(messages: ChatMessage[]): AbJudgeResponse | undefined
 function AbJudgeCard({ result, onApply }: { result: AbJudgeResponse; onApply?: () => void }) {
   const winner = result.winner === "after" ? "MIX" : result.winner === "before" ? "ORIG" : "TIE";
   const winnerClass = result.winner === "after" ? "good" : result.winner === "before" ? "poor" : "ok";
+  const winnerHint = result.winner === "after"
+    ? "The processed mix beats the original"
+    : result.winner === "before"
+      ? "The unprocessed original beats the current mix"
+      : "Too close to call between the mix and the original";
   const issues = result.mixIssuesAfter;
 
   return (
     <div className="message critique ab-judge">
       <div className="crit-head">
-        <div className={`crit-score ${winnerClass}`}>
+        <div className={`crit-score ${winnerClass}`} title={`${winnerHint} (${(result.confidence * 100).toFixed(0)}% confidence)`}>
           <span className="crit-score-value">{winner}</span>
           <span className="crit-score-label">{(result.confidence * 100).toFixed(0)}%</span>
         </div>
         <div className="crit-summary">
-          <strong>A/B judge</strong>
+          <strong>A/B judge — {winnerHint.toLowerCase()}</strong>
           <p>{result.summary}</p>
         </div>
       </div>

@@ -2,8 +2,9 @@
 
 AutoMixer is a proprietary desktop mixing workstation for assisted and autonomous
 audio mixing. It combines a Tauri 2 desktop shell, a React timeline/mixer UI, a
-Rust audio engine, local LLM control through Ollama, optional Gemini A/B mix
-critique, and a Python audio-analysis sidecar for song-structure detection.
+Rust audio engine, local LLM control through Ollama / vLLM / llama.cpp, optional
+Gemini A/B mix critique, and a Python audio-analysis sidecar for song-structure
+detection.
 
 The app is designed around real multitrack sessions: import stems, record takes,
 edit track regions, audition pre/post AI processing, ask the agent for mix
@@ -22,7 +23,9 @@ unless separately authorized in writing by the copyright holder.
 - Rust stable toolchain with Cargo.
 - `uv` for the Python audio-analysis sidecar.
 - Python 3.11 for the sidecar environment.
-- Ollama if you want local agent/autonomous mixing.
+- A local model server if you want local agent/autonomous mixing: Ollama, vLLM,
+  or llama.cpp (`llama-server`). Any server exposing the OpenAI-compatible
+  `/v1` API works; the app detects the protocol automatically.
 
 Optional:
 
@@ -45,18 +48,34 @@ uv sync --python 3.11
 cd ..
 ```
 
-For local LLM use, install Ollama and pull the default model:
+For local LLM use, run one of the supported model servers. With Ollama, pull the
+default model:
 
 ```sh
 ollama pull gpt-oss:20b
 ```
 
+With vLLM or llama.cpp, start the server and point the app at its URL in
+Settings (the protocol is auto-detected):
+
+```sh
+# vLLM (default port 8000)
+vllm serve Qwen/Qwen2.5-32B-Instruct
+
+# llama.cpp (default port 8080)
+llama-server -m model.gguf
+```
+
+For the video agent, use a vision-capable model (e.g. `qwen2.5vl` on Ollama, or
+a Qwen-VL model on vLLM / a model with an mmproj file on llama.cpp).
+
 ## Configuration
 
 The app has sensible local defaults:
 
-- Ollama URL: `http://localhost:11434`
-- Ollama model: `gpt-oss:20b`
+- Model server URL: `http://localhost:11434` (Ollama; use e.g. `:8000` for vLLM
+  or `:8080` for llama.cpp)
+- Model: `gpt-oss:20b`
 - Audio sidecar port: `7321`
 
 You can copy `.env.example` to `.env.local` for local overrides:

@@ -32,6 +32,9 @@ pub struct UiConfig {
 #[derive(Serialize)]
 pub struct ModelsResponse {
     models: Vec<String>,
+    /// Human-readable label of the detected server protocol ("Ollama" or
+    /// "OpenAI-compatible (vLLM / llama.cpp)").
+    provider: String,
 }
 
 #[derive(Serialize)]
@@ -313,7 +316,8 @@ pub fn get_skill_catalog() -> SkillCatalog {
 
 #[tauri::command]
 pub async fn list_ollama_models(base_url: String) -> Result<ModelsResponse, String> {
-    Ok(ModelsResponse { models: assistant::list_ollama_models(base_url).await? })
+    let (provider, models) = assistant::list_models(base_url).await?;
+    Ok(ModelsResponse { models, provider: provider.label().to_string() })
 }
 
 #[tauri::command]
@@ -428,12 +432,19 @@ pub fn add_rendered_video_track(
     Ok(project)
 }
 
-/// Hard-restart the whole app. Used as a "stop" for a mistaken or stuck agent run:
-/// relaunching the process kills any in-flight LLM call or video render. The last
-/// saved session is reloaded on startup. This call never returns.
+/// Hard-restart the whole app. Kept as a last-resort recovery path; the normal way
+/// to stop an agent run is `cancel_agent`.
 #[tauri::command]
 pub fn restart_app(app: AppHandle) {
     app.restart();
+}
+
+/// Cancel the in-flight agent run (chat turn, auto-mix pipeline, or video agent edit)
+/// without touching playback or the rest of the app. The pending command returns
+/// promptly with `assistant::CANCELLED_MESSAGE`.
+#[tauri::command]
+pub fn cancel_agent() {
+    assistant::cancel_agent_run();
 }
 
 #[tauri::command]
@@ -552,6 +563,7 @@ pub async fn assistant_request(
     state: State<'_, AppState>,
     request: AssistantRequest,
 ) -> Result<AssistantResponse, String> {
+    assistant::reset_agent_cancel();
     let project = {
         let store = state.store.lock().map_err(|error| error.to_string())?;
         store.get_project(&request.session_id)?
@@ -559,8 +571,13 @@ pub async fn assistant_request(
     let _ = app.emit("llm:turn-start", serde_json::json!({ "userText": request.user_text }));
     let observer: std::sync::Arc<dyn assistant::LlmObserver> =
         std::sync::Arc::new(TauriLlmObserver { app: app.clone() });
-    let (response, project) =
-        assistant::handle_assistant(state.config.clone(), project, request, observer).await?;
+    let result = assistant::handle_assistant(state.config.clone(), project, request, observer).await;
+    if assistant::agent_cancelled() {
+        // Discard whatever partial turn the model produced — nothing is saved.
+        let _ = app.emit("llm:turn-end", serde_json::json!({}));
+        return Err(assistant::CANCELLED_MESSAGE.into());
+    }
+    let (response, project) = result?;
     {
         let store = state.store.lock().map_err(|error| error.to_string())?;
         store.save(&project)?;
@@ -1014,11 +1031,15 @@ pub async fn start_auto_mix(
     // Hold an Arc clone of the store so the background task can lock it.
     let store_arc = std::sync::Arc::new(std::sync::Mutex::new(unsafe_clone_store(&state)));
 
+    assistant::reset_agent_cancel();
     let app_clone = app.clone();
     let session_id_clone = session_id.clone();
     tokio::spawn(async move {
         let _ = app_clone.emit("auto-mix:start", serde_json::json!({ "stages": options.stages }));
         for (i, stage) in stages.iter().enumerate() {
+            if assistant::agent_cancelled() {
+                break;
+            }
             let _ = app_clone.emit(
                 "auto-mix:stage-start",
                 serde_json::json!({ "index": i, "stageId": stage.id(), "displayName": stage.display_name() }),
@@ -1030,7 +1051,7 @@ pub async fn start_auto_mix(
                 Ok(r) => {
                     let _ = app_clone.emit("auto-mix:stage-done", serde_json::json!(r));
                     let _ = sync_audio_from_app(&app_clone, &session_id_clone);
-                    if r.status == "error" { break; }
+                    if r.status == "error" || r.status == "cancelled" { break; }
                 }
                 Err(e) => {
                     let _ = app_clone.emit("auto-mix:stage-done", serde_json::json!({
@@ -1504,6 +1525,7 @@ pub async fn apply_clip_effects(
     ollama_base_url: Option<String>,
     vision_model: Option<String>,
 ) -> Result<ApplyClipEffectsResponse, String> {
+    assistant::reset_agent_cancel();
     let project = state.store.lock().map_err(|e| e.to_string())?.get_project(&session_id)?;
     let track = project.session.tracks.iter().find(|t| t.id == track_id)
         .ok_or("Track not found")?;
@@ -1673,6 +1695,7 @@ pub async fn render_agent_video_edit(
     // clicking Process to actually render.
     plan_only: Option<bool>,
 ) -> Result<AgentVideoEditResponse, String> {
+    assistant::reset_agent_cancel();
     let started = std::time::Instant::now();
     emit_agent_progress(&app, &started, "starting", "Preparing Agent Video Edit...", 0, 1);
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
@@ -3272,6 +3295,9 @@ async fn build_agent_edit_segments(
     let mut consecutive_same = 0_u32;
     let mut usage_counts: HashMap<usize, u32> = HashMap::new();
     while cursor < range_end {
+        if assistant::agent_cancelled() {
+            return Err(assistant::CANCELLED_MESSAGE.into());
+        }
         window_index += 1;
         let next = (cursor + interval_samples).min(range_end);
         let audio_features = audio_features_for_window(audio_analysis, cursor, next, sample_rate);
@@ -3996,7 +4022,25 @@ async fn analyze_clip_effects(
         .map_err(|error| format!("Could not parse clip-effects response: {error}"))
 }
 
+/// One-shot (non-streaming) chat call, optionally with base64 JPEG frames attached.
+/// Dispatches to the native Ollama API or the OpenAI-compatible API (vLLM,
+/// llama.cpp) depending on what the server at `base_url` speaks.
 async fn call_ollama_chat(
+    base_url: &str,
+    model: &str,
+    prompt: String,
+    images: Option<Vec<String>>,
+) -> Result<OllamaChatResponse, String> {
+    if assistant::agent_cancelled() {
+        return Err(assistant::CANCELLED_MESSAGE.into());
+    }
+    match assistant::detect_provider(base_url).await? {
+        assistant::LlmProvider::Ollama => call_ollama_chat_native(base_url, model, prompt, images).await,
+        assistant::LlmProvider::OpenAiCompat => call_openai_chat(base_url, model, prompt, images).await,
+    }
+}
+
+async fn call_ollama_chat_native(
     base_url: &str,
     model: &str,
     prompt: String,
@@ -4024,6 +4068,64 @@ async fn call_ollama_chat(
         .json::<OllamaChatResponse>()
         .await
         .map_err(|error| format!("Could not parse Ollama response: {error}"))
+}
+
+/// OpenAI-compatible chat (vLLM, llama.cpp). Images go in as multimodal
+/// `image_url` content parts with data URLs; the response is adapted into the
+/// same shape the Ollama path returns so callers don't care which server ran.
+async fn call_openai_chat(
+    base_url: &str,
+    model: &str,
+    prompt: String,
+    images: Option<Vec<String>>,
+) -> Result<OllamaChatResponse, String> {
+    let mut content = vec![serde_json::json!({ "type": "text", "text": prompt })];
+    for image in images.into_iter().flatten() {
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:image/jpeg;base64,{image}") },
+        }));
+    }
+    let body = serde_json::json!({
+        "model": model,
+        "stream": false,
+        "messages": [{ "role": "user", "content": content }],
+    });
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Could not call the model server: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("The model server returned {}", response.status()));
+    }
+    #[derive(Deserialize)]
+    struct OpenAiChatResponse {
+        #[serde(default)]
+        choices: Vec<OpenAiChatChoice>,
+    }
+    #[derive(Deserialize)]
+    struct OpenAiChatChoice {
+        message: OpenAiChatMessage,
+    }
+    #[derive(Deserialize)]
+    struct OpenAiChatMessage {
+        #[serde(default)]
+        content: Option<String>,
+    }
+    let parsed = response
+        .json::<OpenAiChatResponse>()
+        .await
+        .map_err(|error| format!("Could not parse the model server response: {error}"))?;
+    let content = parsed
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|choice| choice.message.content)
+        .ok_or("The model server returned no content")?;
+    Ok(OllamaChatResponse { message: OllamaChatResponseMessage { content } })
 }
 
 fn build_auto_edit_filter(

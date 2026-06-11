@@ -46,6 +46,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Remember window size/position across launches.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(AppState {
             config,
             store: Mutex::new(store),
@@ -98,6 +100,7 @@ pub fn run() {
             commands::rerender_agent_edit,
             commands::fit_canvas_to_footage,
             commands::restart_app,
+            commands::cancel_agent,
             commands::apply_mix_actions,
             commands::undo_mix_action,
             commands::redo_mix_action,

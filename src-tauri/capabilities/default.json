@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "AutoMixer desktop permissions",
   "windows": ["main", "camera-preview", "video-editor"],
-  "permissions": ["core:default", "core:webview:allow-create-webview-window", "dialog:default"]
+  "permissions": [
+    "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-set-title",
+    "dialog:default"
+  ]
 }
