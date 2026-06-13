@@ -1,0 +1,34 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg5" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#13303a"/>
+      <stop offset="0.5" stop-color="#0e1f29"/>
+      <stop offset="1" stop-color="#070f14"/>
+    </linearGradient>
+    <linearGradient id="cap5" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7af0ff"/>
+      <stop offset="1" stop-color="#22b6e6"/>
+    </linearGradient>
+    <filter id="glow5" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="12" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#bg5)"/>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  <!-- two fader slots -->
+  <rect x="372" y="250" width="16" height="540" rx="8" fill="#000000" fill-opacity="0.55"/>
+  <rect x="612" y="250" width="16" height="540" rx="8" fill="#000000" fill-opacity="0.55"/>
+  <g filter="url(#glow5)">
+    <rect x="320" y="540" width="120" height="62" rx="16" fill="url(#cap5)"/>
+    <rect x="560" y="330" width="120" height="62" rx="16" fill="url(#cap5)"/>
+  </g>
+  <g fill="#ffffff" fill-opacity="0.85">
+    <rect x="320" y="567" width="120" height="7" rx="3.5"/>
+    <rect x="560" y="357" width="120" height="7" rx="3.5"/>
+  </g>
+  <!-- AI sparkle top-right -->
+  <g filter="url(#glow5)" fill="#ffe27a">
+    <path d="M732 250 C742 312 760 330 822 340 C760 350 742 368 732 430 C722 368 704 350 642 340 C704 330 722 312 732 250 Z"/>
+  </g>
+</svg>

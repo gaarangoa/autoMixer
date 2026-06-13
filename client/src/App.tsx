@@ -242,6 +242,9 @@ export function App() {
   // For mono tracks: [chIdx]. For stereo: [leftIdx, rightIdx]. Empty/undefined = default 0/0+1.
   const [trackInputChannels, setTrackInputChannels] = useState<Record<string, number[]>>({});
   const [liveRecordingPeaks, setLiveRecordingPeaks] = useState<number[]>([]);
+  // Per-track playback levels from the engine (indexed by track slot), used to
+  // light up a small meter on each track lane while the transport runs.
+  const [trackPeaks, setTrackPeaks] = useState<number[]>([]);
   // Transient notifications (errors, action confirmations). Rendered in a fixed
   // stack so feedback is visible even when the chat log is scrolled away.
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -866,6 +869,20 @@ export function App() {
     return () => cancelAnimationFrame(frame);
   }, [playing, duration, loopSection, session?.sampleRate, recording, videoRecordingTrackIds]);
 
+  // Live per-track playback meters (30 Hz from the engine). When the transport
+  // is stopped we let the bars fall back to zero so nothing stays lit.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api.onMeters((event) => { if (!cancelled) setTrackPeaks(event.trackPeaks); })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch(() => undefined);
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+  useEffect(() => {
+    if (!playing) setTrackPeaks([]);
+  }, [playing]);
+
   useEffect(() => {
     togglePlayRef.current = togglePlay;
   });
@@ -1342,12 +1359,18 @@ export function App() {
     }
   }
 
-  async function openMixerWindow() {
+  async function toggleMixerWindow() {
     if (!session) return;
     const payload: MixerWindowPayload = { sessionId: session.id };
     try {
       const query = new URLSearchParams({ mixer: "1", sessionId: session.id });
       let mixer = await WebviewWindow.getByLabel("mixer");
+      // If the mixer is already open, a second click hides it (toggle).
+      if (mixer && mixerWindowOpen) {
+        await mixer.hide().catch(() => undefined);
+        setMixerWindowOpen(false);
+        return;
+      }
       if (!mixer) {
         mixer = new WebviewWindow("mixer", {
           url: `/?${query.toString()}`,
@@ -3185,8 +3208,8 @@ export function App() {
             <div className="topbar-group" role="group" aria-label="File and help">
               <button
                 className={mixerWindowOpen ? "active" : ""}
-                onClick={() => void openMixerWindow()}
-                title={mixerWindowOpen ? "Focus mixer window" : "Open mixer window"}
+                onClick={() => void toggleMixerWindow()}
+                title={mixerWindowOpen ? "Hide mixer window" : "Show mixer window"}
                 aria-pressed={mixerWindowOpen}
               >
                 <SlidersHorizontal size={18} />
@@ -3662,7 +3685,7 @@ export function App() {
                     ? candidateTrack.clips.map((clip) => clip.startSample / session.sampleRate)
                     : [candidateTrack.startSample / session.sampleRate];
                 });
-                return session.tracks.map((track) => {
+                return session.tracks.map((track, trackIndex) => {
                   const sourceById = new Map(session.sourceFiles.map((item) => [item.id, item]));
                   const videoSourceById = new Map((session.videoSourceFiles ?? []).map((item) => [item.id, item]));
                   const source = sourceById.get(track.sourceFileId);
@@ -3703,6 +3726,7 @@ export function App() {
                       selected={selectedTrackIds.includes(track.id)}
                       focused={focusedTrackId === track.id}
                       armed={isVideo ? armedVideoTrackIds.includes(track.id) : armedAudioTrackIds.includes(track.id)}
+                      peak={playing ? (trackPeaks[trackIndex] ?? 0) : 0}
                       playhead={playhead}
                       transportPlaying={playing}
                       duration={duration}
@@ -3739,6 +3763,9 @@ export function App() {
                         // playback always continues / resumes from wherever it currently is.
                         // Preserve a global ruler range; only drop any per-track range.
                         setSelectedRange((current) => (current && !current.trackId ? current : undefined));
+                        // Focus the clip's track so the left inspector switches to it —
+                        // covers every click path (plain, Cmd, drag), unlike onSelectTrack.
+                        setFocusedTrackId(track.id);
                         setSelectedClip({ trackId: track.id, clipId });
                         if (additive) {
                           setSelectedClips((prev) => prev.some((ref) => ref.trackId === track.id && ref.clipId === clipId)
@@ -3750,6 +3777,7 @@ export function App() {
                       }}
                       onClipContextMenu={(clipId, event) => {
                         event.preventDefault();
+                        setFocusedTrackId(track.id);
                         setSelectedClips((prev) => prev.some((ref) => ref.trackId === track.id && ref.clipId === clipId)
                           ? prev
                           : [{ trackId: track.id, clipId }]);
@@ -4930,6 +4958,17 @@ export function MixerWindowApp() {
   const [focusedTrackId, setFocusedTrackId] = useState<string | undefined>();
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<string | null>(null);
+  // True once the first session has loaded. Subsequent refreshes (every fader
+  // tweak round-trips through the main window) update the project in place
+  // without flipping back to the loading screen — that unmount/remount was
+  // resetting the strip scroll and focus back to the first track.
+  const loadedRef = useRef(false);
+  // Timestamp of the mixer's last self-initiated edit. When the mixer changes a
+  // fader it applies the authoritative result locally (publishUpdate) and pings
+  // the main window, which echoes a "mixer:update" straight back. Reloading on
+  // that echo re-fetches the session and resets the strip-rack scroll/focus, so
+  // we ignore any echo that lands right after one of our own edits.
+  const lastSelfEditRef = useRef(0);
   const session = project?.session;
 
   useEffect(() => {
@@ -4939,6 +4978,7 @@ export function MixerWindowApp() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listen<MixerWindowPayload>("mixer:update", (event) => {
+      if (performance.now() - lastSelfEditRef.current < 1500) return;
       void loadMixerSession(event.payload.sessionId);
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };
@@ -4950,11 +4990,14 @@ export function MixerWindowApp() {
       setLoading(false);
       return;
     }
-    setLoading(true);
+    // Only show the full-screen loading state on the very first load. Refreshes
+    // update in place so the MixerDock stays mounted (scroll + focus preserved).
+    if (!loadedRef.current) setLoading(true);
     try {
       const loaded = await api.getSession(sessionId);
       setProject(loaded);
       setStatus(null);
+      loadedRef.current = true;
       void getCurrentWebviewWindow().setTitle(`${loaded.session.name} Mixer`).catch(() => undefined);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -4964,6 +5007,7 @@ export function MixerWindowApp() {
   }
 
   async function publishUpdate(updated: MixProject) {
+    lastSelfEditRef.current = performance.now();
     setProject(updated);
     await emit("mixer:session-updated", { sessionId: updated.session.id }).catch(() => undefined);
   }
@@ -6452,6 +6496,55 @@ function sectionClass(label: string): string {
   return "section-other";
 }
 
+// A range input that holds its own value while the user drags, so a parent
+// re-render (e.g. the 30 Hz playback meters) can't snap the thumb back to a
+// stale prop. Commits on release like the mixer faders, not per input event.
+function InspectorSlider({
+  label,
+  title,
+  value,
+  min,
+  max,
+  step,
+  format,
+  resetValue,
+  onCommit,
+}: {
+  label: string;
+  title: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  format: (v: number) => string;
+  resetValue: number;
+  onCommit: (v: number) => void;
+}) {
+  const [local, setLocal] = useState(value);
+  const draggingRef = useRef(false);
+  useEffect(() => { if (!draggingRef.current) setLocal(value); }, [value]);
+  const commit = (v: number) => { draggingRef.current = false; onCommit(v); };
+  return (
+    <label className="inspector-field" title={title}>
+      <span>{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={local}
+        onPointerDown={() => { draggingRef.current = true; }}
+        onChange={(event) => setLocal(Number(event.target.value))}
+        onPointerUp={(event) => commit(Number((event.currentTarget as HTMLInputElement).value))}
+        onKeyUp={(event) => commit(Number((event.currentTarget as HTMLInputElement).value))}
+        onBlur={() => { draggingRef.current = false; }}
+        onDoubleClick={() => { draggingRef.current = false; setLocal(resetValue); onCommit(resetValue); }}
+      />
+      <em>{format(local)}</em>
+    </label>
+  );
+}
+
 function TrackInspector({
   track,
   source,
@@ -6659,50 +6752,44 @@ function TrackInspector({
               />
               <em>{formatDb(inputGainDb)}</em>
             </label>
-            <label className="inspector-field" title="Compensates the recording's placement on the timeline to align with what was actually playing. Positive ms = shift earlier. Double-click the slider to reset.">
-              <span>Latency</span>
-              <input
-                type="range"
-                min="-200"
-                max="500"
-                step="1"
-                value={track.inputLatencyMs ?? 0}
-                onChange={(event) => onChange(track, { inputLatencyMs: Number(event.target.value) })}
-                onDoubleClick={() => onChange(track, { inputLatencyMs: 0 })}
-              />
-              <em>{(track.inputLatencyMs ?? 0)} ms</em>
-            </label>
+            <InspectorSlider
+              label="Latency"
+              title="Compensates the recording's placement on the timeline to align with what was actually playing. Positive ms = shift earlier. Double-click the slider to reset."
+              value={track.inputLatencyMs ?? 0}
+              min={-200}
+              max={500}
+              step={1}
+              format={(v) => `${Math.round(v)} ms`}
+              resetValue={0}
+              onCommit={(v) => onChange(track, { inputLatencyMs: v })}
+            />
           </>
         )}
       </div>
       <div className="inspector-section">
         <div className="inspector-section-title">Channel</div>
-        <label className="inspector-field" title="Track volume. Double-click the slider to reset to 0 dB.">
-          <span>Vol</span>
-          <input
-            type="range"
-            min="-24"
-            max="12"
-            step="0.5"
-            value={track.gainDb}
-            onChange={(event) => onChange(track, { gainDb: Number(event.target.value) })}
-            onDoubleClick={() => onChange(track, { gainDb: 0 })}
-          />
-          <em>{formatDb(track.gainDb)}</em>
-        </label>
-        <label className="inspector-field" title="Stereo pan. Double-click the slider to recenter.">
-          <span>Pan</span>
-          <input
-            type="range"
-            min="-1"
-            max="1"
-            step="0.05"
-            value={track.pan}
-            onChange={(event) => onChange(track, { pan: Number(event.target.value) })}
-            onDoubleClick={() => onChange(track, { pan: 0 })}
-          />
-          <em>{formatPan(track.pan)}</em>
-        </label>
+        <InspectorSlider
+          label="Vol"
+          title="Track volume. Double-click the slider to reset to 0 dB."
+          value={track.gainDb}
+          min={-24}
+          max={12}
+          step={0.5}
+          format={formatDb}
+          resetValue={0}
+          onCommit={(v) => onChange(track, { gainDb: v })}
+        />
+        <InspectorSlider
+          label="Pan"
+          title="Stereo pan. Double-click the slider to recenter."
+          value={track.pan}
+          min={-1}
+          max={1}
+          step={0.05}
+          format={formatPan}
+          resetValue={0}
+          onCommit={(v) => onChange(track, { pan: v })}
+        />
         <label className="inspector-check">
           <input type="checkbox" checked={!!track.aiGenerated} onChange={(event) => onChange(track, { aiGenerated: event.target.checked })} />
           <span>AI generated stem</span>
@@ -6747,6 +6834,7 @@ function TrackRow({
   monitoring,
   monitorStarting,
   livePeaks,
+  peak,
   playhead,
   transportPlaying,
   duration,
@@ -6784,6 +6872,7 @@ function TrackRow({
   monitoring: boolean;
   monitorStarting: boolean;
   livePeaks?: number[];
+  peak: number;
   playhead: number;
   transportPlaying: boolean;
   duration: number;
@@ -6946,6 +7035,11 @@ function TrackRow({
         {!isVideo && (recording || monitoring) ? (
           <div className={`track-record-meter ${recording ? "recording" : "monitoring"}`} title="Live input level">
             <span style={{ width: `${Math.max(2, Math.min(100, liveLevel * 100))}%` }} />
+          </div>
+        ) : null}
+        {!isVideo && !recording && !monitoring ? (
+          <div className="track-vu" title="Playback level" aria-hidden="true">
+            <span style={{ height: `${Math.max(0, Math.min(100, peak * 100))}%`, background: track.color }} />
           </div>
         ) : null}
       </div>

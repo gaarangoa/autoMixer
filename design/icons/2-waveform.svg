@@ -1,0 +1,29 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a2140"/>
+      <stop offset="0.55" stop-color="#191427"/>
+      <stop offset="1" stop-color="#0c0913"/>
+    </linearGradient>
+    <linearGradient id="bar2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9b7bff"/>
+      <stop offset="1" stop-color="#5a3df0"/>
+    </linearGradient>
+    <filter id="glow2" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="10" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#bg2)"/>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  <g filter="url(#glow2)" fill="url(#bar2)">
+    <!-- symmetric waveform bars around vertical center 512 -->
+    <rect x="232" y="452" width="48" height="120" rx="24"/>
+    <rect x="312" y="372" width="48" height="280" rx="24"/>
+    <rect x="392" y="276" width="48" height="472" rx="24"/>
+    <rect x="472" y="412" width="48" height="200" rx="24"/>
+    <rect x="552" y="216" width="48" height="592" rx="24"/>
+    <rect x="632" y="356" width="48" height="312" rx="24"/>
+    <rect x="712" y="436" width="48" height="152" rx="24"/>
+  </g>
+</svg>

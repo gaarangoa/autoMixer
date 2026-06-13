@@ -2,11 +2,14 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "AutoMixer desktop permissions",
-  "windows": ["main", "camera-preview", "video-editor"],
+  "windows": ["main", "camera-preview", "video-editor", "mixer"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",
     "core:window:allow-set-title",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
     "dialog:default"
   ]
 }

@@ -1,0 +1,26 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26303a"/>
+      <stop offset="0.5" stop-color="#141a20"/>
+      <stop offset="1" stop-color="#0a0d10"/>
+    </linearGradient>
+    <linearGradient id="a3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd27a"/>
+      <stop offset="1" stop-color="#f5a623"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#bg3)"/>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  <!-- Bold A letterform -->
+  <path d="M512 232 L724 792 L636 792 L596 678 L428 678 L388 792 L300 792 Z" fill="url(#a3)"/>
+  <!-- crossbar replaced by a waveform slit -->
+  <rect x="446" y="600" width="132" height="44" rx="22" fill="#141a20"/>
+  <!-- waveform dots inside the slit -->
+  <g fill="#141a20">
+    <rect x="456" y="568" width="16" height="108" rx="8"/>
+    <rect x="486" y="588" width="16" height="68" rx="8"/>
+    <rect x="516" y="560" width="16" height="124" rx="8"/>
+    <rect x="546" y="588" width="16" height="68" rx="8"/>
+  </g>
+</svg>

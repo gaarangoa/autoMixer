@@ -2704,6 +2704,32 @@ button:disabled {
   background: linear-gradient(90deg, #52c77a, var(--amber) 82%, #ff6b6b);
 }
 
+/* Vertical playback level meter pinned to the right edge of each track lane's
+   header — tinted with the track color so it reads as "this track" at a glance
+   while the transport runs. Absolutely positioned so it never shifts layout. */
+.track-vu {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  right: 3px;
+  z-index: 2;
+  display: flex;
+  align-items: flex-end;
+  width: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.track-vu span {
+  display: block;
+  width: 100%;
+  border-radius: inherit;
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.28);
+  transition: height 45ms linear;
+}
+
 .ai-bulk {
   height: 36px;
   padding: 0 10px;
@@ -6554,6 +6580,7 @@ button {
 }
 
 .track-head {
+  position: relative;
   min-height: 72px;
   padding: 7px 4px !important;
   border-left: 5px solid var(--track-color, transparent) !important;
