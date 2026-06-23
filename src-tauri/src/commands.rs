@@ -84,17 +84,17 @@ struct ClipEffectsChoice {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentVideoEditResponse {
-    path: String,
-    script: Vec<AgentVideoScriptEntry>,
+    pub path: String,
+    pub script: Vec<AgentVideoScriptEntry>,
     // Color-look preset the agent inferred from the user's instructions (e.g. "cinema",
     // "warm", "moody"), so the frontend can sync its Look chip and reuse it on re-renders.
     // Serialized as `lookPreset` (camelCase) for the TS client. None = no preset applied.
-    look_preset: Option<crate::model::VideoFilterPreset>,
+    pub look_preset: Option<crate::model::VideoFilterPreset>,
     // Free-form color grade derived from the user's instructions. Used as the actual
     // render filter when present; otherwise the named look_preset (or nothing) is used.
-    color_grade: Option<AgentColorGrade>,
+    pub color_grade: Option<AgentColorGrade>,
     // Whole-edit effects (fade in/out, speed) applied after the cuts + grade.
-    video_effects: Option<AgentVideoEffects>,
+    pub video_effects: Option<AgentVideoEffects>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -432,6 +432,29 @@ pub fn add_rendered_video_track(
     Ok(project)
 }
 
+/// Upsert the single canonical agent-edit track (replace in place instead of
+/// stacking a new copy every run) and re-sync the audio engine. Used by the
+/// Hermes `edit_video` control path.
+pub fn upsert_agent_video_track(
+    state: &AppState,
+    session_id: &str,
+    video_path: &Path,
+    start_sample: u64,
+    duration_ms: u64,
+) -> Result<MixProject, String> {
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .upsert_agent_video_track(session_id, video_path, start_sample, duration_ms)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
+}
+
 /// Hard-restart the whole app. Kept as a last-resort recovery path; the normal way
 /// to stop an agent run is `cancel_agent`.
 #[tauri::command]
@@ -447,18 +470,25 @@ pub fn cancel_agent() {
     assistant::cancel_agent_run();
 }
 
-#[tauri::command]
-pub fn apply_mix_actions(
-    state: State<'_, AppState>,
-    session_id: String,
-    actions: Vec<MixAction>,
+/// Apply a batch of actions to a session and bring the live audio engine + saved
+/// store into agreement, returning the updated project. This is the single mutation
+/// path shared by the Tauri command (`apply_mix_actions`) and the in-process control
+/// surface (`control.rs`) that the Hermes agent drives, so an external tool call is
+/// indistinguishable from a UI edit at the store/engine level.
+///
+/// Locking order is always store-then-audio (never the reverse) to avoid deadlock.
+pub fn apply_and_sync(
+    state: &AppState,
+    session_id: &str,
+    actions: &[MixAction],
+    source: HistorySource,
     explanation: Option<String>,
 ) -> Result<MixProject, String> {
     let store = state.store.lock().map_err(|error| error.to_string())?;
-    let mut project = store.get_project(&session_id)?;
-    apply_actions(&mut project, &actions, HistorySource::User, explanation)?;
+    let mut project = store.get_project(session_id)?;
+    apply_actions(&mut project, actions, source, explanation)?;
     store.save(&project)?;
-    push_engine_commands(&state, &project.session, &actions);
+    push_engine_commands(state, &project.session, actions);
     if let Ok(mut audio) = state.audio.lock() {
         // Defensive re-sync: makes sure the engine's per-slot gain/mute/pan/etc. mirror the
         // saved project regardless of which actions were in the batch (e.g. a `rename_track`
@@ -470,10 +500,10 @@ pub fn apply_mix_actions(
     Ok(project)
 }
 
-#[tauri::command]
-pub fn undo_mix_action(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+/// Step backward in history and re-sync the engine. Shared by command + control surface.
+pub fn undo_and_sync(state: &AppState, session_id: &str) -> Result<MixProject, String> {
     let store = state.store.lock().map_err(|error| error.to_string())?;
-    let mut project = store.get_project(&session_id)?;
+    let mut project = store.get_project(session_id)?;
     undo(&mut project)?;
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
@@ -483,10 +513,10 @@ pub fn undo_mix_action(state: State<'_, AppState>, session_id: String) -> Result
     Ok(project)
 }
 
-#[tauri::command]
-pub fn redo_mix_action(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+/// Step forward in history and re-sync the engine. Shared by command + control surface.
+pub fn redo_and_sync(state: &AppState, session_id: &str) -> Result<MixProject, String> {
     let store = state.store.lock().map_err(|error| error.to_string())?;
-    let mut project = store.get_project(&session_id)?;
+    let mut project = store.get_project(session_id)?;
     redo(&mut project)?;
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
@@ -494,6 +524,26 @@ pub fn redo_mix_action(state: State<'_, AppState>, session_id: String) -> Result
         audio.publish_automation(&project.session);
     }
     Ok(project)
+}
+
+#[tauri::command]
+pub fn apply_mix_actions(
+    state: State<'_, AppState>,
+    session_id: String,
+    actions: Vec<MixAction>,
+    explanation: Option<String>,
+) -> Result<MixProject, String> {
+    apply_and_sync(state.inner(), &session_id, &actions, HistorySource::User, explanation)
+}
+
+#[tauri::command]
+pub fn undo_mix_action(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+    undo_and_sync(state.inner(), &session_id)
+}
+
+#[tauri::command]
+pub fn redo_mix_action(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+    redo_and_sync(state.inner(), &session_id)
 }
 
 #[tauri::command]
@@ -557,6 +607,337 @@ impl assistant::LlmObserver for TauriLlmObserver {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HermesModel {
+    pub base_url: String,
+    pub model: String,
+    pub provider: String,
+}
+
+fn hermes_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("AUTOMIXER_HERMES_BIN") {
+        return PathBuf::from(p);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(&home).join(".local/bin/hermes");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("hermes")
+}
+
+/// Parse the Hermes agent's orchestration model (base URL, model, provider) out of
+/// `~/.hermes/config.yaml`. This is the single source of truth for the text model —
+/// the chat agent and the auto-mix pipeline both use it, so there's only ever one.
+fn read_hermes_model() -> HermesModel {
+    let (mut base_url, mut model, mut provider) = (String::new(), String::new(), String::new());
+    if let Some(path) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".hermes/config.yaml")) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let mut in_model = false;
+            for line in text.lines() {
+                if line.starts_with("model:") {
+                    in_model = true;
+                    continue;
+                }
+                if in_model {
+                    if !line.starts_with(' ') && !line.trim().is_empty() {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if let Some(v) = trimmed.strip_prefix("base_url:") {
+                        base_url = v.trim().to_string();
+                    } else if let Some(v) = trimmed.strip_prefix("default:") {
+                        model = v.trim().to_string();
+                    } else if let Some(v) = trimmed.strip_prefix("provider:") {
+                        provider = v.trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+    HermesModel { base_url, model, provider }
+}
+
+/// Read the Hermes agent's current orchestration model so the settings UI can display it.
+#[tauri::command]
+pub fn get_hermes_model() -> Result<HermesModel, String> {
+    Ok(read_hermes_model())
+}
+
+/// Clear the chat: forget the agent's conversation for this session so the next turn
+/// starts fresh (no stale context carrying over, e.g. a previously-applied look).
+#[tauri::command]
+pub async fn clear_chat(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    state.hermes_service.reset_session(&session_id).await
+}
+
+/// Point the Hermes agent at any OpenAI-compatible endpoint. We use the bare
+/// `custom` provider (which needs no registry entry, unlike `custom:<name>`),
+/// write the base URL + model, then restart the sidecar so `hermes acp` reloads
+/// its config.
+#[tauri::command]
+pub async fn set_hermes_model(
+    state: State<'_, AppState>,
+    base_url: String,
+    model: String,
+) -> Result<(), String> {
+    let hermes = hermes_bin();
+    let set = |key: &str, value: &str| -> Result<(), String> {
+        let output = Command::new(&hermes)
+            .arg("config")
+            .arg("set")
+            .arg(key)
+            .arg(value)
+            .output()
+            .map_err(|e| format!("could not run hermes config set: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    };
+    set("model.provider", "custom")?;
+    set("model.base_url", base_url.trim())?;
+    set("model.default", model.trim())?;
+    // Relaunch the sidecar so the new model takes effect, then wait for it.
+    state.hermes_service.restart();
+    state
+        .hermes_service
+        .wait_ready(std::time::Duration::from_secs(30))
+        .await;
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEndpoint {
+    pub base_url: String,
+    pub model: String,
+}
+
+/// Push the user's current track selection so the video-edit skill defaults to
+/// only the selected video tracks (and the monitor can mirror it).
+#[tauri::command]
+pub fn set_video_selection(session_id: String, track_ids: Vec<String>) {
+    crate::control::set_selection(&session_id, track_ids);
+}
+
+/// Read the stored selection — the monitor reads this on open so it's correct even
+/// if it missed the live selection event.
+#[tauri::command]
+pub fn get_video_selection(session_id: String) -> Vec<String> {
+    crate::control::get_selection(&session_id)
+}
+
+/// Read the video/vision VLM endpoint the video-edit skill uses.
+#[tauri::command]
+pub fn get_video_model() -> Result<ModelEndpoint, String> {
+    let config = crate::config::Config::load();
+    Ok(ModelEndpoint {
+        base_url: config.video_base_url,
+        model: config.video_model,
+    })
+}
+
+/// Point the video-edit skill at any OpenAI-compatible / Ollama vision endpoint
+/// (e.g. Qwen3-VL on the DGX Spark). Persisted so the skill reads it per request.
+#[tauri::command]
+pub fn set_video_model(base_url: String, model: String) -> Result<(), String> {
+    let mut config = crate::config::Config::load();
+    config.video_base_url = base_url.trim().to_string();
+    config.video_model = model.trim().to_string();
+    config.save()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoMixSummary {
+    pub stages_run: usize,
+    pub total_actions: usize,
+    pub stages: Vec<serde_json::Value>,
+}
+
+/// Run the auto-mix pipeline to completion (awaitable), emitting the same
+/// `auto-mix:*` progress events the UI already renders, and returning a summary.
+/// Unlike the fire-and-forget `start_auto_mix` command, this is what the Hermes
+/// "auto_mix" skill calls so the agent can report the outcome.
+pub async fn run_auto_mix_blocking(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    stage_ids: Vec<String>,
+) -> Result<AutoMixSummary, String> {
+    use crate::auto_mix::AutoMixStage;
+    let all = [
+        AutoMixStage::RawSessionPrep,
+        AutoMixStage::PrepIntent,
+        AutoMixStage::StaticBalance,
+        AutoMixStage::CleanupFilters,
+        AutoMixStage::SubtractiveEq,
+        AutoMixStage::Dynamics,
+        AutoMixStage::TonalEnhancement,
+        AutoMixStage::DepthSpace,
+        AutoMixStage::SectionAutomation,
+        AutoMixStage::MixBusLoudness,
+    ];
+    let stages: Vec<AutoMixStage> = if stage_ids.is_empty() {
+        all.to_vec()
+    } else {
+        all.into_iter().filter(|s| stage_ids.iter().any(|id| id == s.id())).collect()
+    };
+    if stages.is_empty() {
+        return Err("No valid auto-mix stages selected.".into());
+    }
+
+    assistant::reset_agent_cancel();
+    let mut config = crate::config::Config::load();
+    // Use the SAME model as the chat agent (one single text model), not a separate
+    // gpt-oss/ollama setting. Falls back to config.ollama_* only if Hermes has none.
+    let agent = read_hermes_model();
+    if !agent.base_url.is_empty() {
+        config.ollama_base_url = agent.base_url;
+    }
+    if !agent.model.is_empty() {
+        config.ollama_model = agent.model;
+    }
+    let store = std::sync::Arc::new(std::sync::Mutex::new(SessionStore::new(config.data_dir.clone())));
+    let observer: std::sync::Arc<dyn assistant::LlmObserver> = std::sync::Arc::new(assistant::NoopObserver);
+
+    let _ = app.emit(
+        "auto-mix:start",
+        serde_json::json!({ "stages": stages.iter().map(|s| s.id()).collect::<Vec<_>>() }),
+    );
+    let mut total_actions = 0usize;
+    let mut summaries = Vec::new();
+    for (i, stage) in stages.iter().enumerate() {
+        if assistant::agent_cancelled() {
+            break;
+        }
+        let _ = app.emit(
+            "auto-mix:stage-start",
+            serde_json::json!({ "index": i, "stageId": stage.id(), "displayName": stage.display_name() }),
+        );
+        let report = crate::auto_mix::run_stage(&config, store.clone(), session_id, *stage, observer.clone()).await?;
+        let action_count = report.action_count;
+        let status = report.status.clone();
+        let stage_id = report.stage_id.clone();
+        let _ = app.emit("auto-mix:stage-done", serde_json::json!(report));
+        let _ = sync_audio_from_app(app, session_id);
+        total_actions += action_count;
+        summaries.push(serde_json::json!({ "stageId": stage_id, "status": status, "actionCount": action_count }));
+        if status == "error" || status == "cancelled" {
+            break;
+        }
+    }
+    Ok(AutoMixSummary { stages_run: summaries.len(), total_actions, stages: summaries })
+}
+
+#[derive(Deserialize)]
+struct CropChoice {
+    #[serde(default, alias = "cropTop")]
+    crop_top: Option<f32>,
+    #[serde(default, alias = "cropRight")]
+    crop_right: Option<f32>,
+    #[serde(default, alias = "cropBottom")]
+    crop_bottom: Option<f32>,
+    #[serde(default, alias = "cropLeft")]
+    crop_left: Option<f32>,
+}
+
+/// Vision auto-crop: extract a frame from the clip, ask the configured video model
+/// for edge-crop percentages that satisfy `instructions`, and write them to the
+/// clip's layout. Shared by the `auto_crop` control endpoint / agent tool.
+pub async fn auto_crop_clip(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    track_id: &str,
+    clip_id: &str,
+    instructions: &str,
+) -> Result<MixProject, String> {
+    use tauri::Manager;
+    assistant::reset_agent_cancel();
+    let config = crate::config::Config::load();
+
+    let mut project = { app.state::<AppState>().store.lock().map_err(|e| e.to_string())?.get_project(session_id)? };
+
+    // Locate the clip's source video + a representative timestamp (its midpoint).
+    let (source_path, frame_time) = {
+        let track = project.session.tracks.iter().find(|t| t.id == track_id).ok_or("Track not found")?;
+        if !matches!(track.kind, crate::model::TrackKind::Video) {
+            return Err("That track is not a video track.".into());
+        }
+        let clip = track.video_clips.iter().find(|c| c.id == clip_id).ok_or("Clip not found on the track")?;
+        let source = project
+            .session
+            .video_source_files
+            .iter()
+            .find(|s| s.id == clip.video_source_file_id)
+            .ok_or("The clip's source video file is missing")?;
+        let offset_s = clip.source_offset_ms as f64 / 1000.0;
+        let dur_s = clip.end_sample.saturating_sub(clip.start_sample) as f64 / project.session.sample_rate as f64;
+        (PathBuf::from(&source.path), offset_s + dur_s.max(0.0) / 2.0)
+    };
+    if !source_path.exists() {
+        return Err("The clip's source video file is no longer on disk.".into());
+    }
+
+    let temp_dir = config.data_dir.join("auto-crop").join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir_all(&temp_dir).map_err(|e| format!("Could not prepare temp dir: {e}"))?;
+    let frame_path = temp_dir.join("frame.jpg");
+    let _ = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .arg("-ss")
+        .arg(format!("{frame_time:.3}"))
+        .arg("-i")
+        .arg(&source_path)
+        .args(["-frames:v", "1", "-q:v", "6", "-vf", "scale=768:768:force_original_aspect_ratio=decrease"])
+        .arg(&frame_path)
+        .status();
+
+    let frame_read = fs::read(&frame_path);
+    let _ = fs::remove_dir_all(&temp_dir);
+    let bytes = frame_read.map_err(|e| format!("Could not extract a frame at {frame_time:.1}s: {e}"))?;
+    let prompt = format!(
+        "You are reframing a video. Look at this frame and decide how to crop it so: {instructions}. \
+         Reply with ONLY a JSON object giving the percentage to REMOVE from each edge (each 0-45): \
+         {{\"cropTop\":0,\"cropRight\":0,\"cropBottom\":0,\"cropLeft\":0}}. \
+         Crop conservatively and keep the main subject fully in frame."
+    );
+    let base_url = config.video_base_url.trim_end_matches('/').to_string();
+    let resp = call_ollama_chat(&base_url, &config.video_model, prompt, Some(vec![BASE64_STANDARD.encode(bytes)]))
+        .await
+        .map_err(|e| format!("Video model call failed ({base_url} / {}): {e}", config.video_model))?;
+    let text = resp.message.content;
+    let json = crate::assistant::extract_json_object(&text).unwrap_or_else(|| text.clone());
+    let crop: CropChoice = serde_json::from_str(&json)
+        .map_err(|e| format!("Video model returned an unparseable crop ({e}). Raw: {}", text.chars().take(180).collect::<String>()))?;
+
+    // Apply as a reversible history entry so the auto-crop can be undone (⌘Z).
+    let ti = project.session.tracks.iter().position(|t| t.id == track_id).ok_or("Track not found")?;
+    let ci = project.session.tracks[ti].video_clips.iter().position(|c| c.id == clip_id).ok_or("Clip not found")?;
+    let old_layout = project.session.tracks[ti].video_clips[ci].layout.clone().unwrap_or_default();
+    let mut layout = old_layout.clone();
+    if let Some(v) = crop.crop_top { layout.crop_top = v; }
+    if let Some(v) = crop.crop_right { layout.crop_right = v; }
+    if let Some(v) = crop.crop_bottom { layout.crop_bottom = v; }
+    if let Some(v) = crop.crop_left { layout.crop_left = v; }
+    let new_layout = normalized_video_layout(&layout);
+    let path = format!("/tracks/{ti}/videoClips/{ci}/layout");
+    let forward = vec![crate::model::JsonPatchOp { op: "replace".into(), path: path.clone(), value: Some(serde_json::to_value(&new_layout).map_err(|e| e.to_string())?) }];
+    let inverse = vec![crate::model::JsonPatchOp { op: "replace".into(), path, value: Some(serde_json::to_value(&old_layout).map_err(|e| e.to_string())?) }];
+    crate::actions::record_patch(&mut project, forward, inverse, crate::model::HistorySource::Assistant, Some("Auto-crop".to_string()))?;
+    app.state::<AppState>().store.lock().map_err(|e| e.to_string())?.save(&project)?;
+    Ok(project)
+}
+
+/// Run a chat turn through the embedded Hermes agent sidecar.
+///
+/// The agent owns the loop (reasoning, tool execution, memory). Its tool calls
+/// flow through the in-process control surface (`control.rs`), which mutates the
+/// live session and refreshes the UI via `session:externally-updated` — so faders
+/// move mid-turn. We stream the agent's tokens/thoughts/tool events onto the same
+/// `llm:turn-start`/`llm:chunk`/`llm:turn-end` events the chat UI already renders.
 #[tauri::command]
 pub async fn assistant_request(
     app: tauri::AppHandle,
@@ -564,30 +945,77 @@ pub async fn assistant_request(
     request: AssistantRequest,
 ) -> Result<AssistantResponse, String> {
     assistant::reset_agent_cancel();
+    let hermes = state.hermes_service.clone();
+    if !hermes.wait_ready(std::time::Duration::from_secs(30)).await {
+        return Err(format!(
+            "Hermes agent sidecar at {} is not responding. Check that `uv` is on PATH and the model endpoint is reachable.",
+            hermes.base_url()
+        ));
+    }
+
+    let _ = app.emit("llm:turn-start", serde_json::json!({ "userText": request.user_text }));
+
+    // Accumulate the visible assistant message so the finished turn persists in the
+    // chat log (the live bubble is cleared on turn-end).
+    let message = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let app_cb = app.clone();
+    let message_cb = message.clone();
+    let result = hermes
+        .chat(&request.session_id, &request.user_text, move |event| {
+            use crate::hermes_service::ChatEvent;
+            match event {
+                ChatEvent::Chunk { text } => {
+                    if let Ok(mut buf) = message_cb.lock() {
+                        buf.push_str(&text);
+                    }
+                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "action", "text": text }));
+                }
+                ChatEvent::Thought { text } => {
+                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "think", "text": text }));
+                }
+                ChatEvent::Tool { name, status, .. } => {
+                    let label = if status.is_empty() || status == "None" {
+                        format!("{name}\n")
+                    } else {
+                        format!("{name} [{status}]\n")
+                    };
+                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "tool", "text": label }));
+                }
+                ChatEvent::Done { .. } => {}
+                ChatEvent::Error { message } => {
+                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "error", "text": message }));
+                }
+            }
+        }, assistant::agent_cancelled)
+        .await;
+
+    let _ = app.emit("llm:turn-end", serde_json::json!({}));
+    if assistant::agent_cancelled() {
+        // The user pressed Stop — the sidecar was disconnected and cancelled the
+        // ACP turn. Whatever tool calls already landed stay applied (they're real
+        // edits); we just report the cancellation to the chat.
+        return Err(assistant::CANCELLED_MESSAGE.into());
+    }
+    result?;
+
+    // Reload the (tool-mutated) project to return the fresh session + history. The
+    // actions were already applied and synced to the engine via the control surface.
     let project = {
         let store = state.store.lock().map_err(|error| error.to_string())?;
         store.get_project(&request.session_id)?
     };
-    let _ = app.emit("llm:turn-start", serde_json::json!({ "userText": request.user_text }));
-    let observer: std::sync::Arc<dyn assistant::LlmObserver> =
-        std::sync::Arc::new(TauriLlmObserver { app: app.clone() });
-    let result = assistant::handle_assistant(state.config.clone(), project, request, observer).await;
-    if assistant::agent_cancelled() {
-        // Discard whatever partial turn the model produced — nothing is saved.
-        let _ = app.emit("llm:turn-end", serde_json::json!({}));
-        return Err(assistant::CANCELLED_MESSAGE.into());
-    }
-    let (response, project) = result?;
-    {
-        let store = state.store.lock().map_err(|error| error.to_string())?;
-        store.save(&project)?;
-    }
-    if let Ok(mut audio) = state.audio.lock() {
-        sync_session_to_engine(&mut audio, &project.session);
-        audio.publish_automation(&project.session);
-    }
-    let _ = app.emit("llm:turn-end", serde_json::json!({}));
-    Ok(response)
+    let explanation = message.lock().map(|buf| buf.clone()).unwrap_or_default();
+    Ok(AssistantResponse::Ok {
+        explanation,
+        actions: vec![],
+        warnings: vec![],
+        selected_skills: vec![],
+        session: project.session,
+        history: project.history,
+        rationale: None,
+        per_action_notes: None,
+        tokens: None,
+    })
 }
 
 #[tauri::command]
@@ -2514,8 +2942,14 @@ pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFi
         saturation = Some(saturation.unwrap_or(1.0).min(0.75));
         name_parts.push("desaturated");
     }
-    if has("vibrant") || has("colorful") || has("colourful") {
+    if has("vivid") || has("saturated") || has("punchy") || has("pop") {
+        // A strong, clearly-visible boost — this is what people mean by "vivid".
+        saturation = Some(saturation.unwrap_or(1.0).max(1.35));
+        contrast = Some(contrast.unwrap_or(1.0).max(1.06));
+        name_parts.push("vivid");
+    } else if has("vibrant") || has("colorful") || has("colourful") {
         saturation = Some(saturation.unwrap_or(1.0).max(1.18));
+        name_parts.push("vibrant");
     }
     if has("vignette") {
         vignette = Some(vignette.unwrap_or(0.0).max(0.30));
@@ -3294,6 +3728,10 @@ async fn build_agent_edit_segments(
     let mut previous_input_index: Option<usize> = None;
     let mut consecutive_same = 0_u32;
     let mut usage_counts: HashMap<usize, u32> = HashMap::new();
+    // Once the video model fails to analyze a frame (e.g. a text-only endpoint that
+    // can't see images), stop calling it for the rest of the edit and fall back to
+    // deterministic multicam cuts — otherwise every window would eat the full timeout.
+    let mut vision_off = false;
     while cursor < range_end {
         if assistant::agent_cancelled() {
             return Err(assistant::CANCELLED_MESSAGE.into());
@@ -3415,8 +3853,8 @@ async fn build_agent_edit_segments(
             .map(|index| index + 1);
         // Merged describe+decide call: one HTTP roundtrip per window instead of two.
         // We still skip the LLM entirely when there's only one readable angle.
-        let merged = if image_count >= 2 {
-            analyze_and_decide_window(
+        let merged = if image_count >= 2 && !vision_off {
+            match analyze_and_decide_window(
                 base_url,
                 vision_model,
                 &labels,
@@ -3427,7 +3865,26 @@ async fn build_agent_edit_segments(
                 instructions,
             )
             .await
-            .ok()
+            {
+                Ok(m) => Some(m),
+                Err(_) => {
+                    // First failure: the model can't see frames. Disable vision and
+                    // let deterministic variety-cuts carry the rest of the edit.
+                    vision_off = true;
+                    emit_agent_progress(
+                        &app,
+                        &started,
+                        "vision",
+                        "Video model can't analyze frames — switching to automatic time/beat-based cuts.",
+                        window_index,
+                        total_windows,
+                    );
+                    None
+                }
+            }
+        } else if image_count >= 2 {
+            // Vision already disabled — rely on the deterministic cut logic below.
+            None
         } else {
             Some(AgentMergedChoice {
                 candidate_labels: None,
@@ -4046,7 +4503,12 @@ async fn call_ollama_chat_native(
     prompt: String,
     images: Option<Vec<String>>,
 ) -> Result<OllamaChatResponse, String> {
-    let client = reqwest::Client::new();
+    // Bounded timeout so a model that can't process images (e.g. a text-only endpoint
+    // handed video frames) fails fast instead of hanging the whole edit.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|error| error.to_string())?;
     let response = client
         .post(format!("{base_url}/api/chat"))
         .json(&OllamaChatRequest {
@@ -4091,7 +4553,10 @@ async fn call_openai_chat(
         "stream": false,
         "messages": [{ "role": "user", "content": content }],
     });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|error| error.to_string())?;
     let response = client
         .post(format!("{base_url}/v1/chat/completions"))
         .json(&body)
@@ -4207,7 +4672,7 @@ fn build_auto_edit_filter(
     filter
 }
 
-fn normalized_video_layout(layout: &VideoLayout) -> VideoLayout {
+pub fn normalized_video_layout(layout: &VideoLayout) -> VideoLayout {
     let mut next = layout.clone();
     next.width = next.width.clamp(1.0, 300.0);
     next.height = next.height.clamp(1.0, 300.0);
@@ -4290,7 +4755,7 @@ fn session_duration_samples(session: &MixSession) -> u64 {
     }).max().unwrap_or(0)
 }
 
-fn push_engine_commands(state: &State<'_, AppState>, session: &MixSession, actions: &[MixAction]) {
+fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAction]) {
     let Ok(mut audio) = state.audio.lock() else {
         return;
     };

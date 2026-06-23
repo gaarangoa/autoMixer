@@ -1,0 +1,6 @@
+[project]
+name = "automixer-mcp"
+version = "0.1.0"
+description = "MCP shim exposing AutoMixer's live-session control surface to the Hermes agent."
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.2.0"]

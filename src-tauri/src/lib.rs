@@ -7,8 +7,10 @@ pub mod auto_mix;
 pub mod capabilities;
 pub mod commands;
 pub mod config;
+pub mod control;
 pub mod defaults;
 pub mod engine;
+pub mod hermes_service;
 pub mod model;
 pub mod recorder;
 pub mod store;
@@ -17,6 +19,7 @@ pub mod web;
 use std::sync::{Arc, Mutex};
 
 use audio_service::AudioService;
+use hermes_service::HermesService;
 use config::Config;
 use engine::AudioEngine;
 use store::SessionStore;
@@ -30,6 +33,7 @@ pub struct AppState {
     pub store: Mutex<SessionStore>,
     pub audio: Mutex<AudioEngine>,
     pub audio_service: Arc<AudioService>,
+    pub hermes_service: Arc<HermesService>,
     pub recorder: Mutex<Option<recorder::RecordingHandle>>,
     pub input_monitor: Mutex<Option<recorder::InputMonitorHandle>>,
 }
@@ -43,6 +47,7 @@ pub fn run() {
     let engine = AudioEngine::new(block_size);
     let shared = engine.shared();
     let audio_service = Arc::new(AudioService::spawn());
+    let hermes_service = Arc::new(HermesService::spawn());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -53,6 +58,7 @@ pub fn run() {
             store: Mutex::new(store),
             audio: Mutex::new(engine),
             audio_service,
+            hermes_service,
             recorder: Mutex::new(None),
             input_monitor: Mutex::new(None),
         })
@@ -80,6 +86,16 @@ pub fn run() {
                 _ => {}
             });
             engine::telemetry::spawn_telemetry(app.handle().clone(), shared.clone());
+            // In-process HTTP control surface that the Hermes agent sidecar drives
+            // (loopback, ephemeral port, per-launch bearer token). Failing to bind it
+            // is non-fatal — the rest of the app still runs.
+            match control::spawn(app.handle().clone()) {
+                Ok(info) => println!(
+                    "[control] live session control surface on {} (token in env for sidecars)",
+                    info.base_url()
+                ),
+                Err(error) => eprintln!("[control] failed to start: {error}"),
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -101,6 +117,13 @@ pub fn run() {
             commands::fit_canvas_to_footage,
             commands::restart_app,
             commands::cancel_agent,
+            commands::get_hermes_model,
+            commands::set_hermes_model,
+            commands::clear_chat,
+            commands::get_video_model,
+            commands::set_video_model,
+            commands::set_video_selection,
+            commands::get_video_selection,
             commands::apply_mix_actions,
             commands::undo_mix_action,
             commands::redo_mix_action,

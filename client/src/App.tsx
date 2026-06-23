@@ -1,5 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { AlertCircle, Camera, CheckCircle2, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, Info, Keyboard, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, SkipBack, SlidersHorizontal, Square, Trash2, Upload, Video, X } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { AlertCircle, Camera, CheckCircle2, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, Info, Keyboard, Maximize2, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, SkipBack, SlidersHorizontal, Square, Trash2, Upload, Video, X } from "lucide-react";
 import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -223,7 +225,6 @@ export function App() {
   const [loopSection, setLoopSection] = useState<{ start: number; end: number } | null>(null);
   const [profilePresets, setProfilePresets] = useState<ProfilePreset[]>([]);
   const [reasoning, setReasoning] = useState<{ phase: string; text: string; tokens: { prompt: number; response: number; elapsedMs: number } | null }[]>([]);
-  const [reasoningOpen, setReasoningOpen] = useState(false);
   const [streamingTurn, setStreamingTurn] = useState<{ phase: string; text: string } | null>(null);
   const [mode, setMode] = useState<"interactive" | "auto" | "video">("interactive");
   const [autoMixStages, setAutoMixStages] = useState<{ stageId: string; displayName: string; status: string; actionCount: number; warnings: string[]; error?: string; tokens: number; elapsedMs: number; explanation?: string }[]>([]);
@@ -234,6 +235,14 @@ export function App() {
   const [modelOptions, setModelOptions] = useState<string[]>(() => [initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL]);
   const [modelStatus, setModelStatus] = useState("Not checked");
   const [modelsLoading, setModelsLoading] = useState(false);
+  // Embedded Hermes agent orchestration model (any OpenAI-compatible endpoint).
+  const [agentUrl, setAgentUrl] = useState("");
+  const [agentModel, setAgentModel] = useState("");
+  const [agentStatus, setAgentStatus] = useState("");
+  // Video/vision VLM endpoint the video-edit skill calls (e.g. Qwen3-VL on the Spark).
+  const [videoUrl, setVideoUrl] = useState("");
+  const [videoModelName, setVideoModelName] = useState("");
+  const [videoStatus, setVideoStatus] = useState("");
   const [inputDevices, setInputDevices] = useState<string[]>([]);
   const [trackInputDevices, setTrackInputDevices] = useState<Record<string, string>>({});
   // Per-track input gain in dB (applied to the recorded signal before it hits disk).
@@ -254,6 +263,8 @@ export function App() {
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [mixerWindowOpen, setMixerWindowOpen] = useState(false);
+  const [videoMonitorOpen, setVideoMonitorOpen] = useState(false);
+  const videoMonitorRef = useRef<WebviewWindow | null>(null);
   const busyRef = useRef(false);
   useEffect(() => { busyRef.current = busy; }, [busy]);
 
@@ -400,6 +411,15 @@ export function App() {
     void mixerWindowRef.current?.emit("mixer:update", { sessionId: session.id } satisfies MixerWindowPayload).catch(() => undefined);
   }, [session?.id, project, mixerWindowOpen]);
 
+  // Keep the backend (for the video-edit skill) and the monitor window in sync with
+  // the user's track selection — so the agent edits, and the monitor shows, only
+  // what's selected.
+  useEffect(() => {
+    if (!session) return;
+    void api.setVideoSelection(session.id, selectedTrackIds).catch(() => undefined);
+    void videoMonitorRef.current?.emit("video-monitor:selection", { trackIds: selectedTrackIds }).catch(() => undefined);
+  }, [selectedTrackIds, session?.id]);
+
   useEffect(() => {
     void api.listMixerProfiles().then(setProfilePresets).catch(() => undefined);
     void api.inputDevices().then((result) => setInputDevices(result.devices)).catch(() => undefined);
@@ -483,6 +503,25 @@ export function App() {
       const p = payload as { project?: MixProject };
       if (p?.project) setProject(p.project);
     }));
+    // An external agent (the Hermes control surface) mutated a session. Refresh the
+    // project only if it's the one currently open — compared via the functional
+    // updater so this empty-deps effect never reads a stale session id.
+    reg(api.onSessionExternallyUpdated((event) => {
+      setProject((prev) => (prev && prev.session.id === event.sessionId ? event.project : prev));
+    }));
+    // A video render finished: drop a result chip in the chat (click to open the
+    // monitor). We don't auto-open — the monitor is a user-toggled window now.
+    reg(api.onVideoRendered((event) => {
+      setMessages((items) => [...items, { role: "video", path: event.path, cuts: event.cuts, lookPreset: event.lookPreset }]);
+    }));
+    // Clicking a tile in the video monitor selects that track here.
+    reg(listen<{ trackId: string }>("video-monitor:select", (event) => {
+      setSelectedTrackIds([event.payload.trackId]);
+    }));
+    // The agent set the selection (select_tracks tool) — mirror it in the UI.
+    reg(listen<{ sessionId: string; trackIds: string[] }>("selection:set", (event) => {
+      setSelectedTrackIds(event.payload.trackIds ?? []);
+    }));
     reg(api.onLlmTurnStart(() => {
       setReasoning([]);
       setStreamingTurn(null);
@@ -519,16 +558,32 @@ export function App() {
     return () => { cancelled = true; unlisteners.forEach((fn) => fn()); };
   }, []);
 
-  const turnTokenTotal = useMemo(() => {
-    return reasoning.reduce(
+  // Live reasoning (the agent's "thinking") and the tool calls it has made this
+  // turn — surfaced inline in the chat so long operations never look frozen.
+  const liveReasoning = useMemo(
+    () => reasoning.filter((r) => r.phase === "think").map((r) => r.text).join("").trim(),
+    [reasoning],
+  );
+  const liveTools = useMemo(
+    () => reasoning.filter((r) => r.phase === "tool").map((r) => r.text.trim()).filter(Boolean),
+    [reasoning],
+  );
+  const liveTokens = useMemo(
+    () => reasoning.reduce(
       (acc, r) => ({
         prompt: acc.prompt + (r.tokens?.prompt ?? 0),
         response: acc.response + (r.tokens?.response ?? 0),
-        elapsedMs: acc.elapsedMs + (r.tokens?.elapsedMs ?? 0),
       }),
-      { prompt: 0, response: 0, elapsedMs: 0 }
-    );
-  }, [reasoning]);
+      { prompt: 0, response: 0 },
+    ),
+    [reasoning],
+  );
+
+  // Mirror the live reasoning into a ref so handleAssistantResponse (which runs
+  // after the async turn resolves, when its closure's `reasoning` is stale) can
+  // snapshot the full thinking + tool track and persist it onto the turn card.
+  const reasoningRef = useRef(reasoning);
+  useEffect(() => { reasoningRef.current = reasoning; }, [reasoning]);
 
   useEffect(() => {
     localStorage.setItem("autoMixer.ollamaUrl", ollamaUrl);
@@ -1127,6 +1182,15 @@ export function App() {
           setModelOptions([config.ollamaModel]);
         }
       }
+      // Reflect the embedded agent's current orchestration model in the settings.
+      void api.getHermesModel().then((m) => {
+        setAgentUrl(m.baseUrl);
+        setAgentModel(m.model);
+      }).catch(() => undefined);
+      void api.getVideoModel().then((m) => {
+        setVideoUrl(m.baseUrl);
+        setVideoModelName(m.model);
+      }).catch(() => undefined);
       const loaded = sessions[0] ? await api.getSession(sessions[0].id) : await api.createSession("AutoMixer session");
       setProject(loaded);
       setSessionList(sessions.length > 0 ? sessions : [loaded.session]);
@@ -1409,6 +1473,50 @@ export function App() {
     }
   }
 
+  // Toggle the floating multicam Video Monitor: a synced grid of every video clip
+  // in the session (camera angles + agent renders), driven by the transport.
+  async function toggleVideoMonitor(forceShow = false) {
+    if (!session) return;
+    try {
+      const query = new URLSearchParams({ videoMonitor: "1", sessionId: session.id });
+      let monitor = await WebviewWindow.getByLabel("video-monitor");
+      if (monitor && videoMonitorOpen && !forceShow) {
+        await monitor.hide().catch(() => undefined);
+        setVideoMonitorOpen(false);
+        return;
+      }
+      if (!monitor) {
+        monitor = new WebviewWindow("video-monitor", {
+          url: `/?${query.toString()}`,
+          title: "Video Monitor",
+          width: 880,
+          height: 560,
+          minWidth: 360,
+          minHeight: 240,
+          resizable: true,
+        });
+        videoMonitorRef.current = monitor;
+        setVideoMonitorOpen(true);
+        const created = monitor;
+        created.once("tauri://created", () => {
+          void created.emit("video-monitor:session", { sessionId: session.id });
+          void created.emit("video-monitor:selection", { trackIds: selectedTrackIds });
+        });
+        created.once("tauri://destroyed", () => { if (videoMonitorRef.current === created) videoMonitorRef.current = null; setVideoMonitorOpen(false); });
+        created.once("tauri://error", (event) => { setVideoMonitorOpen(false); pushSystem(`Could not open video monitor: ${String(event.payload)}`); });
+      } else {
+        videoMonitorRef.current = monitor;
+        setVideoMonitorOpen(true);
+        await monitor.emit("video-monitor:session", { sessionId: session.id }).catch(() => undefined);
+        await monitor.emit("video-monitor:selection", { trackIds: selectedTrackIds }).catch(() => undefined);
+      }
+      await monitor.show().catch(() => undefined);
+      await monitor.setFocus().catch(() => undefined);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
   async function startVideoRecordingsAt(startSeconds: number) {
     if (!session) return true;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
@@ -1551,8 +1659,13 @@ export function App() {
     if (patch.solo !== undefined) actions.push({ tool: "solo_track" as const, trackId: track.id, solo: patch.solo });
     if (patch.aiGenerated !== undefined) actions.push({ tool: "set_track_ai_generated" as const, trackId: track.id, aiGenerated: patch.aiGenerated });
     if (!actions.length) return;
-    const updated = await api.applyActions(session.id, actions, "Manual control change");
-    setProject(updated);
+    try {
+      const updated = await api.applyActions(session.id, actions, "Manual control change");
+      setProject(updated);
+    } catch (error) {
+      // Surface the failure instead of letting the control silently snap back.
+      pushSystem(error instanceof Error ? error.message : String(error));
+    }
   }
 
   function toggleTrackSelection(trackId: string) {
@@ -2078,11 +2191,28 @@ export function App() {
     if (response.status === "ok") {
       setProject((current) => current ? { ...current, session: response.session, history: response.history } : current);
       const turnEntry = response.history[response.history.length - 1];
+      // Snapshot this turn's full track — the agent's thinking and the tools it
+      // called — so the activity feedback persists in the chat instead of
+      // vanishing when the turn ends.
+      const snap = reasoningRef.current;
+      const turnReasoning = snap.filter((r) => r.phase === "think").map((r) => r.text).join("").trim();
+      const turnTools = snap.filter((r) => r.phase === "tool").map((r) => r.text.trim()).filter(Boolean);
+      const turnTokens = snap.reduce(
+        (acc, r) => ({
+          prompt: acc.prompt + (r.tokens?.prompt ?? 0),
+          response: acc.response + (r.tokens?.response ?? 0),
+          elapsedMs: acc.elapsedMs + (r.tokens?.elapsedMs ?? 0),
+        }),
+        { prompt: 0, response: 0, elapsedMs: 0 },
+      );
       setMessages((items) => [
         ...items,
         {
           role: "assistant-turn",
           explanation: response.explanation,
+          reasoning: turnReasoning,
+          tools: turnTools,
+          tokens: turnTokens,
           skills: response.selectedSkills,
           actions: response.actions,
           warnings: response.warnings,
@@ -2118,6 +2248,22 @@ export function App() {
     } catch (error) {
       pushSystem(error);
     }
+  }
+
+  // Clear the chat: wipe the on-screen transcript AND tell the agent to forget the
+  // conversation, so a fresh request doesn't inherit stale context (e.g. an earlier
+  // "cinema" look the user never asked for again).
+  async function clearChat() {
+    if (!session) return;
+    try {
+      await api.clearChat(session.id);
+    } catch (error) {
+      pushSystem(error);
+    }
+    setMessages([]);
+    setReasoning([]);
+    setStreamingTurn(null);
+    pushToast("info", "Chat cleared — the agent starts fresh.");
   }
 
   async function doUndo() {
@@ -3214,6 +3360,14 @@ export function App() {
               >
                 <SlidersHorizontal size={18} />
               </button>
+              <button
+                className={videoMonitorOpen ? "active" : ""}
+                onClick={() => void toggleVideoMonitor()}
+                title={videoMonitorOpen ? "Hide video monitor" : "Show video monitor"}
+                aria-pressed={videoMonitorOpen}
+              >
+                <Video size={18} />
+              </button>
               <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={18} /></button>
               <button className="upload" onClick={() => void importFiles()} title="Import audio">
                 <Upload size={18} />
@@ -3856,15 +4010,11 @@ export function App() {
         />
       </section>
 
-      <aside className={`assistant ${settingsOpen ? "settings-open" : ""}`}>
+      <aside className="assistant">
         <div className="assistant-head">
           <div className="assistant-title">
-            <MessageSquare size={18} />
-            <div className="mode-toggle">
-              <button className={mode === "interactive" ? "active" : ""} onClick={() => setMode("interactive")} title="Chat with the assistant about mix changes">Chat</button>
-              <button className={mode === "auto" ? "active" : ""} onClick={() => setMode("auto")} title="Run the staged autonomous mixing pipeline">Auto-mix</button>
-              <button className={mode === "video" ? "active" : ""} onClick={() => setMode("video")} title="Multicam video editing assistant">Video</button>
-            </div>
+            <MessageSquare size={17} />
+            <span>Assistant</span>
           </div>
           <div className="assistant-head-actions">
             {busy || autoMixRunning ? (
@@ -3877,120 +4027,19 @@ export function App() {
                 <span>Stop</span>
               </button>
             ) : null}
-            <button onClick={() => setSettingsOpen((open) => !open)} title="LLM settings">
-              <Settings size={18} />
+            <button
+              className="icon-btn"
+              onClick={() => void clearChat()}
+              disabled={busy || autoMixRunning}
+              title="Clear chat — start a fresh conversation so the agent forgets earlier context"
+              aria-label="Clear chat"
+            >
+              <Trash2 size={17} />
+            </button>
+            <button className="icon-btn" onClick={() => setSettingsOpen(true)} title="Settings" aria-label="Settings">
+              <Settings size={17} />
             </button>
           </div>
-        </div>
-        {settingsOpen ? (
-          <div className="llm-settings">
-            <label>
-              Model server URL
-              <input value={ollamaUrl} onChange={(event) => setOllamaUrl(event.target.value)} placeholder={DEFAULT_OLLAMA_URL} />
-            </label>
-            <div className="llm-hint">
-              Ollama (:11434), vLLM (:8000), or llama.cpp (:8080) — the protocol is detected automatically.
-            </div>
-            <label>
-              Model
-              <select value={ollamaModel} onChange={(event) => setOllamaModel(event.target.value)}>
-                {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
-              </select>
-            </label>
-            <label>
-              Gemini API key
-              <input
-                value={geminiApiKey}
-                onChange={(event) => setGeminiApiKey(event.target.value)}
-                type="password"
-                placeholder="Used for A/B audio judge"
-              />
-            </label>
-            <div className="llm-actions">
-              <button onClick={() => void loadOllamaModels()} disabled={modelsLoading} title="Refresh models">
-                <RefreshCw size={16} />
-              </button>
-              <span>{modelStatus}</span>
-            </div>
-            <label>
-              Mixer profile
-              <select
-                value={session.mixerProfile?.presetId ?? "balanced"}
-                onChange={(event) => {
-                  const preset = profilePresets.find((p) => p.id === event.target.value);
-                  if (preset) void applyProfilePreset(preset);
-                }}
-              >
-                {profilePresets.map((preset) => (
-                  <option key={preset.id} value={preset.id}>{preset.displayName}</option>
-                ))}
-              </select>
-            </label>
-            {(() => {
-              const current = profilePresets.find((p) => p.id === (session.mixerProfile?.presetId ?? "balanced"));
-              return current ? <div className="profile-summary">{current.summary}</div> : null;
-            })()}
-            <div className="llm-settings-section-title">Video agent</div>
-            <label>
-              Edit interval
-              <input value={agentIntervalSeconds} onChange={(event) => setAgentIntervalSeconds(event.target.value)} inputMode="decimal" />
-            </label>
-            <label>
-              Vision model
-              <select value={agentVideoModel} onChange={(event) => setAgentVideoModel(event.target.value)}>
-                {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
-              </select>
-            </label>
-            <label>
-              Edit model
-              <select value={agentVideoEditModel} onChange={(event) => setAgentVideoEditModel(event.target.value)}>
-                {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
-              </select>
-            </label>
-            {appVersion ? <div className="llm-about">AutoMixer v{appVersion}</div> : null}
-          </div>
-        ) : null}
-        <div className={`reasoning-panel ${reasoningOpen ? "open" : ""}`}>
-          <button
-            type="button"
-            className="reasoning-head"
-            onClick={() => setReasoningOpen((open) => !open)}
-            title="Show or hide live model output and token counts"
-          >
-            <strong>Agent reasoning</strong>
-            <span>
-              {turnTokenTotal.prompt > 0
-                ? `${turnTokenTotal.prompt.toLocaleString()} prompt · ${turnTokenTotal.response.toLocaleString()} response tokens · ${(turnTokenTotal.elapsedMs / 1000).toFixed(1)}s`
-                : busy
-                  ? "waiting for first chunk…"
-                  : "click to inspect"}
-            </span>
-          </button>
-          {reasoningOpen ? (
-            <div className="reasoning-body">
-              {reasoning.length === 0 ? (
-                <div className="reasoning-empty">
-                  When you send a message, the model's raw output and per-phase token counts will appear here live.
-                </div>
-              ) : (
-                reasoning.map((r, i) => (
-                  <div key={i} className={`reasoning-phase phase-${r.phase}`}>
-                    <div className="reasoning-phase-head">
-                      <span className="reasoning-phase-name">{r.phase}</span>
-                      {r.tokens ? (
-                        <span className="reasoning-phase-stats">
-                          {r.tokens.prompt.toLocaleString()} · {r.tokens.response.toLocaleString()} tok · {(r.tokens.elapsedMs / 1000).toFixed(1)}s
-                        </span>
-                      ) : (
-                        <span className="reasoning-phase-stats streaming">streaming…</span>
-                      )}
-                    </div>
-                    <pre className="reasoning-text">{r.text}</pre>
-                  </div>
-                ))
-              )}
-            </div>
-          ) : null}
         </div>
         {mode === "auto" ? (
           <AutoMixView
@@ -4263,16 +4312,66 @@ export function App() {
                       />
                     );
                   }
+                  if (message.role === "video") {
+                    return (
+                      <button key={index} type="button" className="chat-video-chip" onClick={() => void toggleVideoMonitor(true)} title="Open in the video monitor">
+                        <span className="chip-play"><Play size={14} /></span>
+                        <span className="chip-text">
+                          <strong>Video edit ready</strong>
+                          <span className="chip-meta">{message.cuts} cuts{message.lookPreset ? ` · ${message.lookPreset}` : ""}</span>
+                        </span>
+                        <Maximize2 size={14} className="chip-open" />
+                      </button>
+                    );
+                  }
                   return <div key={index} className={`message ${message.role}`}>{message.text}</div>;
                 })
               )}
-              {streamingTurn ? (
-                <div className="message streaming">
-                  <div className="streaming-head">
-                    <div className="streaming-dot" />
-                    <span>agent is {streamingTurn.phase === "critique" ? "writing the critique" : "drafting actions"}…</span>
+              {busy ? (
+                <div className="message activity">
+                  <div className="activity-head">
+                    <span className="activity-dot" />
+                    <span>{autoMixRunning ? "Auto-mixing…" : agentEditProgress ? "Editing video…" : "Working…"}</span>
+                    {liveTokens.prompt > 0 || liveTokens.response > 0 ? (
+                      <span className="activity-tokens">{liveTokens.prompt.toLocaleString()} → {liveTokens.response.toLocaleString()} tok</span>
+                    ) : null}
                   </div>
-                  <pre className="streaming-text">{streamingTurn.text || "…"}</pre>
+
+                  {liveReasoning ? (
+                    <details className="activity-reasoning" open>
+                      <summary>Reasoning</summary>
+                      <pre>{liveReasoning}</pre>
+                    </details>
+                  ) : null}
+
+                  {liveTools.length > 0 ? (
+                    <div className="activity-tools">
+                      {liveTools.slice(-6).map((tool, i) => (
+                        <span key={i} className="activity-tool">{tool}</span>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {streamingTurn?.text ? <pre className="streaming-text">{streamingTurn.text}</pre> : null}
+
+                  {autoMixRunning && autoMixStages.length > 0 ? (
+                    <div className="activity-stages">
+                      {autoMixStages.map((s) => (
+                        <div key={s.stageId} className={`activity-stage ${s.status}`}>
+                          <span className="stage-icon">{s.status === "running" ? "▸" : s.status === "complete" ? "✓" : s.status === "error" ? "✗" : "·"}</span>
+                          <span className="stage-name">{s.displayName}</span>
+                          {s.actionCount ? <span className="stage-count">{s.actionCount}</span> : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {agentEditProgress ? (
+                    <div className="activity-video">
+                      Rendering video · {agentEditProgress.message || agentEditProgress.stage}
+                      {agentEditProgress.total ? ` (${agentEditProgress.current}/${agentEditProgress.total})` : ""}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>
@@ -4293,20 +4392,95 @@ export function App() {
               className="chat-input"
               onSubmit={(event) => {
                 event.preventDefault();
-                void sendChat();
+                if (!busy && chatText.trim()) void sendChat();
               }}
             >
               <textarea
                 value={chatText}
                 onChange={(event) => setChatText(event.target.value)}
-                placeholder="Make the vocal more upfront..."
+                onKeyDown={(event) => {
+                  // Enter sends; Shift+Enter inserts a newline. Ignore Enter while
+                  // an IME composition is active so CJK input commits cleanly.
+                  if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    if (!busy && chatText.trim()) void sendChat();
+                  }
+                }}
+                placeholder={busy ? "Working…" : "Make a change or ask anything…"}
                 disabled={busy}
+                rows={1}
               />
-              <button disabled={busy || !chatText.trim()}>{busy ? "Working" : "Send"}</button>
             </form>
           </>
         )}
       </aside>
+      {settingsOpen ? (
+        <div className="settings-backdrop" onPointerDown={() => setSettingsOpen(false)}>
+          <div className="settings-modal" role="dialog" aria-modal="true" aria-label="Settings" onPointerDown={(e) => e.stopPropagation()}>
+            <header className="settings-modal-head">
+              <h2>Settings</h2>
+              <button className="icon-btn" onClick={() => setSettingsOpen(false)} aria-label="Close settings"><X size={18} /></button>
+            </header>
+            <div className="settings-modal-body">
+              <section className="settings-group">
+                <div className="settings-group-title">Agent model</div>
+                <p className="settings-group-desc">The model that powers the chat — and the auto-mix. Any OpenAI-compatible endpoint (vLLM / llama.cpp / Ollama).</p>
+                <label className="settings-field"><span>Endpoint URL</span>
+                  <input value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://127.0.0.1:2256/v1" />
+                </label>
+                <label className="settings-field"><span>Model</span>
+                  <input value={agentModel} onChange={(e) => setAgentModel(e.target.value)} placeholder="qwen3.6-35b-a3b" />
+                </label>
+                <div className="settings-field-actions">
+                  <button className="primary" onClick={async () => {
+                    setAgentStatus("Applying…");
+                    try { await api.setHermesModel(agentUrl.trim(), agentModel.trim()); setAgentStatus("Agent restarted on new model"); }
+                    catch (error) { setAgentStatus(error instanceof Error ? error.message : String(error)); }
+                  }}>Apply</button>
+                  <span className="settings-status">{agentStatus}</span>
+                </div>
+              </section>
+
+              <section className="settings-group">
+                <div className="settings-group-title">Video model</div>
+                <p className="settings-group-desc">The vision model the video-edit skill uses to "see" frames (e.g. Qwen3-VL on the Spark).</p>
+                <label className="settings-field"><span>Endpoint URL</span>
+                  <input value={videoUrl} onChange={(e) => setVideoUrl(e.target.value)} placeholder="http://127.0.0.1:11435" />
+                </label>
+                <label className="settings-field"><span>Model</span>
+                  <input value={videoModelName} onChange={(e) => setVideoModelName(e.target.value)} placeholder="qwen3-vl:30b-a3b-instruct-q4_K_M" />
+                </label>
+                <div className="settings-field-actions">
+                  <button className="primary" onClick={async () => {
+                    setVideoStatus("Saving…");
+                    try { await api.setVideoModel(videoUrl.trim(), videoModelName.trim()); setOllamaUrl(videoUrl.trim()); setAgentVideoModel(videoModelName.trim()); setVideoStatus("Video model saved"); }
+                    catch (error) { setVideoStatus(error instanceof Error ? error.message : String(error)); }
+                  }}>Apply</button>
+                  <span className="settings-status">{videoStatus}</span>
+                </div>
+              </section>
+
+              <section className="settings-group">
+                <div className="settings-group-title">Mix profile</div>
+                <label className="settings-field"><span>Preset</span>
+                  <select value={session.mixerProfile?.presetId ?? "balanced"} onChange={(e) => { const preset = profilePresets.find((p) => p.id === e.target.value); if (preset) void applyProfilePreset(preset); }}>
+                    {profilePresets.map((preset) => <option key={preset.id} value={preset.id}>{preset.displayName}</option>)}
+                  </select>
+                </label>
+                {(() => { const current = profilePresets.find((p) => p.id === (session.mixerProfile?.presetId ?? "balanced")); return current ? <p className="settings-group-desc">{current.summary}</p> : null; })()}
+              </section>
+
+              <section className="settings-group">
+                <div className="settings-group-title">A/B judge</div>
+                <label className="settings-field"><span>Gemini API key</span>
+                  <input value={geminiApiKey} onChange={(e) => setGeminiApiKey(e.target.value)} type="password" placeholder="Used for the A/B audio judge" />
+                </label>
+              </section>
+            </div>
+            {appVersion ? <footer className="settings-modal-foot">AutoMixer v{appVersion}</footer> : null}
+          </div>
+        </div>
+      ) : null}
       {addTrackMenuOpen ? (
         <div className="add-track-modal-backdrop" onPointerDown={() => setAddTrackMenuOpen(false)}>
           <div
@@ -4950,6 +5124,136 @@ function readMixerPayloadFromUrl(): MixerWindowPayload | undefined {
   const params = new URLSearchParams(window.location.search);
   const sessionId = params.get("sessionId") ?? "";
   return sessionId ? { sessionId } : undefined;
+}
+
+/** Floating video monitor window — plays the latest agent render. Receives the
+ *  path via the URL on first open and via `video-monitor:load` events after. */
+/** Floating multicam Video Monitor — a synced grid of every video clip in the
+ *  session (camera angles + agent renders), driven by the engine transport. */
+export function VideoMonitorApp() {
+  const initialSid = new URLSearchParams(window.location.search).get("sessionId") ?? "";
+  const [sessionId, setSessionId] = useState(initialSid);
+  const [project, setProject] = useState<MixProject>();
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const playRef = useRef<{ sample: number; running: boolean }>({ sample: 0, running: false });
+  const videoEls = useRef<Map<string, HTMLVideoElement>>(new Map());
+
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    void api.getSession(sessionId).then((p) => { if (!cancelled) setProject(p); }).catch(() => undefined);
+    void api.getVideoSelection(sessionId).then((ids) => { if (!cancelled) setSelectedIds(ids); }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [sessionId]);
+
+  useEffect(() => {
+    const unsubs: (() => void)[] = [];
+    void listen<{ sessionId: string }>("video-monitor:session", (e) => setSessionId(e.payload.sessionId)).then((fn) => unsubs.push(fn));
+    void listen<{ trackIds: string[] }>("video-monitor:selection", (e) => setSelectedIds(e.payload.trackIds ?? [])).then((fn) => unsubs.push(fn));
+    void api.onSessionExternallyUpdated((e) => setProject((prev) => (prev && prev.session.id === e.sessionId ? e.project : prev))).then((fn) => unsubs.push(fn));
+    void api.onPlayhead((e) => { playRef.current = { sample: e.sample, running: e.running }; }).then((fn) => unsubs.push(fn));
+    return () => unsubs.forEach((f) => f());
+  }, []);
+
+  const sr = project?.session.sampleRate ?? 48000;
+  type MonitorClip = { id: string; trackId: string; trackName: string; path: string; start: number; end: number; offset: number; cl: number; cr: number; ct: number; cb: number; rot: number; op: number; filter: string };
+  const allClips = useMemo(() => {
+    const s = project?.session;
+    if (!s) return [] as MonitorClip[];
+    const byId = new Map((s.videoSourceFiles ?? []).map((v) => [v.id, v]));
+    const out: MonitorClip[] = [];
+    for (const t of s.tracks) {
+      if (t.kind !== "video") continue;
+      for (const c of (t.videoClips ?? [])) {
+        const src = byId.get(c.videoSourceFileId);
+        if (!src?.path) continue;
+        out.push({
+          id: c.id, trackId: t.id, trackName: t.name, path: src.path,
+          start: c.startSample / sr, end: c.endSample / sr, offset: (c.sourceOffsetMs ?? 0) / 1000,
+          cl: (c.layout?.cropLeft ?? 0) / 100, cr: (c.layout?.cropRight ?? 0) / 100,
+          ct: (c.layout?.cropTop ?? 0) / 100, cb: (c.layout?.cropBottom ?? 0) / 100,
+          rot: c.layout?.rotation ?? 0, op: c.layout?.opacity ?? 1,
+          // Live color preview — saturation/brightness/contrast/blur/preset as a CSS
+          // filter so a focused-track "make it vivid" shows instantly, no render.
+          filter: videoFilterCss(normalizeVideoLayout(c.layout)),
+        });
+      }
+    }
+    return out;
+  }, [project, sr]);
+
+  // Show only the selected video tracks when a selection exists; otherwise all.
+  const clips = useMemo(() => {
+    const selected = allClips.filter((c) => selectedIds.includes(c.trackId));
+    return selected.length > 0 ? selected : allClips;
+  }, [allClips, selectedIds]);
+
+  // Keep every tile's playback locked to the engine playhead.
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      const { sample, running } = playRef.current;
+      const pos = sample / sr;
+      for (const c of clips) {
+        const el = videoEls.current.get(c.id);
+        if (!el) continue;
+        const active = pos >= c.start && pos <= c.end;
+        const target = Math.max(0, pos - c.start + c.offset);
+        if (active && running) {
+          if (Math.abs(el.currentTime - target) > 0.3) el.currentTime = target;
+          if (el.paused) void el.play().catch(() => undefined);
+        } else {
+          if (!el.paused) el.pause();
+          if (active && Math.abs(el.currentTime - target) > 0.05) el.currentTime = target;
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [clips, sr]);
+
+  const cols = Math.max(1, Math.ceil(Math.sqrt(clips.length || 1)));
+  return (
+    <main className="video-monitor-grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+      {clips.length === 0 ? (
+        <div className="video-monitor-empty">No video in this session yet — record or import video, or ask the assistant to edit a clip.</div>
+      ) : (
+        clips.map((c) => {
+          // Preview the clip's crop/reframe live: zoom into the retained region.
+          const sx = 1 / Math.max(0.1, 1 - c.cl - c.cr);
+          const sy = 1 / Math.max(0.1, 1 - c.ct - c.cb);
+          const ox = ((c.cl + (1 - c.cr)) / 2) * 100;
+          const oy = ((c.ct + (1 - c.cb)) / 2) * 100;
+          const cropped = c.cl > 0 || c.cr > 0 || c.ct > 0 || c.cb > 0 || c.rot !== 0;
+          return (
+            <div
+              className={`monitor-tile ${selectedIds.includes(c.trackId) ? "selected" : ""}`}
+              key={c.id}
+              onClick={() => void emit("video-monitor:select", { trackId: c.trackId }).catch(() => undefined)}
+              title={`Click to focus ${c.trackName}`}
+            >
+              <video
+                ref={(el) => { if (el) videoEls.current.set(c.id, el); else videoEls.current.delete(c.id); }}
+                src={convertFileSrc(c.path)}
+                muted
+                playsInline
+                preload="auto"
+                style={{
+                  objectFit: cropped ? "cover" : "contain",
+                  transform: `rotate(${c.rot}deg) scale(${sx}, ${sy})`,
+                  transformOrigin: `${ox}% ${oy}%`,
+                  opacity: c.op,
+                  filter: c.filter,
+                }}
+              />
+              <span className="monitor-tile-label">{c.trackName}</span>
+            </div>
+          );
+        })
+      )}
+    </main>
+  );
 }
 
 export function MixerWindowApp() {
@@ -7789,6 +8093,9 @@ function buildAbJudgeFixPrompt(result: AbJudgeResponse) {
 type AssistantTurnMessage = {
   role: "assistant-turn";
   explanation: string;
+  reasoning?: string;
+  tools?: string[];
+  tokens?: { prompt: number; response: number; elapsedMs: number };
   skills: string[];
   actions: MixAction[];
   warnings: string[];
@@ -7802,13 +8109,16 @@ type AssistantTurnMessage = {
 type CritiqueMessage = { role: "critique"; critique: MixCritique; skills: string[] };
 type AbJudgeMessage = { role: "ab-judge"; result: AbJudgeResponse };
 
+type VideoResultMessage = { role: "video"; path: string; cuts: number; lookPreset?: string };
+
 type ChatMessage =
   | { role: "user"; text: string }
   | { role: "assistant"; text: string }
   | { role: "system"; text: string }
   | CritiqueMessage
   | AbJudgeMessage
-  | AssistantTurnMessage;
+  | AssistantTurnMessage
+  | VideoResultMessage;
 
 type ActionDescription = {
   target: string;
@@ -7845,7 +8155,22 @@ function AssistantTurn({
 
   return (
     <div className="message assistant-turn">
-      {message.explanation ? <div className="turn-prose">{message.explanation}</div> : null}
+      {message.reasoning ? (
+        <details className="activity-reasoning turn-reasoning" open>
+          <summary>Reasoning</summary>
+          <pre>{message.reasoning}</pre>
+        </details>
+      ) : null}
+      {message.tools && message.tools.length > 0 ? (
+        <div className="activity-tools turn-tools">
+          {message.tools.map((tool, i) => <span key={i} className="activity-tool">{tool}</span>)}
+        </div>
+      ) : null}
+      {message.explanation ? (
+        <div className="turn-prose markdown-body">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.explanation}</ReactMarkdown>
+        </div>
+      ) : null}
       {message.warnings.length > 0 ? (
         <ul className="turn-warnings">
           {message.warnings.map((warning, i) => <li key={i}>{warning}</li>)}
@@ -7875,6 +8200,12 @@ function AssistantTurn({
         </ul>
       ) : null}
       <div className="turn-meta">
+        {message.tokens && (message.tokens.prompt > 0 || message.tokens.response > 0) ? (
+          <span className="turn-tokens" title="Tokens used this turn (prompt → response) and wall-clock time">
+            {message.tokens.prompt.toLocaleString()} → {message.tokens.response.toLocaleString()} tok
+            {message.tokens.elapsedMs > 0 ? ` · ${(message.tokens.elapsedMs / 1000).toFixed(1)}s` : ""}
+          </span>
+        ) : null}
         {message.skills.length > 0 ? <span className="turn-skills">{message.skills.join(" · ")}</span> : null}
         {hasRationale ? (
           <button type="button" className="turn-diff-toggle" onClick={() => setWhyOpen((open) => !open)}>

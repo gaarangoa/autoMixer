@@ -9,3 +9,9 @@ src-tauri/gen/
 .env.local
 benchmark/
 STATUS.md
+
+# Generated sidecar staging for bundling
+src-tauri/resources/
+# Audio sidecar runtime scratch
+audio-service/demix/
+audio-service/spec/

@@ -118,6 +118,25 @@ export const api = {
     listen("llm:turn-start", () => cb()),
   onLlmTurnEnd: (cb: () => void): Promise<UnlistenFn> =>
     listen("llm:turn-end", () => cb()),
+  // Read / set the embedded Hermes agent's orchestration model (any
+  // OpenAI-compatible endpoint). Setting it restarts the agent sidecar.
+  getHermesModel: () => tauriInvoke<{ baseUrl: string; model: string; provider: string }>("get_hermes_model"),
+  setHermesModel: (baseUrl: string, model: string) => tauriInvoke<void>("set_hermes_model", { baseUrl, model }),
+  // Forget the agent's conversation for a session so the next turn starts fresh.
+  clearChat: (sessionId: string) => tauriInvoke<void>("clear_chat", { sessionId }),
+  // Read / set the video-edit skill's vision-model endpoint (e.g. Qwen3-VL on the Spark).
+  getVideoModel: () => tauriInvoke<{ baseUrl: string; model: string }>("get_video_model"),
+  setVideoModel: (baseUrl: string, model: string) => tauriInvoke<void>("set_video_model", { baseUrl, model }),
+  // Push the user's track selection so the video skill edits only selected tracks.
+  setVideoSelection: (sessionId: string, trackIds: string[]) => tauriInvoke<void>("set_video_selection", { sessionId, trackIds }),
+  getVideoSelection: (sessionId: string) => tauriInvoke<string[]>("get_video_selection", { sessionId }),
+  // Fired when an external agent (the Hermes control surface) mutates a session
+  // out from under the UI, so the frontend can refresh its project state.
+  onSessionExternallyUpdated: (cb: (event: { sessionId: string; project: MixProject }) => void): Promise<UnlistenFn> =>
+    listen<{ sessionId: string; project: MixProject }>("session:externally-updated", e => cb(e.payload)),
+  // Fired by the control surface when an agent video edit finishes rendering.
+  onVideoRendered: (cb: (event: { sessionId: string; path: string; cuts: number; lookPreset?: string }) => void): Promise<UnlistenFn> =>
+    listen<{ sessionId: string; path: string; cuts: number; lookPreset?: string }>("video:rendered", e => cb(e.payload)),
   onPlayhead: (cb: (event: PlayheadEvent) => void): Promise<UnlistenFn> =>
     listen<PlayheadEvent>("engine:playhead", e => cb(e.payload)),
   onMeters: (cb: (event: MetersEvent) => void): Promise<UnlistenFn> =>

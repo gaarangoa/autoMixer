@@ -215,14 +215,7 @@ fn log_path() -> Option<PathBuf> {
 }
 
 fn service_dir() -> Option<PathBuf> {
-    // CARGO_MANIFEST_DIR points at .../autoMixer/src-tauri at compile time —
-    // the sidecar lives next to it at .../autoMixer/audio-service.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidate = manifest.parent().map(|p| p.join("audio-service"));
-    if let Some(path) = candidate {
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
+    // Shares the runtime resolution + first-run staging with the Hermes sidecar so
+    // a packaged build (read-only Resources) can still build and run the env.
+    crate::hermes_service::runnable_dir("audio-service")
 }

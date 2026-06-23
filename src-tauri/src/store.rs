@@ -250,6 +250,105 @@ impl SessionStore {
         Ok(project)
     }
 
+    /// Add — or, if one already exists, replace in place — the single canonical
+    /// "Agent video edit" output track. Every agent `edit_video` call used to push a
+    /// brand-new track, so re-running stacked identical copies; this upserts instead.
+    /// Existing agent-edit tracks are detected by name (the canonical name or the
+    /// legacy "Agent Edit N" the manual button produced); the first is reused and any
+    /// extras are removed so the session converges to exactly one agent-edit lane.
+    pub fn upsert_agent_video_track(
+        &self,
+        session_id: &str,
+        video_path: &Path,
+        start_sample: u64,
+        duration_ms: u64,
+    ) -> Result<MixProject, String> {
+        const AGENT_EDIT_NAME: &str = "Agent video edit";
+        let is_agent_edit = |t: &crate::model::Track| {
+            t.kind == TrackKind::Video
+                && (t.name == AGENT_EDIT_NAME || t.name.starts_with("Agent Edit"))
+        };
+
+        let mut project = self.get_project(session_id)?;
+        let sample_rate = project.session.sample_rate;
+        let agent_indices: Vec<usize> = project
+            .session
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| is_agent_edit(t))
+            .map(|(i, _)| i)
+            .collect();
+
+        let Some(&keep) = agent_indices.first() else {
+            // No agent-edit track yet — create the canonical one.
+            return self.add_rendered_video_track(
+                session_id,
+                video_path,
+                AGENT_EDIT_NAME.to_string(),
+                start_sample,
+                duration_ms,
+            );
+        };
+
+        // Stage the new render into the videos dir.
+        let source_id = Uuid::new_v4().to_string();
+        let extension = video_path.extension().and_then(|item| item.to_str()).unwrap_or("mp4");
+        let destination = self.videos_dir().join(format!("{source_id}.{extension}"));
+        fs::copy(video_path, &destination)
+            .map_err(|error| format!("Could not store rendered video: {error}"))?;
+        let original_name = video_path
+            .file_name()
+            .and_then(|item| item.to_str())
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| AGENT_EDIT_NAME.to_string());
+        let duration_samples = ((duration_ms as f64 / 1000.0) * sample_rate as f64).round() as u64;
+
+        // Drop the duplicate agent-edit tracks (everything after the first). Remove
+        // from the end so the lower `keep` index stays valid.
+        for &idx in agent_indices.iter().skip(1).rev() {
+            project.session.tracks.remove(idx);
+        }
+
+        let track = &mut project.session.tracks[keep];
+        track.name = AGENT_EDIT_NAME.to_string();
+        // Converge to a single full-frame clip pointing at the fresh render.
+        track.video_clips.truncate(1);
+        if let Some(clip) = track.video_clips.first_mut() {
+            clip.video_source_file_id = source_id.clone();
+            clip.source_offset_ms = 0;
+            clip.start_sample = start_sample;
+            clip.end_sample = start_sample + duration_samples.max(1);
+            clip.name = Some(AGENT_EDIT_NAME.to_string());
+            clip.layout = Some(VideoLayout::default());
+            clip.pristine_video_source_file_id = None;
+            clip.pristine_source_offset_ms = None;
+            clip.pristine_duration_samples = None;
+        } else {
+            track.video_clips.push(VideoClipRegion {
+                id: Uuid::new_v4().to_string(),
+                video_source_file_id: source_id.clone(),
+                name: Some(AGENT_EDIT_NAME.to_string()),
+                start_sample,
+                end_sample: start_sample + duration_samples.max(1),
+                source_offset_ms: 0,
+                layout: Some(VideoLayout::default()),
+                pristine_video_source_file_id: None,
+                pristine_source_offset_ms: None,
+                pristine_duration_samples: None,
+            });
+        }
+        project.session.video_source_files.push(VideoSourceFile {
+            id: source_id,
+            original_name,
+            path: destination.to_string_lossy().to_string(),
+            mime_type: "video/mp4".into(),
+            duration_ms,
+        });
+        self.save(&project)?;
+        Ok(project)
+    }
+
     /// Restore a video clip to its original (un-graded) recording by swapping its
     /// source-id, offset and duration back to the pristine snapshot saved on the
     /// first effects render. No-op if no pristine snapshot exists — meaning the
