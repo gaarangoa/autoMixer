@@ -68,6 +68,21 @@ pub fn get_selection(session_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// True while a background video edit is rendering. Guards against launching a second
+/// concurrent edit (they'd fight over the single model slot and the agent-edit track).
+static VIDEO_EDIT_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RAII guard that releases VIDEO_EDIT_RUNNING on drop — including if the render task
+/// PANICS or is dropped mid-flight. Without this, a panic would leave the flag stuck
+/// true forever and every future edit would 409 ("already rendering") with nothing
+/// actually running — which looks like the agent is permanently stuck.
+struct EditRunningGuard;
+impl Drop for EditRunningGuard {
+    fn drop(&mut self) {
+        VIDEO_EDIT_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone)]
 struct ControlState {
     app: AppHandle,
@@ -265,9 +280,8 @@ struct VideoEditBody {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VideoEditResult {
-    path: String,
-    cuts: usize,
-    look_preset: Option<String>,
+    status: String,
+    message: String,
 }
 
 /// The video-edit skill: run AutoMixer's agent video pipeline (frame analysis via
@@ -338,6 +352,64 @@ async fn post_video_edit(
     let start_sample = body.start_sample.or(region_start);
     let end_sample = body.end_sample.or(region_end);
 
+    // Only one background edit at a time (they'd contend on the single model slot).
+    if VIDEO_EDIT_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A video edit is already rendering. Wait for it to finish (a chat chip appears when it's ready).".into(),
+        ));
+    }
+
+    // Render in a DETACHED background task so it survives the agent's chat turn ending.
+    // (Previously the render was awaited inside the turn, so if the turn was cancelled
+    // or timed out mid-render the whole job was dropped and the UI froze.) The task
+    // emits its own progress + the terminal `video:rendered` event independently.
+    let instructions = body.instructions.clone();
+    let interval_seconds = body.interval_seconds;
+    let task_session = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        // Releases the running-flag on ANY exit (return, error, panic, drop).
+        let _guard = EditRunningGuard;
+        let result = render_video_edit_job(
+            app.clone(),
+            task_session.clone(),
+            start_sample,
+            end_sample,
+            track_ids,
+            interval_seconds,
+            config,
+            instructions,
+        )
+        .await;
+        if let Err(error) = result {
+            // Surface the failure to the UI as a terminal progress event so the
+            // "rendering…" overlay clears instead of hanging.
+            let _ = app.emit(
+                "video:edit-failed",
+                serde_json::json!({ "sessionId": task_session, "error": error }),
+            );
+        }
+    });
+
+    Ok(Json(VideoEditResult {
+        status: "started".into(),
+        message: "Video edit started and is now rendering in the background (the user sees a live progress bar; a result chip appears automatically when done). YOUR TURN IS COMPLETE: reply with ONE short sentence telling the user the edit has started, then STOP. Do NOT think further, do NOT call any more tools, do NOT call get_session to check for the result, do NOT call edit_video again — there is nothing left to do this turn.".into(),
+    }))
+}
+
+/// The actual render, run in a detached background task (see post_video_edit). Renders
+/// the multicam edit, upserts the agent-edit track, and emits `video:rendered`.
+#[allow(clippy::too_many_arguments)]
+async fn render_video_edit_job(
+    app: AppHandle,
+    session_id: String,
+    start_sample: Option<u64>,
+    end_sample: Option<u64>,
+    track_ids: Vec<String>,
+    interval_seconds: Option<f64>,
+    config: crate::config::Config,
+    instructions: Option<String>,
+) -> Result<(), String> {
     let resp = crate::commands::render_agent_video_edit(
         app.clone(),
         app.state::<AppState>(),
@@ -346,19 +418,16 @@ async fn post_video_edit(
         start_sample,
         end_sample,
         track_ids,
-        body.interval_seconds,
+        interval_seconds,
         Some(config.video_base_url),
         Some(config.video_model.clone()),
         Some(config.video_model.clone()),
         Some(config.video_model),
-        body.instructions,
+        instructions,
         Some(false),
     )
-    .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    .await?;
 
-    // Upsert the single canonical agent-edit track at the footage's start position —
-    // replace it in place rather than stacking a new identical copy every run.
     let duration_ms = probe_duration_ms(&resp.path);
     let project = crate::commands::upsert_agent_video_track(
         &app.state::<AppState>(),
@@ -366,11 +435,9 @@ async fn post_video_edit(
         std::path::Path::new(&resp.path),
         start_sample.unwrap_or(0),
         duration_ms,
-    )
-    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    )?;
     emit_updated(&app, &session_id, &project);
 
-    // Tell the UI a render is ready so it can post a chat chip + open the monitor.
     let look = resp.look_preset.as_ref().map(|p| format!("{p:?}"));
     let _ = app.emit(
         "video:rendered",
@@ -381,12 +448,7 @@ async fn post_video_edit(
             "lookPreset": look,
         }),
     );
-
-    Ok(Json(VideoEditResult {
-        path: resp.path,
-        cuts: resp.script.len(),
-        look_preset: look,
-    }))
+    Ok(())
 }
 
 #[derive(Deserialize)]

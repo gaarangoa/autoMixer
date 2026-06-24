@@ -38,6 +38,17 @@ pub enum ChatEvent {
         #[serde(default)]
         kind: String,
     },
+    /// Estimated token usage + context state for the current agent session.
+    Usage {
+        #[serde(rename = "outputTokens", default)]
+        output_tokens: u64,
+        #[serde(rename = "thoughtTokens", default)]
+        thought_tokens: u64,
+        #[serde(rename = "turnsSinceCompaction", default)]
+        turns_since_compaction: u64,
+        #[serde(rename = "compactAfter", default)]
+        compact_after: u64,
+    },
     /// The turn finished.
     Done {
         #[serde(rename = "stopReason", default)]
@@ -122,6 +133,18 @@ impl HermesService {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Pre-spawn the agent's tool server at startup so the first real turn is fast.
+    pub async fn warmup(&self) -> Result<(), String> {
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{}/warmup", self.base_url))
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| format!("hermes-service unreachable at {}: {e}", self.base_url))?;
+        Ok(())
     }
 
     /// Forget the agent's conversation for a session (Clear chat). The next chat turn

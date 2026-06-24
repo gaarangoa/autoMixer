@@ -49,6 +49,12 @@ pub fn run() {
     let audio_service = Arc::new(AudioService::spawn());
     let hermes_service = Arc::new(HermesService::spawn());
 
+    // Captured before `config`/`hermes_service` are moved into manage(), for the
+    // background startup warm-up.
+    let warm_video_base = config.video_base_url.clone();
+    let warm_video_model = config.video_model.clone();
+    let warm_hermes = hermes_service.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         // Remember window size/position across launches.
@@ -96,6 +102,13 @@ pub fn run() {
                 ),
                 Err(error) => eprintln!("[control] failed to start: {error}"),
             }
+            // Warm up the agent tool server + the video model's vision encoder in the
+            // background so the first chat turn / video edit isn't slow. Best-effort.
+            tauri::async_runtime::spawn(commands::warm_up_models(
+                warm_video_base.clone(),
+                warm_video_model.clone(),
+                warm_hermes.clone(),
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

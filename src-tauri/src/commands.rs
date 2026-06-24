@@ -673,6 +673,44 @@ pub async fn clear_chat(state: State<'_, AppState>, session_id: String) -> Resul
     state.hermes_service.reset_session(&session_id).await
 }
 
+/// Warm up the models at app startup so the first agent turn / video edit is fast:
+/// pre-spawn the agent's tool server, and prime the video model's vision encoder with a
+/// tiny throwaway frame (the "first window is slow" cost). All best-effort — failures
+/// (model not up yet, text-only endpoint) are ignored.
+pub async fn warm_up_models(
+    video_base: String,
+    video_model: String,
+    hermes: std::sync::Arc<crate::hermes_service::HermesService>,
+) {
+    // Give the sidecar + model server a moment to come up.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    if hermes.wait_ready(std::time::Duration::from_secs(20)).await {
+        let _ = hermes.warmup().await;
+    }
+    let base = video_base.trim_end_matches('/').to_string();
+    if !base.is_empty() && !video_model.trim().is_empty() {
+        if let Ok(frame) = warmup_frame_b64() {
+            let _ = call_ollama_chat(&base, &video_model, "Reply with the single word: ok.".to_string(), Some(vec![frame])).await;
+        }
+    }
+}
+
+/// A tiny 64×64 JPEG to prime the vision encoder. Returns base64 (no data URL prefix).
+fn warmup_frame_b64() -> Result<String, String> {
+    let path = std::env::temp_dir().join(format!("automixer-warmup-{}.jpg", uuid::Uuid::new_v4()));
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=64x64", "-frames:v", "1"])
+        .arg(&path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("ffmpeg warmup frame failed".into());
+    }
+    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(&path);
+    Ok(BASE64_STANDARD.encode(bytes))
+}
+
 /// Point the Hermes agent at any OpenAI-compatible endpoint. We use the bare
 /// `custom` provider (which needs no registry entry, unlike `custom:<name>`),
 /// write the base URL + model, then restart the sidecar so `hermes acp` reloads
@@ -980,6 +1018,16 @@ pub async fn assistant_request(
                         format!("{name} [{status}]\n")
                     };
                     let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "tool", "text": label }));
+                }
+                ChatEvent::Usage { output_tokens, thought_tokens, turns_since_compaction, compact_after } => {
+                    // Estimated token usage + how full the conversation is before the
+                    // next auto-compaction (which resets the context).
+                    let _ = app_cb.emit("agent:usage", serde_json::json!({
+                        "outputTokens": output_tokens,
+                        "thoughtTokens": thought_tokens,
+                        "turnsSinceCompaction": turns_since_compaction,
+                        "compactAfter": compact_after,
+                    }));
                 }
                 ChatEvent::Done { .. } => {}
                 ChatEvent::Error { message } => {
@@ -3732,6 +3780,10 @@ async fn build_agent_edit_segments(
     // can't see images), stop calling it for the rest of the edit and fall back to
     // deterministic multicam cuts — otherwise every window would eat the full timeout.
     let mut vision_off = false;
+    // Rolling editorial history — a compact log of the shots already taken and what was
+    // in them — fed into each window's decision so the agent cuts based on how the
+    // sequence is EVOLVING (coverage, development, rhythm), not on an isolated frame.
+    let mut edit_history: Vec<String> = Vec::new();
     while cursor < range_end {
         if assistant::agent_cancelled() {
             return Err(assistant::CANCELLED_MESSAGE.into());
@@ -3780,10 +3832,33 @@ async fn build_agent_edit_segments(
         let mut labels = Vec::new();
         let mut images = Vec::new();
         let mut candidates = Vec::new();
+        // Extract every camera's frame for this window CONCURRENTLY. The model server
+        // runs one request at a time (`--parallel 1`), but ffmpeg extractions are
+        // independent CPU work, so doing them in parallel removes the per-camera stall
+        // (2+ cameras went from ~1s sequential to ~0.5s).
+        let frame_paths: Vec<std::path::PathBuf> = active
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| temp_dir.join(format!("shot-{}-{slot}.jpg", segments.len())))
+            .collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = active
+                .iter()
+                .enumerate()
+                .map(|(slot, (_, clip))| {
+                    let frame_path = frame_paths[slot].clone();
+                    let sample = sample.clamp(clip.start_sample, clip.end_sample.saturating_sub(1));
+                    scope.spawn(move || extract_video_frame(clip, sample, session, &frame_path))
+                })
+                .collect();
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
         for (slot, (input_index, clip)) in active.iter().enumerate() {
             let sample = sample.clamp(clip.start_sample, clip.end_sample.saturating_sub(1));
-            let frame_path = temp_dir.join(format!("shot-{}-{slot}.jpg", segments.len()));
-            if extract_video_frame(clip, sample, session, &frame_path).is_ok() {
+            let frame_path = frame_paths[slot].clone();
+            if frame_path.exists() {
                 if let Ok(bytes) = fs::read(&frame_path) {
                     images.push(BASE64_STANDARD.encode(bytes));
                     labels.push((
@@ -3853,6 +3928,11 @@ async fn build_agent_edit_segments(
             .map(|index| index + 1);
         // Merged describe+decide call: one HTTP roundtrip per window instead of two.
         // We still skip the LLM entirely when there's only one readable angle.
+        let history_text = if edit_history.is_empty() {
+            "Nothing yet — this is the opening shot of the edit.".to_string()
+        } else {
+            edit_history.join("\n")
+        };
         let merged = if image_count >= 2 && !vision_off {
             match analyze_and_decide_window(
                 base_url,
@@ -3863,6 +3943,8 @@ async fn build_agent_edit_segments(
                 previous_label,
                 consecutive_same,
                 instructions,
+                &history_text,
+                first_color_grade.is_none() && look_votes.is_empty(),
             )
             .await
             {
@@ -3977,7 +4059,11 @@ async fn build_agent_edit_segments(
         }
         let mut variety_override = false;
         let mut coverage_override = false;
-        if labels.len() > 1 {
+        // Full freedom for the agent: when the vision model made a decision, honor it —
+        // no forced variety/coverage cuts. The deterministic rules below only kick in as
+        // a FALLBACK when there's no model decision (vision unavailable), otherwise a
+        // single camera would play for the whole edit.
+        if model_choice.is_none() && labels.len() > 1 {
             if let Some(previous) = previous_input_index {
                 let chosen_input_index = labels[chosen_label_index].0;
                 if chosen_input_index == previous && consecutive_same >= MAX_DYNAMIC_HOLD_WINDOWS {
@@ -4007,7 +4093,7 @@ async fn build_agent_edit_segments(
                 }
             }
         }
-        if !variety_override && labels.len() > 1 && window_index >= MIN_WINDOWS_BEFORE_COVERAGE_CUT {
+        if model_choice.is_none() && !variety_override && labels.len() > 1 && window_index >= MIN_WINDOWS_BEFORE_COVERAGE_CUT {
             let chosen_input_index = labels[chosen_label_index].0;
             let chosen_usage = usage_counts.get(&chosen_input_index).copied().unwrap_or(0);
             let alternate = labels
@@ -4095,6 +4181,21 @@ async fn build_agent_edit_segments(
                 .and_then(|candidate| candidate.note.as_deref())
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
+            // Append to the rolling editorial history (kept short) so later windows see
+            // what's already on screen and how the sequence is developing.
+            let history_what = selected_note
+                .or_else(|| candidates.iter().find(|c| c.image_number == chosen_image_number).and_then(|c| c.angle_label.as_deref()))
+                .unwrap_or("shot");
+            edit_history.push(format!(
+                "t={:.0}s {} cam{}: {}",
+                segment_start as f64 / sample_rate as f64,
+                model_decision,
+                input_index + 1,
+                history_what,
+            ));
+            if edit_history.len() > 6 {
+                edit_history.remove(0);
+            }
             let continuity_plan = model_choice
                 .as_ref()
                 .and_then(|choice| choice.continuity_plan.as_deref())
@@ -4243,8 +4344,10 @@ fn extract_video_frame(clip: &VideoRenderClip, sample: u64, session: &MixSession
     let crop_h = (1.0 - ((layout.crop_top + layout.crop_bottom).min(90.0) / 100.0)).max(0.05);
     let crop_x = (layout.crop_left / 100.0).clamp(0.0, 0.9);
     let crop_y = (layout.crop_top / 100.0).clamp(0.0, 0.9);
+    // 384px (down from 512) is plenty for the model to judge framing/action and cuts
+    // the per-frame vision-encoding cost noticeably.
     let filter = format!(
-        "crop=iw*{crop_w:.5}:ih*{crop_h:.5}:iw*{crop_x:.5}:ih*{crop_y:.5},scale=512:512:force_original_aspect_ratio=decrease"
+        "crop=iw*{crop_w:.5}:ih*{crop_h:.5}:iw*{crop_x:.5}:ih*{crop_y:.5},scale=384:384:force_original_aspect_ratio=decrease"
     );
     let output = Command::new("ffmpeg")
         .arg("-y")
@@ -4403,6 +4506,11 @@ async fn analyze_and_decide_window(
     previous_label: Option<usize>,
     consecutive_same: u32,
     instructions: Option<&str>,
+    edit_history: &str,
+    // Only the FIRST window needs the full color-grade/effects design (we adopt the
+    // grade once for the whole edit). Later windows return a minimal shot decision —
+    // ~80 output tokens instead of ~400 — which is the dominant per-window cost.
+    request_grade: bool,
 ) -> Result<AgentMergedChoice, String> {
     let label_text = labels
         .iter()
@@ -4412,39 +4520,43 @@ async fn analyze_and_decide_window(
         .join("\n");
     let continuity_note = previous_label
         .map(|label| format!(
-            "Previous chosen image number was {label}, held for {consecutive_same} consecutive edit window(s). You may HOLD it if alternatives don't justify a cut, but after 3+ held windows actively prefer a readable alternate for dynamics."
+            "Previous chosen image number was {label}, held for {consecutive_same} consecutive edit window(s). You have full creative freedom: HOLD it as long as it serves the edit, and CUT only when another angle genuinely improves the sequence. There is no required cutting cadence and no coverage quota — follow the user's direction (e.g. \"keep camera X as the main shot, only complement with the others\") over any urge to add variety."
         ))
         .unwrap_or_else(|| "No previous shot has been chosen yet.".to_string());
     let instruction_note = instructions
         .map(|value| format!("User edit instructions (treat as creative guidelines unless they force a black/unusable shot):\n{value}\n"))
         .unwrap_or_else(|| "User edit instructions: none.\n".to_string());
     let audio_text = audio_features_text(audio_features);
+    let history_note = format!(
+        "EDIT SO FAR (oldest to newest — the shots already on screen and what was in them):\n{edit_history}\n\
+         Cut like an editor shaping a SEQUENCE, not someone rating one frame in isolation. Base this shot on how the performance/action is EVOLVING across the edit: develop what is becoming interesting, follow the energy, introduce a fresh angle when the moment shifts, keep balanced coverage over time (don't keep returning to the same angle or repeat the recent rhythm), and let cuts breathe with the music. The goal is a coherent arc, not a string of locally-best frames.\n"
+    );
+    // The full color-grade/effects spec is large; only ask for it on the first window
+    // (we adopt the grade once for the whole edit). Every other window returns a small
+    // shot decision, which is far faster to generate.
+    let grade_block = if request_grade {
+        "Also design a color grade for the WHOLE edit that fits the user's instructions. Use a named `look_preset` and/or a custom `color_grade` (numeric, clamped server-side): brightness(-0.5..0.5), contrast(0.4..2), saturation(0..2.5), gamma(0.5..1.8), rgbMix{rr,gg,bb each 0.4..1.6}, hueShift(-180..180), vignette(0..1), blur(0..8), sharpen(0..2), grain(0..30). Presets: none,warm,cool,mono,punch,dream,cinema,noir,moody,vintage,golden,cold (cinematic/epic->cinema; teal-and-orange->cinema rr>1 bb<1; warm->warm/golden; cool->cool; b&w->mono; punchy->punch; dreamy->dream). Also pick `video_effects` (fadeInSeconds 0..10, fadeOutSeconds 0..10, speedFactor 0.25..4) only if the user asked. If no look direction, use look_preset \"none\".\n"
+    } else {
+        ""
+    };
+    let json_shape = if request_grade {
+        "{{\"window_summary\": \"one sentence\", \"candidate_labels\": [\"label1\", \"label2\"], \"candidate_notes\": [\"note1\", \"note2\"], \"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"...\", \"reason\": \"one sentence\", \"continuity_plan\": \"...\", \"look_preset\": \"cinema\", \"color_grade\": {{\"name\": \"epic cinema\", \"reason\": \"...\", \"contrast\": 1.12, \"saturation\": 1.05, \"rgbMix\": {{\"rr\": 1.10, \"bb\": 0.85}}, \"vignette\": 0.25, \"sharpen\": 0.4}}, \"video_effects\": {{\"fadeInSeconds\": 1.0}}}}"
+    } else {
+        // Minimal per-window response — no grade/effects (already set for the edit).
+        "{{\"candidate_labels\": [\"label1\", \"label2\"], \"candidate_notes\": [\"note1\", \"note2\"], \"decision\": \"hold|cut\", \"choice\": 1, \"reason\": \"one short sentence\"}}"
+    };
     let prompt = format!(
-        "You are a multicam editor. Look at each simultaneous camera frame and pick the strongest one for this edit window, in one pass.\n\
+        "You are a multicam editor cutting a continuous sequence. Look at each simultaneous camera frame and decide the strongest shot for THIS window given everything that has come before.\n\
          {instruction_note}\
          Images are in this order:\n{label_text}\n\
+         For each image, derive a short angle label (e.g. \"wide room\", \"guitar hands\", \"fretboard close-up\", \"face/profile\", \"dark/weak\") and a concise 6-12 word visual note (framing, hands, instrument, motion, focus, exposure).\n\
+         Then pick the best image. CUT only when the new shot creates a coherent edit (different angle, better detail, face/reaction, clearer action, pacing change). HOLD when changing would feel arbitrary. Use audio for pacing: loud sections justify cuts; quiet sections favor holds.\n\
+         {grade_block}\
+         --- CONTEXT FOR THIS WINDOW ---\n\
          Audio features: {audio_text}\n\
          {continuity_note}\n\
-         For each image, derive a short angle label (e.g. \"wide room\", \"overhead/top-down\", \"face/profile\", \"guitar hands\", \"fretboard close-up\", \"keyboard hands\", \"drums\", \"dark/weak\", \"blocked/unclear\") and a concrete 8-14 word visual note using framing, face/eyes, hands, instrument, gesture, motion, focus, exposure, occlusion, and uniqueness. Never write the literal phrase \"concrete note\".\n\
-         Then pick the best image. CUT only when the new shot creates a coherent edit: meaningfully different angle, better detail, face/reaction, clearer action, sensible pacing change. HOLD when changing would feel arbitrary. Use audio to support pacing: loud/high-transient sections can justify cuts; quiet sections favor holds unless the alternate is clearly better.\n\
-         Also design a color grade that fits the user's instructions for the whole edit. Choose either a named preset (`look_preset`) and/or a custom `color_grade` with numeric parameters. Use the custom grade when the user asks for something specific (\"epic cinematic teal-and-orange\", \"sunny warm summer\", \"dreamy faded film\", etc.). Be expressive — sum the parameters into a real grade, don't default to neutral.\n\
-         Named presets you may use: none, warm, cool, mono, punch, dream, cinema, noir, moody, vintage, golden, cold. Map: cinematic/epic/film->cinema; teal-and-orange/blockbuster->cinema with custom rgbMix (rr>1, bb<1); warm/sunset->warm or golden; cool/teal->cool; b&w->mono; punchy->punch; dreamy->dream; dark/serious->moody; retro->vintage; icy->cold; noir->noir.\n\
-         Custom grade fields (ALL optional, ALL numeric, ranges clamped server-side):\n\
-         - brightness: -0.5..0.5 (0 = unchanged)\n\
-         - contrast: 0.4..2.0 (1 = unchanged)\n\
-         - saturation: 0..2.5 (1 = unchanged, 0 = grayscale)\n\
-         - gamma: 0.5..1.8 (1 = unchanged)\n\
-         - rgbMix: {{rr, gg, bb}} each 0.4..1.6 (1 = unchanged). For teal+orange: rr~1.1, gg~0.95, bb~0.85. For cool: rr~0.9, bb~1.15.\n\
-         - hueShift: -180..180 degrees (0 = unchanged)\n\
-         - vignette: 0..1 (subtle darkening at edges)\n\
-         - blur: 0..8 (sigma; >0.5 visibly softens)\n\
-         - sharpen: 0..2 (0.5 = mild, 1.5 = strong)\n\
-         - grain: 0..30 (subtle film grain)\n\
-         If the user gave no look direction, use \"look_preset\": \"none\" and omit color_grade.\n\
-         For the color_grade.reason field, write 1-2 sentences mapping the user's exact words to the parameters you picked: e.g., \"You asked for epic/cinematic so I lifted contrast to 1.12 and warmed the highlights via rgbMix rr=1.10. The 'brighter, clearer' note pushed brightness +0.05 and sharpen 0.6.\" Be concrete about which word drove which knob.\n\
-         Also pick `video_effects` for the WHOLE edit (fade in/out, speed). Fields are optional; emit only what the user asked for: fadeInSeconds (0..10), fadeOutSeconds (0..10), speedFactor (0.25..4, 1=normal). If the user said \"fade in 2 seconds\", set fadeInSeconds=2. If \"slow-mo\", set speedFactor=0.5. If \"speed it up 2x\", set speedFactor=2. Include video_effects.reason explaining which user word drove each.\n\
-         Reply only as JSON with this exact shape:\n\
-         {{\"window_summary\": \"one sentence summarizing the available visual choices\", \"candidate_labels\": [\"label1\", \"label2\"], \"candidate_notes\": [\"Image 1 note\", \"Image 2 note\"], \"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"hold continuity | wide context | hands detail | face/reaction | motion accent | pacing variation\", \"reason\": \"one specific sentence using visual + audio evidence\", \"continuity_plan\": \"how this supports the surrounding edit\", \"look_preset\": \"none|warm|cool|mono|punch|dream|cinema|noir|moody|vintage|golden|cold\", \"color_grade\": {{\"name\": \"epic cinema\", \"reason\": \"1-2 sentences mapping the user's words to these knobs\", \"brightness\": 0.0, \"contrast\": 1.12, \"saturation\": 1.05, \"gamma\": 1.0, \"rgbMix\": {{\"rr\": 1.10, \"gg\": 0.96, \"bb\": 0.85}}, \"hueShift\": 0, \"vignette\": 0.25, \"blur\": 0, \"sharpen\": 0.4, \"grain\": 2}}, \"video_effects\": {{\"reason\": \"why these effects\", \"fadeInSeconds\": 1.0, \"fadeOutSeconds\": 1.5, \"speedFactor\": 1.0}}}}"
+         {history_note}\n\
+         Reply ONLY as compact JSON (no prose) with this exact shape:\n{json_shape}"
     );
     let parsed = call_ollama_chat(base_url, model, prompt, Some(images)).await?;
     let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
@@ -4491,6 +4603,12 @@ async fn call_ollama_chat(
     if assistant::agent_cancelled() {
         return Err(assistant::CANCELLED_MESSAGE.into());
     }
+    // These are all vision/decision calls that want a fast JSON answer, NOT chain-of-
+    // thought. Reasoning models (qwen3.x) take ~100s/window with thinking on vs <2s off.
+    // The `/no_think` prefix is honored by the qwen chat template regardless of which
+    // HTTP path (native Ollama vs OpenAI-compat) or server processes it — more robust
+    // than the `chat_template_kwargs` body flag, which some endpoints silently drop.
+    let prompt = format!("/no_think\n{prompt}");
     match assistant::detect_provider(base_url).await? {
         assistant::LlmProvider::Ollama => call_ollama_chat_native(base_url, model, prompt, images).await,
         assistant::LlmProvider::OpenAiCompat => call_openai_chat(base_url, model, prompt, images).await,
@@ -4552,6 +4670,11 @@ async fn call_openai_chat(
         "model": model,
         "stream": false,
         "messages": [{ "role": "user", "content": content }],
+        // Disable the model's chain-of-thought for these vision calls. We need a fast
+        // JSON decision, not reasoning — with thinking ON, a single window decision on
+        // qwen3.6 takes ~105s/4500 tokens; with it OFF, ~0.3s. The field is honored by
+        // llama.cpp / vLLM qwen chat templates and ignored by servers that don't use it.
+        "chat_template_kwargs": { "enable_thinking": false },
     });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))

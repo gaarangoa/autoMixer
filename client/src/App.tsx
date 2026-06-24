@@ -226,6 +226,9 @@ export function App() {
   const [profilePresets, setProfilePresets] = useState<ProfilePreset[]>([]);
   const [reasoning, setReasoning] = useState<{ phase: string; text: string; tokens: { prompt: number; response: number; elapsedMs: number } | null }[]>([]);
   const [streamingTurn, setStreamingTurn] = useState<{ phase: string; text: string } | null>(null);
+  // Estimated agent token usage + how full the conversation is before the next
+  // auto-compaction (turnsSinceCompaction / compactAfter). Resets on compaction.
+  const [agentUsage, setAgentUsage] = useState<{ output: number; thought: number; turns: number; compactAfter: number } | null>(null);
   const [mode, setMode] = useState<"interactive" | "auto" | "video">("interactive");
   const [autoMixStages, setAutoMixStages] = useState<{ stageId: string; displayName: string; status: string; actionCount: number; warnings: string[]; error?: string; tokens: number; elapsedMs: number; explanation?: string }[]>([]);
   const [autoMixRunning, setAutoMixRunning] = useState(false);
@@ -477,7 +480,16 @@ export function App() {
         setTimeout(() => setAgentEditProgress(null), 6000);
       }
     }).then((fn) => { if (cancelled) fn(); else unlisten = fn; });
-    return () => { cancelled = true; unlisten?.(); };
+    // Tick the displayed elapsed every second so the timer keeps moving between the
+    // per-window backend events (and during the final encode, which emits none).
+    const tick = setInterval(() => {
+      setAgentEditProgress((current) =>
+        current && current.stage !== "done" && current.stage !== "error"
+          ? { ...current, elapsedSeconds: current.elapsedSeconds + 1 }
+          : current,
+      );
+    }, 1000);
+    return () => { cancelled = true; unlisten?.(); clearInterval(tick); };
   }, []);
 
   useEffect(() => {
@@ -514,6 +526,18 @@ export function App() {
     reg(api.onVideoRendered((event) => {
       setMessages((items) => [...items, { role: "video", path: event.path, cuts: event.cuts, lookPreset: event.lookPreset }]);
     }));
+    // Spacebar pressed in a secondary window (mixer / monitor / video editor) — the
+    // main window owns the transport, so toggle play here.
+    reg(listen("transport:toggle", () => { void togglePlayRef.current(); }));
+    // Live token/context usage from the agent (cumulative for the current session).
+    reg(listen<{ outputTokens: number; thoughtTokens: number; turnsSinceCompaction: number; compactAfter: number }>("agent:usage", (event) => {
+      setAgentUsage({
+        output: event.payload.outputTokens,
+        thought: event.payload.thoughtTokens,
+        turns: event.payload.turnsSinceCompaction,
+        compactAfter: event.payload.compactAfter,
+      });
+    }));
     // Clicking a tile in the video monitor selects that track here.
     reg(listen<{ trackId: string }>("video-monitor:select", (event) => {
       setSelectedTrackIds([event.payload.trackId]);
@@ -527,6 +551,12 @@ export function App() {
       setStreamingTurn(null);
     }));
     reg(api.onLlmTurnEnd(() => setStreamingTurn(null)));
+    // The background video-edit job failed — clear the "rendering…" overlay and tell
+    // the user (the job runs independently of the chat turn, so this is its closure).
+    reg(listen<{ sessionId: string; error: string }>("video:edit-failed", (event) => {
+      setAgentEditProgress(null);
+      pushSystem(`Video edit failed: ${event.payload.error}`);
+    }));
     reg(api.onLlmChunk((event) => {
       setReasoning((current) => {
         const last = current[current.length - 1];
@@ -2263,6 +2293,7 @@ export function App() {
     setMessages([]);
     setReasoning([]);
     setStreamingTurn(null);
+    setAgentUsage(null);
     pushToast("info", "Chat cleared — the agent starts fresh.");
   }
 
@@ -4017,6 +4048,14 @@ export function App() {
             <span>Assistant</span>
           </div>
           <div className="assistant-head-actions">
+            {agentUsage ? (
+              <span
+                className="agent-ctx-badge"
+                title={`This conversation: ~${(agentUsage.output + agentUsage.thought).toLocaleString()} tokens generated (${agentUsage.output.toLocaleString()} reply + ${agentUsage.thought.toLocaleString()} reasoning). Context is ${agentUsage.turns}/${agentUsage.compactAfter} turns full — it auto-compacts (resets) at ${agentUsage.compactAfter}.`}
+              >
+                {agentUsage.turns}/{agentUsage.compactAfter} ctx · {(agentUsage.output + agentUsage.thought).toLocaleString()} tok
+              </span>
+            ) : null}
             {busy || autoMixRunning ? (
               <button
                 className="chat-stop"
@@ -4332,7 +4371,11 @@ export function App() {
                   <div className="activity-head">
                     <span className="activity-dot" />
                     <span>{autoMixRunning ? "Auto-mixing…" : agentEditProgress ? "Editing video…" : "Working…"}</span>
-                    {liveTokens.prompt > 0 || liveTokens.response > 0 ? (
+                    {agentUsage ? (
+                      <span className="activity-tokens" title="Estimated tokens generated this session (reply · reasoning).">
+                        {agentUsage.output.toLocaleString()} out · {agentUsage.thought.toLocaleString()} reasoning
+                      </span>
+                    ) : liveTokens.prompt > 0 || liveTokens.response > 0 ? (
                       <span className="activity-tokens">{liveTokens.prompt.toLocaleString()} → {liveTokens.response.toLocaleString()} tok</span>
                     ) : null}
                   </div>
@@ -4366,15 +4409,34 @@ export function App() {
                     </div>
                   ) : null}
 
-                  {agentEditProgress ? (
-                    <div className="activity-video">
-                      Rendering video · {agentEditProgress.message || agentEditProgress.stage}
-                      {agentEditProgress.total ? ` (${agentEditProgress.current}/${agentEditProgress.total})` : ""}
-                    </div>
-                  ) : null}
                 </div>
               ) : null}
             </div>
+            {/* Standalone video-render progress — shows while the background edit runs,
+                independent of the chat turn (which ends immediately now). */}
+            {agentEditProgress && agentEditProgress.stage !== "done" && agentEditProgress.stage !== "error" ? (
+              <div className={`video-render-progress stage-${agentEditProgress.stage}`}>
+                <div className="vrp-head">
+                  <span className="vrp-spinner" />
+                  <span className="vrp-title">Rendering video edit</span>
+                  <span className="vrp-meta">
+                    {agentEditProgress.total > 1 ? `window ${agentEditProgress.current}/${agentEditProgress.total} · ` : ""}
+                    {Math.round(agentEditProgress.elapsedSeconds)}s
+                  </span>
+                </div>
+                <div className="vrp-bar">
+                  <div
+                    className="vrp-fill"
+                    style={{
+                      width: agentEditProgress.total > 1
+                        ? `${Math.min(100, (agentEditProgress.current / agentEditProgress.total) * 100)}%`
+                        : "20%",
+                    }}
+                  />
+                </div>
+                <div className="vrp-msg">{agentEditProgress.message || agentEditProgress.stage}</div>
+              </div>
+            ) : null}
             <div className="chat-selected">
               {selectedTrackIds.length === 0 ? (
                 <>Scope: <strong>all tracks</strong> (click a track to narrow and arm recording)</>
@@ -4386,6 +4448,23 @@ export function App() {
               <div className="chat-scope">
                 <span>scope: <strong>{scopedSection.label}</strong> {formatTime(scopedSection.start)}–{formatTime(scopedSection.end)}</span>
                 <button type="button" onClick={() => setScopedSection(null)}>×</button>
+              </div>
+            ) : null}
+            {agentUsage ? (
+              <div className="chat-usage" title="Context fills as the conversation grows, then auto-compacts (resets) to keep it light. Tokens are an estimate of what the agent generated this session (reply + reasoning).">
+                <div className="chat-usage-row">
+                  <span className="chat-usage-label">context</span>
+                  <div className="chat-usage-bar">
+                    <div
+                      className="chat-usage-fill"
+                      style={{ width: `${Math.min(100, (agentUsage.turns / Math.max(1, agentUsage.compactAfter)) * 100)}%` }}
+                    />
+                  </div>
+                  <span className="chat-usage-meta">{agentUsage.turns}/{agentUsage.compactAfter} turns</span>
+                </div>
+                <div className="chat-usage-tokens">
+                  ~{(agentUsage.output + agentUsage.thought).toLocaleString()} tok generated · {agentUsage.output.toLocaleString()} reply · {agentUsage.thought.toLocaleString()} reasoning
+                </div>
               </div>
             ) : null}
             <form
@@ -5128,9 +5207,27 @@ function readMixerPayloadFromUrl(): MixerWindowPayload | undefined {
 
 /** Floating video monitor window — plays the latest agent render. Receives the
  *  path via the URL on first open and via `video-monitor:load` events after. */
+/** Secondary windows (mixer / monitor / video editor) don't own the transport, so a
+ *  Space press there is forwarded to the main window via `transport:toggle`. Ignores
+ *  Space while typing or on a focused control, matching the main window's behavior. */
+function useSpaceToggleTransport() {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== " " || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('input, textarea, select, [contenteditable="true"], button, a, [role="menu"]')) return;
+      event.preventDefault();
+      void emit("transport:toggle").catch(() => undefined);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+}
+
 /** Floating multicam Video Monitor — a synced grid of every video clip in the
  *  session (camera angles + agent renders), driven by the engine transport. */
 export function VideoMonitorApp() {
+  useSpaceToggleTransport();
   const initialSid = new URLSearchParams(window.location.search).get("sessionId") ?? "";
   const [sessionId, setSessionId] = useState(initialSid);
   const [project, setProject] = useState<MixProject>();
@@ -5257,6 +5354,7 @@ export function VideoMonitorApp() {
 }
 
 export function MixerWindowApp() {
+  useSpaceToggleTransport();
   const initialPayloadRef = useRef<MixerWindowPayload | undefined>(readMixerPayloadFromUrl());
   const [project, setProject] = useState<MixProject>();
   const [focusedTrackId, setFocusedTrackId] = useState<string | undefined>();
@@ -5373,6 +5471,7 @@ export function MixerWindowApp() {
 }
 
 export function VideoEditorWindowApp() {
+  useSpaceToggleTransport();
   const initialOllamaUrlRef = useRef(localStorage.getItem("autoMixer.ollamaUrl"));
   const initialOllamaModelRef = useRef(localStorage.getItem("autoMixer.ollamaModel"));
   const initialAgentVideoModelRef = useRef(localStorage.getItem("autoMixer.agentVideoModel"));

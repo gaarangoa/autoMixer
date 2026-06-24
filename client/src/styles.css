@@ -3831,6 +3831,112 @@ button:disabled {
 }
 .activity-tokens { margin-left: auto; }
 
+/* Background video-render progress — shown while the edit renders independently. */
+.video-render-progress {
+  margin: 8px 14px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(125, 184, 255, 0.28);
+  background: rgba(125, 184, 255, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.vrp-head { display: flex; align-items: center; gap: 8px; }
+.vrp-spinner {
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(125, 184, 255, 0.35);
+  border-top-color: var(--accent, #7db8ff);
+  animation: vrp-spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+@keyframes vrp-spin { to { transform: rotate(360deg); } }
+.vrp-title { font-weight: 600; font-size: var(--text-sm, 12px); color: var(--text, #e6edf3); }
+.vrp-meta {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--text-xs, 11px);
+  color: var(--text-dim, #8b96a2);
+}
+.vrp-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.vrp-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #62c98a, #7db8ff);
+  transition: width 0.4s ease;
+}
+.video-render-progress.stage-rendering .vrp-fill,
+.video-render-progress.stage-encoding .vrp-fill {
+  /* The final ffmpeg encode has no per-window count — show an indeterminate sweep. */
+  width: 100% !important;
+  background: linear-gradient(90deg, transparent, #7db8ff, transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: vrp-sweep 1.2s ease-in-out infinite;
+}
+@keyframes vrp-sweep { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
+.vrp-msg {
+  font-size: var(--text-xs, 11px);
+  color: var(--text-dim, #8b96a2);
+  line-height: 1.4;
+}
+
+/* Context / token visualization above the chat input. */
+.chat-usage {
+  padding: 6px 14px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.chat-usage-row { display: flex; align-items: center; gap: 8px; }
+.chat-usage-label {
+  font-size: var(--text-xs, 10.5px);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim, #8b96a2);
+  min-width: 48px;
+}
+.chat-usage-bar {
+  flex: 1 1 auto;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+.chat-usage-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #62c98a, #7db8ff);
+  transition: width 0.3s ease;
+}
+.chat-usage-meta,
+.chat-usage-tokens {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--text-xs, 10.5px);
+  color: var(--text-dim, #8b96a2);
+  white-space: nowrap;
+}
+.chat-usage-tokens { padding-left: 56px; }
+
+/* Always-visible agent session context size in the chat header. */
+.agent-ctx-badge {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--text-xs, 11px);
+  color: var(--text-dim, #8b96a2);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid #29362c;
+  white-space: nowrap;
+  cursor: default;
+}
+
 .turn-warnings {
   margin: 0;
   padding-left: 18px;

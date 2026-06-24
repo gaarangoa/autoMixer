@@ -81,6 +81,20 @@ def _track_summary(project: dict) -> list[dict]:
     return out
 
 
+def _track_summary_compact(project: dict) -> list[dict]:
+    """A lean view (no video clips, no filters) for mutation tools to echo back — full
+    state is one get_session away, so we don't bloat the agent's context on every edit."""
+    out = []
+    for t in project.get("session", {}).get("tracks", []):
+        out.append({
+            "id": t.get("id"),
+            "name": t.get("name"),
+            "gainDb": t.get("gainDb"),
+            "muted": t.get("muted"),
+        })
+    return out
+
+
 @mcp.tool()
 def get_session(session_id: str) -> dict:
     """Return the AutoMixer session's tracks (id, name, role, gain, pan, mute, solo,
@@ -147,7 +161,7 @@ def set_track_gain(session_id: str, track_id: str, gain_db: float) -> dict:
             "explanation": "hermes: set_track_gain",
         },
     )
-    applied = next((t for t in _track_summary(project) if t["id"] == track_id), None)
+    applied = next((t for t in _track_summary_compact(project) if t["id"] == track_id), None)
     return {"ok": True, "track": applied}
 
 
@@ -186,37 +200,42 @@ def apply_actions(session_id: str, actions: list[dict], explanation: str = "") -
         f"/control/session/{session_id}/actions",
         {"actions": actions, "explanation": explanation or "hermes: apply_actions"},
     )
-    return {"ok": True, "tracks": _track_summary(project)}
+    return {"ok": True, "tracks": _track_summary_compact(project)}
 
 
 @mcp.tool()
 def undo(session_id: str) -> dict:
     """Undo the most recent change to the session."""
     project = _request("POST", f"/control/session/{session_id}/undo")
-    return {"ok": True, "tracks": _track_summary(project)}
+    return {"ok": True, "tracks": _track_summary_compact(project)}
 
 
 @mcp.tool()
 def redo(session_id: str) -> dict:
     """Redo the change that was just undone."""
     project = _request("POST", f"/control/session/{session_id}/redo")
-    return {"ok": True, "tracks": _track_summary(project)}
+    return {"ok": True, "tracks": _track_summary_compact(project)}
 
 
 @mcp.tool()
 def edit_video(session_id: str, instructions: str = "", interval_seconds: float = 1.0) -> dict:
-    """Analyze and edit this session's video. The configured video model "sees" the
-    frames; the tool renders a multicam cut + color grade. `instructions` guides the
-    look/pacing (e.g. "cinematic, cut on the beat"). `interval_seconds` sets how often
-    it samples a frame (smaller = more cuts). Returns the output path, number of cuts,
-    and the inferred look preset. Slow (frame analysis + ffmpeg render can take minutes).
+    """Start a multicam video edit. The configured video model "sees" the frames and the
+    tool renders a multicam cut + color grade. `instructions` guides the look/pacing
+    (e.g. "cinematic, cut on the beat"). `interval_seconds` sets how often it samples a
+    frame (smaller = more cuts; 2-3 is a good default — 1 is fine-grained but slower).
+
+    IMPORTANT: this returns IMMEDIATELY with {"status":"started"}. The render runs in the
+    BACKGROUND (it can take a few minutes) and the user sees live progress; a chat chip
+    appears when it's done. So after calling this, tell the user the edit has STARTED and
+    is rendering — do NOT claim it is finished, do NOT call it again to "check", and do
+    NOT call get_session expecting the new track yet. One edit runs at a time; calling
+    again while one is rendering returns a 409 (already running).
 
     Scope: automatically targets the user's SELECTED video tracks (see
-    get_session.selectedTrackIds); it does not edit unselected cameras. Re-running it
-    REPLACES the single "Agent video edit" output in place — it never stacks a new copy
-    — so it's safe to iterate (e.g. bump a clip's saturation, then re-run)."""
+    get_session.selectedTrackIds); it does not edit unselected cameras. It REPLACES the
+    single "Agent video edit" output in place — it never stacks a new copy."""
     body = {"instructions": instructions, "intervalSeconds": interval_seconds}
-    return _request("POST", f"/control/session/{session_id}/video-edit", body, timeout=1800)
+    return _request("POST", f"/control/session/{session_id}/video-edit", body, timeout=60)
 
 
 @mcp.tool()
