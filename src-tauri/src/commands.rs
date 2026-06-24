@@ -1907,6 +1907,87 @@ pub fn export_rendered_video(source_path: String, output_path: String, aspect_ra
     Ok(RenderResponse { path: path.to_string_lossy().to_string() })
 }
 
+/// Compute the output box (even dims) for a target aspect ratio + max long-edge size.
+/// `aspect` is "W:H" (e.g. "16:9", "9:16", "1:1", "4:5") or "original" to keep the
+/// source ratio. `max_dim` is the longer side in pixels (None = keep the source's).
+fn export_target_box(src_w: i32, src_h: i32, aspect: &str, max_dim: Option<u32>) -> (i32, i32) {
+    let (aw, ah): (f64, f64) = if aspect == "original" || aspect.is_empty() {
+        (src_w.max(1) as f64, src_h.max(1) as f64)
+    } else {
+        let mut parts = aspect.split(&[':', 'x', '/'][..]);
+        let a = parts.next().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(16.0);
+        let b = parts.next().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(9.0);
+        (a.max(0.01), b.max(0.01))
+    };
+    let ratio = aw / ah; // width / height
+    // Default long edge: the source's longer side, so "Source" resolution = no upscale.
+    let long = max_dim.map(|m| m as f64).unwrap_or_else(|| src_w.max(src_h) as f64);
+    let (w, h) = if ratio >= 1.0 {
+        (long, long / ratio) // landscape or square
+    } else {
+        (long * ratio, long) // portrait
+    };
+    (even_dimension(w.round() as i32).max(2), even_dimension(h.round() as i32).max(2))
+}
+
+/// Export a rendered video at an arbitrary aspect ratio + resolution.
+/// - `aspect`: "original" | "16:9" | "9:16" | "1:1" | "4:5" | "4:3" | "21:9" ...
+/// - `max_dimension`: longer side in px (None = source size; no upscale on "original").
+/// - `mode`: "fit" letterbox/pad (show everything) or "fill" cover/crop (fill the frame).
+/// Always re-encodes at high quality (slow/CRF 17, AAC 320k).
+#[tauri::command]
+pub fn export_video(
+    source_path: String,
+    output_path: String,
+    aspect: String,
+    max_dimension: Option<u32>,
+    mode: Option<String>,
+) -> Result<RenderResponse, String> {
+    let source = PathBuf::from(&source_path);
+    if !source.exists() {
+        return Err("The video to export is missing. Render an Agent Edit first.".into());
+    }
+    let path = normalize_mp4_path(PathBuf::from(output_path));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let (src_w, src_h) = probe_video_dimensions(&source)?;
+    let (t_w, t_h) = export_target_box(src_w as i32, src_h as i32, &aspect, max_dimension);
+
+    // "fill" scales to cover the box then center-crops; "fit" scales to fit then pads.
+    let fill = mode.as_deref() == Some("fill");
+    let filter = if fill {
+        format!(
+            "scale={t_w}:{t_h}:force_original_aspect_ratio=increase,crop={t_w}:{t_h},setsar=1,format=yuv420p"
+        )
+    } else {
+        format!(
+            "scale={t_w}:{t_h}:force_original_aspect_ratio=decrease,pad={t_w}:{t_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p"
+        )
+    };
+
+    let output = Command::new("ffmpeg")
+        .arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
+        .arg("-i").arg(&source)
+        .arg("-vf").arg(&filter)
+        .arg("-c:v").arg("libx264")
+        .arg("-preset").arg("slow")
+        .arg("-crf").arg("17")
+        .arg("-pix_fmt").arg("yuv420p")
+        .arg("-movflags").arg("+faststart")
+        .arg("-c:a").arg("aac").arg("-b:a").arg("320k")
+        .arg(&path)
+        .output()
+        .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg export failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+}
+
 #[tauri::command]
 pub fn render_auto_video_edit(
     state: State<'_, AppState>,

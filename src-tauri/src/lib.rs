@@ -171,6 +171,7 @@ pub fn run() {
             commands::save_video_recording,
             commands::render_video_mix,
             commands::export_rendered_video,
+            commands::export_video,
             commands::render_auto_video_edit,
             commands::render_agent_video_edit,
             commands::apply_clip_effects,

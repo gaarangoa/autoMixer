@@ -88,6 +88,10 @@ export const api = {
     tauriInvoke<{ path: string }>("render_video_mix", { sessionId, outputPath, startSample, endSample, trackIds, aspectRatio, quality }),
   exportRenderedVideo: (sourcePath: string, outputPath: string, aspectRatio?: ExportAspect, quality?: ExportQuality) =>
     tauriInvoke<{ path: string }>("export_rendered_video", { sourcePath, outputPath, aspectRatio, quality }),
+  // Flexible export: any aspect ("16:9","9:16","1:1","4:5","original",…), long-edge px,
+  // and fit (letterbox) vs fill (crop). Re-encodes at high quality.
+  exportVideo: (sourcePath: string, outputPath: string, aspect: string, maxDimension?: number, mode?: "fit" | "fill") =>
+    tauriInvoke<{ path: string }>("export_video", { sourcePath, outputPath, aspect, maxDimension, mode }),
   renderAutoVideoEdit: (sessionId: string, outputPath: string, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number) =>
     tauriInvoke<{ path: string }>("render_auto_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds }),
   renderAgentVideoEdit: (sessionId: string, outputPath: string | undefined, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number, ollamaBaseUrl: string, visionModel: string, editModel: string, instructions: string, planOnly?: boolean) =>

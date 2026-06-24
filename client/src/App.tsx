@@ -5234,6 +5234,12 @@ export function VideoMonitorApp() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const playRef = useRef<{ sample: number; running: boolean }>({ sample: 0, running: false });
   const videoEls = useRef<Map<string, HTMLVideoElement>>(new Map());
+  // Export controls (shape + resolution + fit/fill).
+  const [exportAspect, setExportAspect] = useState("original");
+  const [exportRes, setExportRes] = useState<number | "source">("source");
+  const [exportMode, setExportMode] = useState<"fit" | "fill">("fit");
+  const [exporting, setExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState<string | null>(null);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -5311,7 +5317,77 @@ export function VideoMonitorApp() {
   }, [clips, sr]);
 
   const cols = Math.max(1, Math.ceil(Math.sqrt(clips.length || 1)));
+
+  // The clip to export: prefer the agent's rendered output, else the focused/only clip.
+  const exportClip = useMemo(() => {
+    const agent = allClips.find((c) => c.trackName === "Agent video edit" || c.trackName.startsWith("Agent Edit"));
+    if (agent) return agent;
+    if (clips.length === 1) return clips[0];
+    return allClips.find((c) => selectedIds.includes(c.trackId)) ?? null;
+  }, [allClips, clips, selectedIds]);
+
+  const ASPECTS: { id: string; label: string }[] = [
+    { id: "original", label: "Original" },
+    { id: "16:9", label: "16:9 Landscape" },
+    { id: "9:16", label: "9:16 Vertical" },
+    { id: "1:1", label: "1:1 Square" },
+    { id: "4:5", label: "4:5 Portrait" },
+    { id: "4:3", label: "4:3 Classic" },
+    { id: "21:9", label: "21:9 Cinema" },
+  ];
+  const RESOLUTIONS: { id: number | "source"; label: string }[] = [
+    { id: "source", label: "Source" },
+    { id: 3840, label: "4K" },
+    { id: 2560, label: "1440p" },
+    { id: 1920, label: "1080p" },
+    { id: 1280, label: "720p" },
+    { id: 854, label: "480p" },
+  ];
+  // Preview the output dimensions for the chosen shape + resolution (when not Source).
+  const exportDims = useMemo(() => {
+    if (exportRes === "source") return null;
+    const long = exportRes;
+    let aw = 16, ah = 9;
+    if (exportAspect !== "original") {
+      const [a, b] = exportAspect.split(":").map(Number);
+      if (a && b) { aw = a; ah = b; }
+    } else { aw = 16; ah = 9; }
+    const r = aw / ah;
+    const w = r >= 1 ? long : Math.round(long * r);
+    const h = r >= 1 ? Math.round(long / r) : long;
+    const even = (n: number) => n - (n % 2);
+    return exportAspect === "original" ? `≤${long}px` : `${even(w)}×${even(h)}`;
+  }, [exportAspect, exportRes]);
+
+  async function doExport() {
+    if (!exportClip) { setExportStatus("Nothing to export — render an Agent Edit first."); return; }
+    const suffix = exportAspect === "original" ? "" : `-${exportAspect.replace(":", "x")}`;
+    const outputPath = await save({
+      title: "Export video",
+      defaultPath: `automixer-export${suffix}.mp4`,
+      filters: [{ name: "MP4 Video", extensions: ["mp4"] }],
+    });
+    if (!outputPath) return;
+    setExporting(true);
+    setExportStatus("Exporting…");
+    try {
+      const res = await api.exportVideo(
+        exportClip.path,
+        outputPath,
+        exportAspect,
+        exportRes === "source" ? undefined : exportRes,
+        exportMode,
+      );
+      setExportStatus(`Exported to ${res.path}`);
+    } catch (error) {
+      setExportStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
+    <div className="video-monitor-root">
     <main className="video-monitor-grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
       {clips.length === 0 ? (
         <div className="video-monitor-empty">No video in this session yet — record or import video, or ask the assistant to edit a clip.</div>
@@ -5350,6 +5426,39 @@ export function VideoMonitorApp() {
         })
       )}
     </main>
+    <footer className="video-export-bar">
+      <div className="vexport-title">
+        <Download size={15} />
+        <span>Export{exportClip ? <> · <strong>{exportClip.trackName}</strong></> : ""}</span>
+      </div>
+      <div className="vexport-controls">
+        <label className="vexport-field">
+          <span>Shape</span>
+          <select value={exportAspect} onChange={(e) => setExportAspect(e.target.value)} disabled={exporting}>
+            {ASPECTS.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
+          </select>
+        </label>
+        <label className="vexport-field">
+          <span>Resolution</span>
+          <select value={String(exportRes)} onChange={(e) => setExportRes(e.target.value === "source" ? "source" : Number(e.target.value))} disabled={exporting}>
+            {RESOLUTIONS.map((r) => <option key={String(r.id)} value={String(r.id)}>{r.label}</option>)}
+          </select>
+        </label>
+        <label className="vexport-field">
+          <span>Fit</span>
+          <select value={exportMode} onChange={(e) => setExportMode(e.target.value as "fit" | "fill")} disabled={exporting} title="Fit = letterbox (show everything). Fill = crop to fill the frame.">
+            <option value="fit">Fit (pad)</option>
+            <option value="fill">Fill (crop)</option>
+          </select>
+        </label>
+        {exportDims ? <span className="vexport-dims">{exportDims}</span> : null}
+        <button className="vexport-go" onClick={() => void doExport()} disabled={exporting || !exportClip}>
+          {exporting ? "Exporting…" : "Export MP4"}
+        </button>
+      </div>
+      {exportStatus ? <div className="vexport-status">{exportStatus}</div> : null}
+    </footer>
+    </div>
   );
 }
 

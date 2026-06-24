@@ -7440,14 +7440,86 @@ button.primary:hover { filter: brightness(1.09); }
 .chat-video-chip .chip-meta { font-size: var(--text-xs, 11px); color: var(--text-muted, #9aa6b2); }
 .chat-video-chip .chip-open { color: var(--text-muted, #9aa6b2); flex: 0 0 auto; }
 
-.video-monitor-grid {
+.video-monitor-root {
   position: fixed;
   inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: #000;
+}
+.video-monitor-grid {
+  flex: 1 1 auto;
+  min-height: 0;
   display: grid;
   gap: 2px;
   padding: 2px;
   background: #000;
   grid-auto-rows: 1fr;
+}
+
+/* Export controls below the monitor. */
+.video-export-bar {
+  flex: 0 0 auto;
+  background: linear-gradient(180deg, #16191a, #101212);
+  border-top: 1px solid #000;
+  padding: 8px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.4);
+}
+.vexport-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-dim, #9aa6b2);
+  font-size: var(--text-xs, 11px);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.vexport-title strong { color: var(--text, #e6edf3); text-transform: none; letter-spacing: 0; }
+.vexport-controls {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.vexport-field { display: flex; flex-direction: column; gap: 3px; }
+.vexport-field > span {
+  font-size: var(--text-xs, 10.5px);
+  color: var(--text-dim, #8b96a2);
+}
+.vexport-field select {
+  background: #0c0e0e;
+  color: var(--text, #e6edf3);
+  border: 1px solid #29362c;
+  border-radius: 7px;
+  padding: 6px 9px;
+  font-size: var(--text-sm, 12px);
+  min-width: 116px;
+}
+.vexport-dims {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--text-xs, 11px);
+  color: var(--accent, #7db8ff);
+  padding-bottom: 7px;
+}
+.vexport-go {
+  margin-left: auto;
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(111, 183, 216, 0.45);
+  background: var(--accent-soft, rgba(125, 184, 255, 0.14));
+  color: var(--accent-strong, #7db8ff);
+  font-weight: 600;
+  font-size: var(--text-sm, 12px);
+  cursor: pointer;
+}
+.vexport-go:disabled { opacity: 0.5; cursor: default; }
+.vexport-status {
+  font-size: var(--text-xs, 11px);
+  color: var(--text-dim, #8b96a2);
+  word-break: break-all;
 }
 .video-monitor-empty {
   grid-column: 1 / -1;
