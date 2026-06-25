@@ -1,7 +1,7 @@
-import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertCircle, Camera, CheckCircle2, ChevronDown, ChevronRight, Download, FilePlus2, FolderOpen, GitCompareArrows, Info, Keyboard, Maximize2, MessageSquare, Mic, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, SkipBack, SlidersHorizontal, Square, Trash2, Upload, Video, X } from "lucide-react";
+import { AlertCircle, Aperture, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Download, FilePlus2, Focus, FolderOpen, GitCompareArrows, Info, Keyboard, Maximize2, MessageSquare, Mic, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X } from "lucide-react";
 import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -9,6 +9,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow, getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getVersion } from "@tauri-apps/api/app";
 import { api, type ExportAspect, type ExportQuality } from "./api";
+import { cssAdjustFilter, vignetteStyle, grainStyle, whiteBalanceStyle } from "./videoAdjust";
 
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "gpt-oss:20b";
@@ -4044,7 +4045,7 @@ export function App() {
       <aside className="assistant">
         <div className="assistant-head">
           <div className="assistant-title">
-            <MessageSquare size={17} />
+            <MessageSquare size={14} />
             <span>Assistant</span>
           </div>
           <div className="assistant-head-actions">
@@ -4073,10 +4074,10 @@ export function App() {
               title="Clear chat — start a fresh conversation so the agent forgets earlier context"
               aria-label="Clear chat"
             >
-              <Trash2 size={17} />
+              <Trash2 size={14} />
             </button>
             <button className="icon-btn" onClick={() => setSettingsOpen(true)} title="Settings" aria-label="Settings">
-              <Settings size={17} />
+              <Settings size={14} />
             </button>
           </div>
         </div>
@@ -5123,6 +5124,15 @@ function defaultVideoLayout(index = 0): VideoLayout {
       saturation: 1,
       blur: 0,
       preset: "none",
+      exposure: 0,
+      highlights: 0,
+      shadows: 0,
+      temperature: 0,
+      tint: 0,
+      gamma: 1,
+      vignette: 0,
+      sharpen: 0,
+      grain: 0,
     };
   }
   const slot = (index - 1) % 4;
@@ -5156,6 +5166,15 @@ function normalizeVideoLayout(layout?: Partial<VideoLayout>, index = 0): VideoLa
     saturation: clamp(layout?.saturation, 0, 2, base.saturation),
     blur: clamp(layout?.blur, 0, 10, base.blur),
     preset: layout?.preset ?? base.preset,
+    exposure: clamp(layout?.exposure, -1, 1, base.exposure ?? 0),
+    highlights: clamp(layout?.highlights, -1, 1, base.highlights ?? 0),
+    shadows: clamp(layout?.shadows, -1, 1, base.shadows ?? 0),
+    temperature: clamp(layout?.temperature, -1, 1, base.temperature ?? 0),
+    tint: clamp(layout?.tint, -1, 1, base.tint ?? 0),
+    gamma: clamp(layout?.gamma, 0.5, 1.8, base.gamma ?? 1),
+    vignette: clamp(layout?.vignette, 0, 1, base.vignette ?? 0),
+    sharpen: clamp(layout?.sharpen, 0, 2, base.sharpen ?? 0),
+    grain: clamp(layout?.grain, 0, 1, base.grain ?? 0),
   };
 }
 
@@ -5226,6 +5245,158 @@ function useSpaceToggleTransport() {
 
 /** Floating multicam Video Monitor — a synced grid of every video clip in the
  *  session (camera angles + agent renders), driven by the engine transport. */
+// macOS Photos–style pill slider: label left, value right, a lighter fill that
+// grows from the center (bipolar) or left (unipolar). The whole pill is the
+// drag area (a transparent range input overlays it); double-click resets.
+type AdjustSliderDef = { key: string; label: string; min: number; max: number; step: number; def: number };
+
+function PhotoSlider({ def, value, onChange }: { def: AdjustSliderDef; value: number; onChange: (v: number) => void }) {
+  const { label, min, max, step, def: dflt } = def;
+  const span = max - min || 1;
+  const frac = Math.min(1, Math.max(0, (value - min) / span));
+  const bipolar = min < 0 && max > 0;
+  const origin = bipolar ? (0 - min) / span : 0;
+  const a = Math.min(origin, frac);
+  const b = Math.max(origin, frac);
+  const r = Math.round(value * 100) / 100;
+  const display = bipolar ? `${r > 0 ? "+" : ""}${r.toFixed(2)}` : r.toFixed(2);
+  return (
+    <div className="ph-slider" onDoubleClick={() => onChange(dflt)}>
+      <div className="ph-slider-fill" style={{ left: `${a * 100}%`, width: `${(b - a) * 100}%` }} />
+      <div className="ph-slider-tick" style={{ left: `${frac * 100}%` }} />
+      <span className="ph-slider-label">{label}</span>
+      <span className="ph-slider-value">{display}</span>
+      <input
+        className="ph-slider-input"
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+    </div>
+  );
+}
+
+type AdjustSectionDef = { id: string; title: string; icon: ReactNode; auto?: Record<string, number>; sliders: AdjustSliderDef[] };
+
+const ADJUST_SECTIONS: AdjustSectionDef[] = [
+  {
+    id: "light", title: "Light", icon: <Sun size={14} />, auto: { contrast: 1.12, brightness: 1.06, shadows: 0.12 },
+    sliders: [
+      { key: "exposure", label: "Exposure", min: -1, max: 1, step: 0.01, def: 0 },
+      { key: "highlights", label: "Highlights", min: -1, max: 1, step: 0.01, def: 0 },
+      { key: "shadows", label: "Shadows", min: -1, max: 1, step: 0.01, def: 0 },
+      { key: "brightness", label: "Brightness", min: 0.2, max: 2, step: 0.01, def: 1 },
+      { key: "contrast", label: "Contrast", min: 0.2, max: 2, step: 0.01, def: 1 },
+      { key: "gamma", label: "Black Point", min: 0.5, max: 1.8, step: 0.01, def: 1 },
+    ],
+  },
+  {
+    id: "color", title: "Color", icon: <Palette size={14} />, auto: { saturation: 1.18 },
+    sliders: [
+      { key: "saturation", label: "Saturation", min: 0, max: 2, step: 0.01, def: 1 },
+      { key: "temperature", label: "Temperature", min: -1, max: 1, step: 0.01, def: 0 },
+      { key: "tint", label: "Tint", min: -1, max: 1, step: 0.01, def: 0 },
+    ],
+  },
+  { id: "sharpen", title: "Sharpen", icon: <Focus size={14} />, sliders: [{ key: "sharpen", label: "Intensity", min: 0, max: 2, step: 0.01, def: 0 }] },
+  { id: "noise", title: "Noise Reduction", icon: <Aperture size={14} />, sliders: [{ key: "grain", label: "Amount", min: 0, max: 1, step: 0.01, def: 0 }] },
+  {
+    id: "vignette", title: "Vignette", icon: <Circle size={14} />,
+    sliders: [
+      { key: "vignette", label: "Strength", min: 0, max: 1, step: 0.01, def: 0 },
+      { key: "blur", label: "Blur", min: 0, max: 10, step: 0.1, def: 0 },
+    ],
+  },
+];
+
+function AdjustSection({ section, grade, open, onToggleOpen, onAdjust }: {
+  section: AdjustSectionDef; grade: VideoLayout; open: boolean; onToggleOpen: () => void; onAdjust: (patch: Record<string, number>) => void;
+}) {
+  const val = (k: string) => (grade as unknown as Record<string, number>)[k];
+  const isActive = section.sliders.some((s) => Math.abs((val(s.key) ?? s.def) - s.def) > 1e-4);
+  const resetSection = () => {
+    const p: Record<string, number> = {};
+    section.sliders.forEach((s) => { p[s.key] = s.def; });
+    onAdjust(p);
+  };
+  const applyAuto = () => { if (section.auto) onAdjust(section.auto); };
+  return (
+    <div className={`ph-section ${open ? "open" : ""}`}>
+      <div className="ph-section-head">
+        <button type="button" className="ph-chevron" onClick={onToggleOpen} aria-label="Expand section">
+          {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        </button>
+        <span className="ph-section-icon">{section.icon}</span>
+        <button type="button" className="ph-section-title" onClick={onToggleOpen}>{section.title}</button>
+        <button type="button" className="ph-icon-btn" title="Reset section" onClick={resetSection}><RotateCcw size={11} /></button>
+        {section.auto ? <button type="button" className="ph-auto" title="Auto" onClick={applyAuto}>AUTO</button> : null}
+        <button
+          type="button"
+          className={`ph-check ${isActive ? "on" : ""}`}
+          title={isActive ? "Reset this section" : "Apply auto"}
+          onClick={() => (isActive ? resetSection() : applyAuto())}
+        >
+          {isActive ? <Check size={10} strokeWidth={3} /> : null}
+        </button>
+      </div>
+      {open ? (
+        <div className="ph-section-body">
+          {section.sliders.map((s) => (
+            <PhotoSlider key={s.key} def={s} value={val(s.key) ?? s.def} onChange={(v) => onAdjust({ [s.key]: v })} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// A monitor grid tile. Geometry (crop-zoom/rotate/opacity) stays in CSS; color
+// is CSS + SVG filters applied directly to the <video> (works on cross-origin
+// media, unlike WebGL). Look preset goes on the surrounding box.
+function MonitorTile({ clip, grade, selected, registerVideo, onClick }: {
+  clip: { id: string; trackName: string; path: string; cl: number; cr: number; ct: number; cb: number; rot: number; op: number };
+  grade: VideoLayout;
+  selected: boolean;
+  registerVideo: (id: string, el: HTMLVideoElement | null) => void;
+  onClick: () => void;
+}) {
+  const sx = 1 / Math.max(0.1, 1 - clip.cl - clip.cr);
+  const sy = 1 / Math.max(0.1, 1 - clip.ct - clip.cb);
+  const ox = ((clip.cl + (1 - clip.cr)) / 2) * 100;
+  const oy = ((clip.ct + (1 - clip.cb)) / 2) * 100;
+  const cropped = clip.cl > 0 || clip.cr > 0 || clip.ct > 0 || clip.cb > 0 || clip.rot !== 0;
+  return (
+    <div
+      className={`monitor-tile ${selected ? "selected" : ""}`}
+      onClick={onClick}
+      title={`Click to adjust ${clip.trackName}`}
+      style={{ filter: presetCss(grade) }}
+    >
+      <video
+        ref={(el) => registerVideo(clip.id, el)}
+        src={convertFileSrc(clip.path)}
+        muted
+        playsInline
+        preload="auto"
+        style={{
+          objectFit: cropped ? "cover" : "contain",
+          transform: `rotate(${clip.rot}deg) scale(${sx}, ${sy})`,
+          transformOrigin: `${ox}% ${oy}%`,
+          opacity: clip.op,
+          filter: cssAdjustFilter(grade),
+        }}
+      />
+      {(() => { const wb = whiteBalanceStyle(grade); return wb ? <div style={wb} /> : null; })()}
+      {(grade.vignette ?? 0) > 0 ? <div style={vignetteStyle(grade)} /> : null}
+      {(grade.grain ?? 0) > 0 ? <div style={grainStyle(grade)} /> : null}
+      <span className="monitor-tile-label">{clip.trackName}</span>
+    </div>
+  );
+}
+
 export function VideoMonitorApp() {
   useSpaceToggleTransport();
   const initialSid = new URLSearchParams(window.location.search).get("sessionId") ?? "";
@@ -5240,6 +5411,12 @@ export function VideoMonitorApp() {
   const [exportMode, setExportMode] = useState<"fit" | "fill">("fit");
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
+  const [shareOpen, setShareOpen] = useState(false);
+  // Photos-style adjust: the clip being edited and its live (un-persisted) grade.
+  const [focusedClipId, setFocusedClipId] = useState<string | null>(null);
+  const [draftLayout, setDraftLayout] = useState<VideoLayout | null>(null);
+  const [openSections, setOpenSections] = useState<Record<string, boolean>>({ light: true, color: true });
+  const persistTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -5259,31 +5436,44 @@ export function VideoMonitorApp() {
   }, []);
 
   const sr = project?.session.sampleRate ?? 48000;
-  type MonitorClip = { id: string; trackId: string; trackName: string; path: string; start: number; end: number; offset: number; cl: number; cr: number; ct: number; cb: number; rot: number; op: number; filter: string };
+  type MonitorClip = { id: string; trackId: string; trackName: string; path: string; start: number; end: number; offset: number; cl: number; cr: number; ct: number; cb: number; rot: number; op: number; layout: VideoLayout; ti: number; ci: number };
   const allClips = useMemo(() => {
     const s = project?.session;
     if (!s) return [] as MonitorClip[];
     const byId = new Map((s.videoSourceFiles ?? []).map((v) => [v.id, v]));
     const out: MonitorClip[] = [];
-    for (const t of s.tracks) {
-      if (t.kind !== "video") continue;
-      for (const c of (t.videoClips ?? [])) {
+    s.tracks.forEach((t, ti) => {
+      if (t.kind !== "video") return;
+      (t.videoClips ?? []).forEach((c, ci) => {
         const src = byId.get(c.videoSourceFileId);
-        if (!src?.path) continue;
+        if (!src?.path) return;
         out.push({
           id: c.id, trackId: t.id, trackName: t.name, path: src.path,
           start: c.startSample / sr, end: c.endSample / sr, offset: (c.sourceOffsetMs ?? 0) / 1000,
           cl: (c.layout?.cropLeft ?? 0) / 100, cr: (c.layout?.cropRight ?? 0) / 100,
           ct: (c.layout?.cropTop ?? 0) / 100, cb: (c.layout?.cropBottom ?? 0) / 100,
           rot: c.layout?.rotation ?? 0, op: c.layout?.opacity ?? 1,
-          // Live color preview — saturation/brightness/contrast/blur/preset as a CSS
-          // filter so a focused-track "make it vivid" shows instantly, no render.
-          filter: videoFilterCss(normalizeVideoLayout(c.layout)),
+          layout: normalizeVideoLayout(c.layout), ti, ci,
         });
-      }
-    }
+      });
+    });
     return out;
   }, [project, sr]);
+
+  // Follow the main window's track selection: aim the Adjust panel at the
+  // selected track's clip so sliders target what the user picked there. Keep a
+  // manual in-monitor focus if it already belongs to a selected track (so
+  // clicking a specific tile on a multi-clip track isn't overridden).
+  useEffect(() => {
+    if (selectedIds.length === 0) return;
+    const current = allClips.find((c) => c.id === focusedClipId);
+    if (current && selectedIds.includes(current.trackId)) return;
+    const target = allClips.find((c) => selectedIds.includes(c.trackId));
+    if (target) {
+      setFocusedClipId(target.id);
+      setDraftLayout(target.layout);
+    }
+  }, [selectedIds, allClips, focusedClipId]);
 
   // Show only the selected video tracks when a selection exists; otherwise all.
   const clips = useMemo(() => {
@@ -5386,78 +5576,132 @@ export function VideoMonitorApp() {
     }
   }
 
+  const focusedClip = useMemo(() => allClips.find((c) => c.id === focusedClipId) ?? null, [allClips, focusedClipId]);
+  const focusGrade: VideoLayout | null = focusedClip ? (draftLayout ?? focusedClip.layout) : null;
+
+  function focusClip(c: MonitorClip) {
+    setFocusedClipId(c.id);
+    setDraftLayout(c.layout);
+    void emit("video-monitor:select", { trackId: c.trackId }).catch(() => undefined);
+  }
+
+  // Update the focused clip's grade: instant local preview + debounced persist
+  // (via applyPatch) so the change survives reloads and downstream renders use it.
+  function adjust(patch: Partial<VideoLayout>) {
+    if (!focusedClip) return;
+    const next = normalizeVideoLayout({ ...(draftLayout ?? focusedClip.layout), ...patch });
+    setDraftLayout(next);
+    window.clearTimeout(persistTimer.current);
+    persistTimer.current = window.setTimeout(() => {
+      const s = project?.session;
+      const track = s?.tracks[focusedClip.ti];
+      const before = track?.videoClips ?? [];
+      if (!s || !before.some((c) => c.id === focusedClip.id)) return;
+      const arr = before.map((c) => (c.id === focusedClip.id ? { ...c, layout: next } : c));
+      void api.applyPatch(
+        s.id,
+        [{ op: "replace", path: `/tracks/${focusedClip.ti}/videoClips`, value: arr }],
+        [{ op: "replace", path: `/tracks/${focusedClip.ti}/videoClips`, value: before }],
+        "Adjust clip",
+      ).then(setProject).catch(() => undefined);
+    }, 300) as unknown as number;
+  }
+
   return (
     <div className="video-monitor-root">
+    <div className="video-monitor-body">
     <main className="video-monitor-grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
       {clips.length === 0 ? (
         <div className="video-monitor-empty">No video in this session yet — record or import video, or ask the assistant to edit a clip.</div>
       ) : (
-        clips.map((c) => {
-          // Preview the clip's crop/reframe live: zoom into the retained region.
-          const sx = 1 / Math.max(0.1, 1 - c.cl - c.cr);
-          const sy = 1 / Math.max(0.1, 1 - c.ct - c.cb);
-          const ox = ((c.cl + (1 - c.cr)) / 2) * 100;
-          const oy = ((c.ct + (1 - c.cb)) / 2) * 100;
-          const cropped = c.cl > 0 || c.cr > 0 || c.ct > 0 || c.cb > 0 || c.rot !== 0;
-          return (
-            <div
-              className={`monitor-tile ${selectedIds.includes(c.trackId) ? "selected" : ""}`}
-              key={c.id}
-              onClick={() => void emit("video-monitor:select", { trackId: c.trackId }).catch(() => undefined)}
-              title={`Click to focus ${c.trackName}`}
-            >
-              <video
-                ref={(el) => { if (el) videoEls.current.set(c.id, el); else videoEls.current.delete(c.id); }}
-                src={convertFileSrc(c.path)}
-                muted
-                playsInline
-                preload="auto"
-                style={{
-                  objectFit: cropped ? "cover" : "contain",
-                  transform: `rotate(${c.rot}deg) scale(${sx}, ${sy})`,
-                  transformOrigin: `${ox}% ${oy}%`,
-                  opacity: c.op,
-                  filter: c.filter,
-                }}
-              />
-              <span className="monitor-tile-label">{c.trackName}</span>
-            </div>
-          );
-        })
+        clips.map((c) => (
+          <MonitorTile
+            key={c.id}
+            clip={c}
+            grade={c.id === focusedClipId && draftLayout ? draftLayout : c.layout}
+            selected={c.id === focusedClipId || selectedIds.includes(c.trackId)}
+            registerVideo={(id, el) => { if (el) videoEls.current.set(id, el); else videoEls.current.delete(id); }}
+            onClick={() => focusClip(c)}
+          />
+        ))
       )}
     </main>
-    <footer className="video-export-bar">
-      <div className="vexport-title">
-        <Download size={15} />
-        <span>Export{exportClip ? <> · <strong>{exportClip.trackName}</strong></> : ""}</span>
-      </div>
-      <div className="vexport-controls">
-        <label className="vexport-field">
-          <span>Shape</span>
-          <select value={exportAspect} onChange={(e) => setExportAspect(e.target.value)} disabled={exporting}>
-            {ASPECTS.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-          </select>
-        </label>
-        <label className="vexport-field">
-          <span>Resolution</span>
-          <select value={String(exportRes)} onChange={(e) => setExportRes(e.target.value === "source" ? "source" : Number(e.target.value))} disabled={exporting}>
-            {RESOLUTIONS.map((r) => <option key={String(r.id)} value={String(r.id)}>{r.label}</option>)}
-          </select>
-        </label>
-        <label className="vexport-field">
-          <span>Fit</span>
-          <select value={exportMode} onChange={(e) => setExportMode(e.target.value as "fit" | "fill")} disabled={exporting} title="Fit = letterbox (show everything). Fill = crop to fill the frame.">
-            <option value="fit">Fit (pad)</option>
-            <option value="fill">Fill (crop)</option>
-          </select>
-        </label>
-        {exportDims ? <span className="vexport-dims">{exportDims}</span> : null}
-        <button className="vexport-go" onClick={() => void doExport()} disabled={exporting || !exportClip}>
-          {exporting ? "Exporting…" : "Export MP4"}
+    {focusGrade && focusedClip ? (
+      <aside className="video-monitor-adjust photos">
+        <div className="ph-head">
+          <span>ADJUST</span>
+          <button type="button" className="ph-share" onClick={() => setShareOpen(true)} title="Share / Export">
+            <Share2 size={11} />
+            Share
+          </button>
+        </div>
+        <div className="ph-sections">
+          {ADJUST_SECTIONS.map((sec) => (
+            <AdjustSection
+              key={sec.id}
+              section={sec}
+              grade={focusGrade}
+              open={!!openSections[sec.id]}
+              onToggleOpen={() => setOpenSections((o) => ({ ...o, [sec.id]: !o[sec.id] }))}
+              onAdjust={(p) => adjust(p as Partial<VideoLayout>)}
+            />
+          ))}
+        </div>
+        <button
+          type="button"
+          className="ph-reset-all"
+          onClick={() => adjust({ exposure: 0, highlights: 0, shadows: 0, gamma: 1, brightness: 1, contrast: 1, saturation: 1, temperature: 0, tint: 0, sharpen: 0, grain: 0, vignette: 0, blur: 0, preset: "none" })}
+        >
+          Reset Adjustments
         </button>
+      </aside>
+    ) : (
+      <aside className="video-monitor-adjust photos empty">
+        <SlidersHorizontal size={26} />
+        <span>Select a clip to adjust</span>
+      </aside>
+    )}
+    </div>
+    {shareOpen ? (
+      <div className="share-backdrop" onClick={() => { if (!exporting) setShareOpen(false); }}>
+        <div className="share-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="share-modal-head">
+            <Share2 size={16} />
+            <span>Export Video</span>
+            <button type="button" className="share-modal-close" onClick={() => setShareOpen(false)} disabled={exporting}><X size={16} /></button>
+          </div>
+          <div className="share-modal-body">
+            <label className="share-field">
+              <span>Shape</span>
+              <select value={exportAspect} onChange={(e) => setExportAspect(e.target.value)} disabled={exporting}>
+                {ASPECTS.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
+              </select>
+            </label>
+            <label className="share-field">
+              <span>Resolution</span>
+              <select value={String(exportRes)} onChange={(e) => setExportRes(e.target.value === "source" ? "source" : Number(e.target.value))} disabled={exporting}>
+                {RESOLUTIONS.map((r) => <option key={String(r.id)} value={String(r.id)}>{r.label}</option>)}
+              </select>
+            </label>
+            <label className="share-field">
+              <span>Fit</span>
+              <select value={exportMode} onChange={(e) => setExportMode(e.target.value as "fit" | "fill")} disabled={exporting} title="Fit = letterbox (show everything). Fill = crop to fill the frame.">
+                <option value="fit">Fit (pad)</option>
+                <option value="fill">Fill (crop)</option>
+              </select>
+            </label>
+            {exportDims ? <div className="share-dims">Output · {exportDims}</div> : null}
+            {exportStatus ? <div className="share-status">{exportStatus}</div> : null}
+          </div>
+          <div className="share-modal-foot">
+            <button type="button" className="share-cancel" onClick={() => setShareOpen(false)} disabled={exporting}>Cancel</button>
+            <button type="button" className="share-export" onClick={() => void doExport()} disabled={exporting || !exportClip}>
+              {exporting ? "Exporting…" : "Export MP4"}
+            </button>
+          </div>
+        </div>
       </div>
-      {exportStatus ? <div className="vexport-status">{exportStatus}</div> : null}
-    </footer>
+    ) : null}
     </div>
   );
 }
@@ -6739,10 +6983,10 @@ function CameraCanvasLayer({
       onPointerMove={moveDrag}
       onPointerUp={endDrag}
     >
-      <div className="video-canvas-layer-media" style={{ filter: videoFilterCss(layout) }}>
+      <div className="video-canvas-layer-media" style={{ filter: presetCss(layout) }}>
         <div className="video-canvas-layer-inner" style={innerStyle}>
           {layer.clip
-            ? <RecordedVideoFeed clip={layer.clip} playing={layer.track.transportPlaying} />
+            ? <RecordedVideoFeed clip={layer.clip} playing={layer.track.transportPlaying} grade={layout} />
             : <CameraLiveFeed track={layer.track} />}
         </div>
       </div>
@@ -6873,15 +7117,27 @@ function VideoCanvasInspector({
           <VideoSlider label="Right" value={layout.cropRight} min={0} max={45} step={0.5} onChange={(cropRight) => update({ cropRight })} />
           <VideoSlider label="Bottom" value={layout.cropBottom} min={0} max={45} step={0.5} onChange={(cropBottom) => update({ cropBottom })} />
           <VideoSlider label="Left" value={layout.cropLeft} min={0} max={45} step={0.5} onChange={(cropLeft) => update({ cropLeft })} />
-          <div className="video-canvas-panel-title">Effects</div>
+          <div className="video-canvas-panel-title">Filters</div>
           <div className="video-filter-presets">
             {(["none", "warm", "cool", "mono", "punch", "dream"] as const).map((preset) => (
               <button key={preset} type="button" className={layout.preset === preset ? "active" : ""} onClick={() => update({ preset })}>{preset}</button>
             ))}
           </div>
+          <div className="video-canvas-panel-title">Light</div>
+          <VideoSlider label="Exposure" value={layout.exposure ?? 0} min={-1} max={1} step={0.01} onChange={(exposure) => update({ exposure })} />
           <VideoSlider label="Bright" value={layout.brightness} min={0.2} max={2} step={0.01} onChange={(brightness) => update({ brightness })} />
           <VideoSlider label="Contrast" value={layout.contrast} min={0.2} max={2} step={0.01} onChange={(contrast) => update({ contrast })} />
+          <VideoSlider label="Highlights" value={layout.highlights ?? 0} min={-1} max={1} step={0.01} onChange={(highlights) => update({ highlights })} />
+          <VideoSlider label="Shadows" value={layout.shadows ?? 0} min={-1} max={1} step={0.01} onChange={(shadows) => update({ shadows })} />
+          <VideoSlider label="Gamma" value={layout.gamma ?? 1} min={0.5} max={1.8} step={0.01} onChange={(gamma) => update({ gamma })} />
+          <div className="video-canvas-panel-title">Color</div>
           <VideoSlider label="Saturate" value={layout.saturation} min={0} max={2} step={0.01} onChange={(saturation) => update({ saturation })} />
+          <VideoSlider label="Temp" value={layout.temperature ?? 0} min={-1} max={1} step={0.01} onChange={(temperature) => update({ temperature })} />
+          <VideoSlider label="Tint" value={layout.tint ?? 0} min={-1} max={1} step={0.01} onChange={(tint) => update({ tint })} />
+          <div className="video-canvas-panel-title">Detail</div>
+          <VideoSlider label="Sharpen" value={layout.sharpen ?? 0} min={0} max={2} step={0.01} onChange={(sharpen) => update({ sharpen })} />
+          <VideoSlider label="Noise" value={layout.grain ?? 0} min={0} max={1} step={0.01} onChange={(grain) => update({ grain })} />
+          <VideoSlider label="Vignette" value={layout.vignette ?? 0} min={0} max={1} step={0.01} onChange={(vignette) => update({ vignette })} />
           <VideoSlider label="Blur" value={layout.blur} min={0} max={10} step={0.1} onChange={(blur) => update({ blur })} />
           <button type="button" className="video-reset-button" onClick={() => update(defaultVideoLayout())}>Reset layer</button>
         </>
@@ -6900,8 +7156,11 @@ function VideoSlider({ label, value, min, max, step, onChange }: { label: string
   );
 }
 
-function videoFilterCss(layout: VideoLayout) {
-  const preset = {
+// CSS for the named look preset only (sepia/hue/grayscale combos CSS does well).
+// Applied on the surrounding box so it composes over either the GL canvas or the
+// plain <video> fallback.
+function presetCss(layout: VideoLayout) {
+  return {
     none: "",
     warm: "sepia(0.18) hue-rotate(-8deg)",
     cool: "hue-rotate(12deg) saturate(0.92)",
@@ -6914,11 +7173,20 @@ function videoFilterCss(layout: VideoLayout) {
     vintage: "sepia(0.35) saturate(0.72) contrast(0.94)",
     golden: "sepia(0.18) saturate(1.12) brightness(1.04) hue-rotate(-6deg)",
     cold: "hue-rotate(18deg) saturate(0.92) contrast(1.05)",
-  }[layout.preset];
-  return `brightness(${layout.brightness}) contrast(${layout.contrast}) saturate(${layout.saturation}) blur(${layout.blur}px) ${preset}`;
+  }[layout.preset] || "";
 }
 
-function RecordedVideoFeed({ clip, playing }: { clip: CameraPreviewClip; playing: boolean }) {
+// CSS for the subset of numeric adjustments CSS can express (used as the
+// fallback when WebGL is unavailable; the GL path handles the full set).
+function numericCss(layout: VideoLayout) {
+  return `brightness(${layout.brightness}) contrast(${layout.contrast}) saturate(${layout.saturation}) blur(${layout.blur}px)`;
+}
+
+function videoFilterCss(layout: VideoLayout) {
+  return `${numericCss(layout)} ${presetCss(layout)}`.trim();
+}
+
+function RecordedVideoFeed({ clip, playing, grade }: { clip: CameraPreviewClip; playing: boolean; grade?: VideoLayout }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState<string | undefined>();
   const url = convertFileSrc(clip.src);
@@ -6946,9 +7214,13 @@ function RecordedVideoFeed({ clip, playing }: { clip: CameraPreviewClip; playing
         muted
         playsInline
         preload="auto"
+        style={grade ? { filter: cssAdjustFilter(grade) } : undefined}
         onLoadedData={() => setError(undefined)}
         onError={() => setError(`Could not load recorded video: ${url}`)}
       />
+      {(() => { const wb = grade ? whiteBalanceStyle(grade) : null; return wb ? <div style={wb} /> : null; })()}
+      {grade && (grade.vignette ?? 0) > 0 ? <div style={vignetteStyle(grade)} /> : null}
+      {grade && (grade.grain ?? 0) > 0 ? <div style={grainStyle(grade)} /> : null}
       <div className="camera-preview-source">{clip.name}</div>
       {error ? <div className="camera-preview-error">{error}</div> : null}
     </>

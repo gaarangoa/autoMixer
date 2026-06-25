@@ -127,6 +127,16 @@ export type VideoLayout = {
   saturation: number;
   blur: number;
   preset: VideoFilterPreset;
+  // Photos-style adjustments (optional for backward-compat; neutral when absent).
+  exposure?: number;     // -1..1  (0 = neutral)
+  highlights?: number;   // -1..1  (0)
+  shadows?: number;      // -1..1  (0)
+  temperature?: number;  // -1..1  white balance, warm(+)/cool(-) (0)
+  tint?: number;         // -1..1  green(-)/magenta(+) (0)
+  gamma?: number;        // 0.5..1.8 (1)
+  vignette?: number;     // 0..1   (0)
+  sharpen?: number;      // 0..2   (0)
+  grain?: number;        // 0..1   (0)
 };
 
 export type VideoCanvas = {

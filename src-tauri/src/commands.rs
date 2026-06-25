@@ -2916,24 +2916,7 @@ fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, 
 
 fn default_video_layout(index: usize) -> VideoLayout {
     if index == 0 {
-        return VideoLayout {
-            x: 0.0,
-            y: 0.0,
-            width: 100.0,
-            height: 100.0,
-            crop_top: 0.0,
-            crop_right: 0.0,
-            crop_bottom: 0.0,
-            crop_left: 0.0,
-            opacity: 1.0,
-            rotation: 0.0,
-            z_index: 0,
-            brightness: 1.0,
-            contrast: 1.0,
-            saturation: 1.0,
-            blur: 0.0,
-            preset: VideoFilterPreset::None,
-        };
+        return VideoLayout::default();
     }
     let slot = (index - 1) % 4;
     let mut layout = default_video_layout(0);
@@ -3463,10 +3446,34 @@ fn layout_processing_suffix(layout: &VideoLayout, reference_w: i32, reference_h:
     );
     let eq_brightness = (layout.brightness - 1.0).clamp(-0.8, 0.8);
     suffix.push_str(&format!(
-        ",eq=brightness={eq_brightness:.3}:contrast={:.3}:saturation={:.3}",
+        ",eq=brightness={eq_brightness:.3}:contrast={:.3}:saturation={:.3}:gamma={:.3}",
         layout.contrast.clamp(0.2, 2.0),
-        layout.saturation.clamp(0.0, 2.0)
+        layout.saturation.clamp(0.0, 2.0),
+        layout.gamma.clamp(0.5, 1.8),
     ));
+    // Photos-style adjustments — mirror client/src/glColor.ts so preview == export.
+    let exposure = layout.exposure.clamp(-1.0, 1.0);
+    if exposure.abs() >= 0.005 {
+        let gain = 2f32.powf(exposure);
+        suffix.push_str(&format!(",colorchannelmixer=rr={gain:.4}:gg={gain:.4}:bb={gain:.4}"));
+    }
+    let temp = layout.temperature.clamp(-1.0, 1.0);
+    let tint = layout.tint.clamp(-1.0, 1.0);
+    if temp.abs() >= 0.005 || tint.abs() >= 0.005 {
+        suffix.push_str(&format!(
+            ",colorbalance=rm={:.4}:gm={:.4}:bm={:.4}",
+            temp * 0.3,
+            -tint * 0.3,
+            -temp * 0.3,
+        ));
+    }
+    let hl = layout.highlights.clamp(-1.0, 1.0);
+    let sh = layout.shadows.clamp(-1.0, 1.0);
+    if hl.abs() >= 0.005 || sh.abs() >= 0.005 {
+        let sy = (0.25 + sh * 0.15).clamp(0.0, 1.0);
+        let hy = (0.75 + hl * 0.15).clamp(0.0, 1.0);
+        suffix.push_str(&format!(",curves=m=0/0 0.25/{sy:.3} 0.75/{hy:.3} 1/1"));
+    }
     match layout.preset {
         VideoFilterPreset::Warm => suffix.push_str(",colorchannelmixer=rr=1.06:gg=1.01:bb=0.94"),
         VideoFilterPreset::Cool => suffix.push_str(",colorchannelmixer=rr=0.94:gg=1.01:bb=1.08"),
@@ -3483,6 +3490,16 @@ fn layout_processing_suffix(layout: &VideoLayout, reference_w: i32, reference_h:
     }
     if layout.blur >= 0.5 {
         suffix.push_str(&format!(",boxblur={}:1", layout.blur.round().clamp(1.0, 10.0)));
+    }
+    if layout.sharpen.clamp(0.0, 2.0) >= 0.02 {
+        suffix.push_str(&format!(",unsharp=5:5:{:.3}:5:5:0.0", layout.sharpen.clamp(0.0, 2.0)));
+    }
+    if layout.grain.clamp(0.0, 1.0) >= 0.02 {
+        suffix.push_str(&format!(",noise=alls={}:allf=t", (layout.grain.clamp(0.0, 1.0) * 30.0).round() as i32));
+    }
+    if layout.vignette.clamp(0.0, 1.0) >= 0.02 {
+        let ang = (layout.vignette.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_3) as f64;
+        suffix.push_str(&format!(",vignette=a={ang:.4}"));
     }
     if layout.rotation.abs() >= 0.5 {
         let radians = layout.rotation as f64 * std::f64::consts::PI / 180.0;
@@ -4891,6 +4908,15 @@ pub fn normalized_video_layout(layout: &VideoLayout) -> VideoLayout {
     next.contrast = next.contrast.clamp(0.2, 2.0);
     next.saturation = next.saturation.clamp(0.0, 2.0);
     next.blur = next.blur.clamp(0.0, 10.0);
+    next.exposure = next.exposure.clamp(-1.0, 1.0);
+    next.highlights = next.highlights.clamp(-1.0, 1.0);
+    next.shadows = next.shadows.clamp(-1.0, 1.0);
+    next.temperature = next.temperature.clamp(-1.0, 1.0);
+    next.tint = next.tint.clamp(-1.0, 1.0);
+    next.gamma = next.gamma.clamp(0.5, 1.8);
+    next.vignette = next.vignette.clamp(0.0, 1.0);
+    next.sharpen = next.sharpen.clamp(0.0, 2.0);
+    next.grain = next.grain.clamp(0.0, 1.0);
     next
 }
 

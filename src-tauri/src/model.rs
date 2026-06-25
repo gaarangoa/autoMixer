@@ -193,6 +193,29 @@ pub struct VideoLayout {
     pub saturation: f32,
     pub blur: f32,
     pub preset: VideoFilterPreset,
+    // Photos-style adjustments. serde defaults keep older saved projects loading.
+    #[serde(default)]
+    pub exposure: f32,
+    #[serde(default)]
+    pub highlights: f32,
+    #[serde(default)]
+    pub shadows: f32,
+    #[serde(default)]
+    pub temperature: f32,
+    #[serde(default)]
+    pub tint: f32,
+    #[serde(default = "default_gamma")]
+    pub gamma: f32,
+    #[serde(default)]
+    pub vignette: f32,
+    #[serde(default)]
+    pub sharpen: f32,
+    #[serde(default)]
+    pub grain: f32,
+}
+
+fn default_gamma() -> f32 {
+    1.0
 }
 
 impl Default for VideoLayout {
@@ -215,6 +238,15 @@ impl Default for VideoLayout {
             saturation: 1.0,
             blur: 0.0,
             preset: VideoFilterPreset::None,
+            exposure: 0.0,
+            highlights: 0.0,
+            shadows: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            gamma: 1.0,
+            vignette: 0.0,
+            sharpen: 0.0,
+            grain: 0.0,
         }
     }
 }

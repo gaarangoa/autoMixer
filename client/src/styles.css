@@ -7447,8 +7447,14 @@ button.primary:hover { filter: brightness(1.09); }
   flex-direction: column;
   background: #000;
 }
+.video-monitor-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
 .video-monitor-grid {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   display: grid;
   gap: 2px;
@@ -7456,6 +7462,334 @@ button.primary:hover { filter: brightness(1.09); }
   background: #000;
   grid-auto-rows: 1fr;
 }
+/* ===== macOS Photos–style Adjust panel (compact) ===== */
+.video-monitor-adjust.photos {
+  flex: 0 0 226px;
+  overflow-y: auto;
+  background: #1c1c1e;
+  border-left: 1px solid #000;
+  display: flex;
+  flex-direction: column;
+  color: #f2f2f7;
+  font: 12px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.video-monitor-adjust.photos::-webkit-scrollbar { width: 9px; }
+.video-monitor-adjust.photos::-webkit-scrollbar-thumb { background: #38383a; border-radius: 5px; border: 2px solid #1c1c1e; }
+.video-monitor-adjust.photos.empty {
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #8e8e93;
+  font-size: 11px;
+  text-align: center;
+  padding: 20px;
+}
+
+.ph-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #d7d7db;
+  border-bottom: 1px solid #38383a;
+}
+.ph-share {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  min-width: 0;
+  padding: 0 9px;
+  border: 1px solid #5a5a5e;
+  border-radius: 999px;
+  background: transparent;
+  color: #d7d7db;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.ph-share:hover { border-color: #8e8e93; background: transparent; color: #fff; }
+.ph-sections { flex: 1 1 auto; }
+
+/* Section row */
+.ph-section { border-bottom: 1px solid #2a2a2c; }
+.ph-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 31px;
+  padding: 0 10px 0 6px;
+}
+.ph-chevron {
+  display: grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border: none;
+  background: none;
+  color: #8e8e93;
+  cursor: pointer;
+  padding: 0;
+}
+.ph-section-icon { display: grid; place-items: center; color: #e5e5ea; }
+.ph-section-title {
+  flex: 1;
+  text-align: left;
+  border: none;
+  background: none;
+  color: #f2f2f7;
+  font-size: 13px;
+  font-weight: 400;
+  cursor: pointer;
+  padding: 0;
+}
+.ph-icon-btn {
+  display: grid;
+  place-items: center;
+  width: 19px;
+  height: 19px;
+  border: none;
+  background: none;
+  color: #98989d;
+  cursor: pointer;
+  border-radius: 5px;
+}
+.ph-icon-btn:hover { color: #fff; background: #2c2c2e; }
+.ph-auto {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid #5a5a5e;
+  background: transparent;
+  color: #d7d7db;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.ph-auto:hover { border-color: #8e8e93; color: #fff; }
+.ph-check {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid #5a5a5e;
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+  padding: 0;
+}
+.ph-check.on { background: #0a84ff; border-color: #0a84ff; }
+
+/* Section body + sliders */
+.ph-section-body { padding: 1px 10px 9px; display: flex; flex-direction: column; gap: 5px; }
+.ph-slider {
+  position: relative;
+  height: 26px;
+  border-radius: 6px;
+  background: #2c2c2e;
+  overflow: hidden;
+  cursor: ew-resize;
+  user-select: none;
+}
+.ph-slider-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.15);
+}
+.ph-slider-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.55);
+}
+.ph-slider-label {
+  position: absolute;
+  left: 10px;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  color: #f2f2f7;
+  pointer-events: none;
+}
+.ph-slider-value {
+  position: absolute;
+  right: 10px;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  color: #c7c7cc;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.ph-slider-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: ew-resize;
+}
+
+.ph-reset-all {
+  position: sticky;
+  bottom: 0;
+  margin: 9px 10px 12px;
+  height: 30px;
+  border-radius: 7px;
+  border: none;
+  background: #2c2c2e;
+  color: #f2f2f7;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.ph-reset-all:hover { background: #363638; }
+
+/* Neutralize the app's global <button> chrome (border / 36px min-size / bg)
+   inside the Photos panel — without this the chevrons, AUTO pill and the check
+   circle get forced to 36px boxes with borders ("cheap" look). */
+.video-monitor-adjust.photos .ph-chevron,
+.video-monitor-adjust.photos .ph-section-title,
+.video-monitor-adjust.photos .ph-icon-btn,
+.video-monitor-adjust.photos .ph-auto,
+.video-monitor-adjust.photos .ph-check,
+.video-monitor-adjust.photos .ph-reset-all {
+  min-width: 0;
+}
+.video-monitor-adjust.photos .ph-section-title,
+.video-monitor-adjust.photos .ph-auto { height: auto; }
+.video-monitor-adjust.photos .ph-chevron:hover,
+.video-monitor-adjust.photos .ph-section-title:hover,
+.video-monitor-adjust.photos .ph-check:hover { background: none; }
+.video-monitor-adjust.photos .ph-check.on { background: #0a84ff; }
+.video-monitor-adjust.photos .ph-slider-input { border: none; border-radius: 0; }
+
+/* ===== Export: slim Share bar + modal ===== */
+.video-export-bar.slim {
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+}
+.video-export-bar.slim .vexport-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim, #9aa6b2);
+  font-size: 12px;
+}
+.vexport-share {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  min-width: 0;
+  padding: 0 14px;
+  border: none;
+  border-radius: 8px;
+  background: #0a84ff;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.vexport-share:hover { background: #2a96ff; }
+.vexport-share:disabled { opacity: 0.5; cursor: default; }
+
+.share-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+.share-modal {
+  width: 330px;
+  max-width: calc(100vw - 40px);
+  background: #1e1e1e;
+  border: 1px solid #38383a;
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  color: #f2f2f7;
+  overflow: hidden;
+  font: 13px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+}
+.share-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 13px 14px;
+  border-bottom: 1px solid #2a2a2c;
+  font-size: 15px;
+  font-weight: 600;
+}
+.share-modal-head > span { flex: 1; }
+.share-modal-close {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  min-width: 0;
+  border: none;
+  background: none;
+  color: #98989d;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.share-modal-close:hover { background: #2c2c2e; color: #fff; }
+.share-modal-body { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+.share-field { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.share-field > span { font-size: 13px; color: #c7c7cc; }
+.share-field select {
+  flex: 0 0 auto;
+  min-width: 156px;
+  height: 32px;
+  background: #2c2c2e;
+  color: #f2f2f7;
+  border: 1px solid #3a3a3c;
+  border-radius: 7px;
+  padding: 0 9px;
+  font-size: 13px;
+}
+.share-dims { font-size: 12px; color: #8e8e93; }
+.share-status { font-size: 12px; color: #4aa3ff; word-break: break-all; }
+.share-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 14px 14px;
+  border-top: 1px solid #2a2a2c;
+}
+.share-cancel,
+.share-export {
+  height: 32px;
+  min-width: 0;
+  padding: 0 16px;
+  border-radius: 7px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.share-cancel { border: 1px solid #3a3a3c; background: #2c2c2e; color: #f2f2f7; }
+.share-cancel:hover { background: #363638; }
+.share-export { border: none; background: #0a84ff; color: #fff; font-weight: 600; }
+.share-export:hover { background: #2a96ff; }
+.share-export:disabled, .share-cancel:disabled { opacity: 0.5; cursor: default; }
 
 /* Export controls below the monitor. */
 .video-export-bar {
