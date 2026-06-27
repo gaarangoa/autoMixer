@@ -197,6 +197,15 @@ class Bridge:
         env = {"HOME": os.environ["HOME"], "PATH": os.environ.get("PATH", "")}
         if "HERMES_HOME" in os.environ:
             env["HERMES_HOME"] = os.environ["HERMES_HOME"]
+        # Shrink the agent's system prompt. This audio/video agent's capabilities come
+        # from the automixer MCP tools, NOT from Hermes' bundled skills (apple, email,
+        # github, powerpoint, research, …), whose ~11k-token catalog bloats every prompt
+        # and is the main reason the first turn is slow. Point bundled-skills resolution
+        # at an empty dir for THIS process only — the shared ~/.hermes and the desktop
+        # Hermes app are unaffected.
+        no_skills = Path.home() / ".automixer" / "hermes-no-skills"
+        no_skills.mkdir(parents=True, exist_ok=True)
+        env["HERMES_BUNDLED_SKILLS"] = str(no_skills)
         self._cm = acp.spawn_agent_process(self, HERMES, "acp", env=env)
         self.conn, self.proc = await self._cm.__aenter__()
         await self.conn.initialize(

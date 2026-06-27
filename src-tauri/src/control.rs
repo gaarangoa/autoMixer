@@ -134,6 +134,7 @@ pub fn spawn(app: AppHandle) -> Result<&'static ControlInfo, String> {
         .route("/control/session/{session_id}/video-edit", post(post_video_edit))
         .route("/control/session/{session_id}/auto-mix", post(post_auto_mix))
         .route("/control/session/{session_id}/clip-layout", post(post_clip_layout))
+        .route("/control/session/{session_id}/clip-effects", post(post_clip_effects))
         .route("/control/session/{session_id}/auto-crop", post(post_auto_crop))
         .with_state(state);
 
@@ -590,6 +591,43 @@ async fn post_clip_layout(
 
     store.save(&project).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     drop(store);
+    emit_updated(&app, &session_id, &project);
+    Ok(Json(project))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipEffectsBody {
+    track_id: String,
+    clip_id: String,
+    #[serde(default)]
+    fade_in_seconds: Option<f32>,
+    #[serde(default)]
+    fade_out_seconds: Option<f32>,
+    #[serde(default)]
+    speed_factor: Option<f32>,
+}
+
+/// Apply fade-in / fade-out / speed to a video clip (re-encodes it in place). Lets the
+/// agent do a simple "fade in 2s, fade out 10s" without a full multicam re-edit.
+async fn post_clip_effects(
+    AxumState(state): AxumState<ControlState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+    Json(body): Json<ClipEffectsBody>,
+) -> CtlResult<MixProject> {
+    check_auth(&state, &headers)?;
+    let app = state.app.clone();
+    let project = crate::commands::apply_video_effects(
+        &app,
+        &session_id,
+        &body.track_id,
+        &body.clip_id,
+        body.fade_in_seconds,
+        body.fade_out_seconds,
+        body.speed_factor,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     emit_updated(&app, &session_id, &project);
     Ok(Json(project))
 }

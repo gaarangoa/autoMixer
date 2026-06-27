@@ -280,6 +280,36 @@ def set_clip_layout(
 
 
 @mcp.tool()
+def apply_video_effects(
+    session_id: str,
+    track_id: str,
+    clip_id: str,
+    fade_in_seconds: float | None = None,
+    fade_out_seconds: float | None = None,
+    speed_factor: float | None = None,
+) -> dict:
+    """Apply a fade-in, fade-out, and/or speed change to a video clip — the simple way.
+    This is what you use for requests like "fade in 2 seconds and fade out 10 seconds"
+    or "make it half speed". It re-encodes the clip's video in place (fast — no multicam
+    re-edit, no model calls) and is reversible. Get track_id + clip_id from get_session
+    (video tracks list their clips); for the agent's rendered output use the
+    "Agent video edit" track's clip. fade_in_seconds / fade_out_seconds are 0-10;
+    speed_factor is 0.25-4 (1 = normal, 0.5 = half speed, 2 = 2x). Pass only what you
+    want to change. Re-applies from the original each time, so changing the fade values
+    doesn't stack. (Do NOT try to fake a video fade with audio gain/automation — use
+    this.)"""
+    fields = {
+        "trackId": track_id,
+        "clipId": clip_id,
+        "fadeInSeconds": fade_in_seconds,
+        "fadeOutSeconds": fade_out_seconds,
+        "speedFactor": speed_factor,
+    }
+    body = {k: v for k, v in fields.items() if v is not None}
+    return _request("POST", f"/control/session/{session_id}/clip-effects", body, timeout=600)
+
+
+@mcp.tool()
 def auto_crop(session_id: str, track_id: str, clip_id: str, instructions: str = "") -> dict:
     """Let the video model LOOK at a frame of the clip and auto-crop it to satisfy
     `instructions` (e.g. 'keep the singer centered', 'reframe to portrait', 'tighten

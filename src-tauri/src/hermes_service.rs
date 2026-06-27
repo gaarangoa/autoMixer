@@ -104,6 +104,10 @@ impl HermesService {
                 .arg(port.to_string())
                 // The sidecar uses uv to spawn the automixer-mcp server.
                 .env("AUTOMIXER_UV", uv_path())
+                // Point the embedded Hermes agent at AutoMixer's dedicated home
+                // (isolated config + no shared skills). The sidecar forwards this to
+                // the `hermes acp` process it spawns.
+                .env("HERMES_HOME", bootstrap_hermes_home())
                 .stdout(stdout_target)
                 .stderr(stderr_target)
                 .spawn()
@@ -278,6 +282,45 @@ fn uv_path() -> PathBuf {
 
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// AutoMixer's DEDICATED Hermes home — its own config + memory + EMPTY skill dirs,
+/// kept under `~/.automixer/` so the agent (a) doesn't inherit the user's global
+/// `~/.hermes` skills catalog (which bloats the prompt and slows every turn) and
+/// (b) never disturbs the standalone Hermes desktop app that shares `~/.hermes`.
+pub fn automixer_hermes_home() -> PathBuf {
+    dirs_home()
+        .map(|h| h.join(".automixer/hermes-home"))
+        .unwrap_or_else(|| PathBuf::from(".automixer/hermes-home"))
+}
+
+/// Ensure the dedicated home exists with a usable config + empty skill dirs. On first
+/// run we seed `config.yaml` from the user's `~/.hermes` (so the working model + the
+/// automixer MCP registration carry over); afterwards it's fully independent — model
+/// changes from Settings write here, not to the shared home.
+pub fn bootstrap_hermes_home() -> PathBuf {
+    let home = automixer_hermes_home();
+    let _ = std::fs::create_dir_all(home.join("skills"));
+    let _ = std::fs::create_dir_all(home.join("optional-skills"));
+    let cfg = home.join("config.yaml");
+    if !cfg.exists() {
+        if let Some(shared) = dirs_home().map(|h| h.join(".hermes/config.yaml")) {
+            if shared.exists() {
+                let _ = std::fs::copy(&shared, &cfg);
+            }
+        }
+        // Carry over secrets (.env) if the model endpoint needs an API key; harmless
+        // for local no-auth servers.
+        if let (Some(src), Some(dst)) = (
+            dirs_home().map(|h| h.join(".hermes/.env")),
+            Some(home.join(".env")),
+        ) {
+            if src.exists() && !dst.exists() {
+                let _ = std::fs::copy(&src, &dst);
+            }
+        }
+    }
+    home
 }
 
 fn log_path() -> Option<PathBuf> {

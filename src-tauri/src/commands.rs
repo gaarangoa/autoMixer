@@ -684,7 +684,9 @@ fn hermes_bin() -> PathBuf {
 /// the chat agent and the auto-mix pipeline both use it, so there's only ever one.
 fn read_hermes_model() -> HermesModel {
     let (mut base_url, mut model, mut provider) = (String::new(), String::new(), String::new());
-    if let Some(path) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".hermes/config.yaml")) {
+    // Read AutoMixer's DEDICATED Hermes home (isolated config), not the shared ~/.hermes.
+    {
+        let path = crate::hermes_service::automixer_hermes_home().join("config.yaml");
         if let Ok(text) = std::fs::read_to_string(&path) {
             let mut in_model = false;
             for line in text.lines() {
@@ -773,8 +775,12 @@ pub async fn set_hermes_model(
     model: String,
 ) -> Result<(), String> {
     let hermes = hermes_bin();
+    // Write to AutoMixer's DEDICATED Hermes home (HERMES_HOME), so model changes land in
+    // the isolated config and never touch the shared ~/.hermes / desktop app.
+    let home = crate::hermes_service::bootstrap_hermes_home();
     let set = |key: &str, value: &str| -> Result<(), String> {
         let output = Command::new(&hermes)
+            .env("HERMES_HOME", &home)
             .arg("config")
             .arg("set")
             .arg(key)
@@ -1024,6 +1030,78 @@ pub async fn auto_crop_clip(
     let inverse = vec![crate::model::JsonPatchOp { op: "replace".into(), path, value: Some(serde_json::to_value(&old_layout).map_err(|e| e.to_string())?) }];
     crate::actions::record_patch(&mut project, forward, inverse, crate::model::HistorySource::Assistant, Some("Auto-crop".to_string()))?;
     app.state::<AppState>().store.lock().map_err(|e| e.to_string())?.save(&project)?;
+    Ok(project)
+}
+
+/// Apply fade-in / fade-out / playback-speed to an existing video clip by re-encoding
+/// its rendered video with the ffmpeg fade/setpts filter and swapping the clip's source
+/// in place. Fast (one ffmpeg pass) — so a simple "fade in 2s, fade out 10s" doesn't
+/// need a full multicam re-edit. Re-encodes from the PRISTINE source when one exists, so
+/// changing the fade values re-renders from the original instead of stacking effects.
+/// Shared by the `apply_video_effects` control endpoint / agent tool.
+pub fn apply_video_effects(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    track_id: &str,
+    clip_id: &str,
+    fade_in_seconds: Option<f32>,
+    fade_out_seconds: Option<f32>,
+    speed_factor: Option<f32>,
+) -> Result<MixProject, String> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let project = state.store.lock().map_err(|e| e.to_string())?.get_project(session_id)?;
+
+    // Resolve the clip's source video (pristine when available) + its region length.
+    let (source_path, region_seconds) = {
+        let track = project.session.tracks.iter().find(|t| t.id == track_id).ok_or("Track not found")?;
+        if !matches!(track.kind, crate::model::TrackKind::Video) {
+            return Err("That track is not a video track.".into());
+        }
+        let clip = track.video_clips.iter().find(|c| c.id == clip_id).ok_or("Clip not found on the track")?;
+        let source_id = clip.pristine_video_source_file_id.as_ref().unwrap_or(&clip.video_source_file_id);
+        let source = project.session.video_source_files.iter().find(|s| &s.id == source_id)
+            .ok_or("The clip's source video file is missing")?;
+        let region = clip.end_sample.saturating_sub(clip.start_sample) as f64 / project.session.sample_rate as f64;
+        (PathBuf::from(&source.path), region)
+    };
+    if !source_path.exists() {
+        return Err("The clip's video file is missing on disk.".into());
+    }
+
+    let effects = AgentVideoEffects { reason: None, fade_in_seconds, fade_out_seconds, speed_factor };
+    // Total duration for fade-out placement: probe the actual source, fall back to the
+    // clip region length.
+    let total_s = probe_video_duration(&source_path).unwrap_or(region_seconds).max(0.05);
+    let (video_chain, audio_chain, _speed) = build_effects_filters(&effects, total_s);
+    if video_chain.is_none() && audio_chain.is_none() {
+        return Err("Nothing to apply — set a fade-in, fade-out, or speed.".into());
+    }
+
+    let renders_dir = state.store.lock().map_err(|e| e.to_string())?.renders_dir();
+    fs::create_dir_all(&renders_dir).map_err(|e| e.to_string())?;
+    let out_path = renders_dir.join(format!("fx-{}.mp4", uuid::Uuid::new_v4()));
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error").arg("-i").arg(&source_path);
+    if let Some(v) = video_chain.as_ref() { cmd.arg("-vf").arg(v); }
+    if let Some(a) = audio_chain.as_ref() { cmd.arg("-af").arg(a); }
+    cmd.arg("-c:v").arg("libx264").arg("-preset").arg("medium").arg("-crf").arg("18")
+        .arg("-pix_fmt").arg("yuv420p").arg("-movflags").arg("+faststart")
+        .arg("-c:a").arg("aac").arg("-b:a").arg("256k");
+    let output = cmd.arg(&out_path).output().map_err(|e| format!("Could not run ffmpeg: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg effects render failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+
+    let new_duration_ms = (probe_video_duration(&out_path).unwrap_or(total_s) * 1000.0).round() as u64;
+    let project = state.store.lock().map_err(|e| e.to_string())?
+        .replace_track_video(session_id, track_id, clip_id, &out_path, new_duration_ms)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        let _ = audio.bind_session_sources(&project.session);
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    let _ = app.emit("session:externally-updated", serde_json::json!({ "sessionId": session_id, "project": project }));
     Ok(project)
 }
 
