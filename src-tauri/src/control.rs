@@ -91,7 +91,9 @@ struct ControlState {
 
 #[derive(Deserialize)]
 struct ActionsBody {
-    actions: Vec<MixAction>,
+    // Raw values so we can parse each action individually and report a precise error
+    // (which action, what's wrong) instead of a bare 422 for the whole batch.
+    actions: Vec<serde_json::Value>,
     #[serde(default)]
     explanation: Option<String>,
 }
@@ -225,10 +227,25 @@ async fn post_actions(
 ) -> CtlResult<MixProject> {
     check_auth(&state, &headers)?;
     let app_state = state.app.state::<AppState>();
+    // Parse each action on its own so a single malformed one yields an actionable error
+    // ("action 9 (set_compressor): missing field `releaseMs`") rather than a bare 422.
+    let mut actions: Vec<MixAction> = Vec::with_capacity(body.actions.len());
+    for (i, raw) in body.actions.iter().enumerate() {
+        let tool = raw.get("tool").and_then(|t| t.as_str()).unwrap_or("(no tool)");
+        match serde_json::from_value::<MixAction>(raw.clone()) {
+            Ok(action) => actions.push(action),
+            Err(error) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("action {} ({}): {}", i + 1, tool, error),
+                ));
+            }
+        }
+    }
     let project = apply_and_sync(
         app_state.inner(),
         &session_id,
-        &body.actions,
+        &actions,
         HistorySource::Assistant,
         body.explanation,
     )

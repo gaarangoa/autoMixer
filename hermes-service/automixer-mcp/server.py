@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -43,8 +44,18 @@ def _request(method: str, path: str, body: dict | None = None, timeout: float = 
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        # Surface the server's error BODY (e.g. "action 9 (set_compressor): missing field
+        # `releaseMs`") so the agent can fix it, instead of a bare "HTTP Error 400".
+        detail = ""
+        try:
+            detail = exc.read().decode().strip()
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"{exc.code} {exc.reason}: {detail}" if detail else f"{exc.code} {exc.reason}") from None
 
 
 def _track_summary(project: dict) -> list[dict]:
@@ -137,8 +148,10 @@ def apply_actions(session_id: str, actions: list[dict], explanation: str = "") -
     snake_case `tool` discriminator and camelCase fields; trackIds/regionIds come from
     get_session. Combine many in one call; all changes are reversible via undo.
 
-    See the **audio-mixing** skill for the full action vocabulary (exact field names and
-    ranges) and how to approach a mix — read it before doing non-trivial audio work."""
+    A real mix is PROCESSING, not just faders: for a "professional / clear / punchy / make
+    it sit / cut through" request, use set_eq_band + set_compressor + high-pass + sends —
+    NOT gain alone. For a whole-mix request, consider auto_mix. ALWAYS read the
+    **audio-mixing** skill first for the vocabulary and the doctrine."""
     project = _request(
         "POST",
         f"/control/session/{session_id}/actions",

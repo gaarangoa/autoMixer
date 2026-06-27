@@ -44,27 +44,52 @@ change is reversible with `undo`.
 All numeric values are clamped server-side, so a slightly-out-of-range value is
 corrected rather than rejected — but stay within the noted ranges.
 
-## How to approach a mix (doctrine)
+## CRITICAL: mixing is PROCESSING, not just faders
 
-Work in this order; make **small, reversible** moves and re-check `get_session` between
-passes.
+Changing volumes is **not a mix**. If the user asks for a "professional", "clear",
+"punchy", "djent/metal", "radio-ready" sound, or for something to "sit in" / "cut
+through" / "stand out" — gain alone will NOT achieve it, and a gain-only answer is wrong.
+A real engineer reaches for **high-pass, EQ, compression, and sends**, then sets levels.
+So:
 
-1. **Balance first.** Set rough static gains so every part is audible. Lead vocal and
-   the main rhythmic element sit forward; pads/ambience sit back. Don't reach for EQ to
-   fix a level problem — fix the fader.
-2. **Clean up.** High-pass non-bass tracks (vocals ~80–100 Hz, guitars ~90 Hz, overheads
-   ~120 Hz) to clear low-end mud. Leave kick and bass full-range.
-3. **Subtractive EQ before boosts.** Cut problem frequencies (boxiness ~300–500 Hz,
-   harshness ~2.5–4 kHz) before adding anything. Narrow Q for cuts, wider Q for tone.
-4. **Control dynamics.** Compress only what needs it (vocals, bass). Gentle ratios
-   (2:1–4:1), moderate attack (10–30 ms) to keep transients, release that breathes with
-   the tempo. Add a little makeup to match the pre-compression level.
-5. **Space & depth.** Use reverb/delay sends, not inserts, so tracks share a space.
-   Lead vocal a touch drier and forward; backgrounds wetter and back.
-6. **Pan for width.** Keep kick/bass/lead-vocal centered; spread doubles, guitars, and
-   percussion left/right for a wide, balanced image.
-7. **Master last.** Set master gain for healthy headroom (leave room before 0 dBFS).
-   Never make something louder just to "win" a comparison.
+- **To make a part CLEAR or sit on top:** don't just turn it up. Carve a frequency
+  *pocket* — `set_eq_band` a gentle CUT in the competing parts around the lead's core
+  range, and/or a small presence BOOST on the lead (~2.5–5 kHz). Add `set_compressor` to
+  control its dynamics so it stays present, not just loud.
+- **To make drums/bass PUNCHY:** `set_compressor` on them (snappy attack to keep the
+  transient, makeup to restore level), tighten the low end with `set_high_pass` on
+  everything that isn't kick/bass.
+- **To give DEPTH/space:** `set_reverb_send` / `set_delay_send` — leads drier/forward,
+  backgrounds wetter/back.
+- **Whole-mix request** ("mix this", "make it sound good/professional", "auto-mix"):
+  strongly consider running **`auto_mix`** (see the auto-mix skill) — it applies the full
+  chain (cleanup filters, subtractive EQ, compression, tonal shaping, depth/space,
+  section automation, master) across all tracks. Then refine specifics (e.g. feature a
+  solo) with targeted `apply_actions` moves. Do NOT hand-apply 6 gain changes and call it
+  a professional mix.
+
+Use the full vocabulary above. After a request like this, your applied actions should
+include EQ and/or compression and/or sends — not only `set_track_gain`.
+
+## Order of operations (for a manual mix)
+
+Make **small, reversible** moves; re-check `get_session` between passes.
+
+1. **Clean up.** High-pass non-bass tracks (vocals ~80–100 Hz, guitars ~90 Hz, overheads
+   ~120 Hz). Leave kick and bass full-range.
+2. **Subtractive EQ before boosts.** Cut problems (boxiness ~300–500 Hz, harshness
+   ~2.5–4 kHz) before adding. Narrow Q for cuts, wider Q for tone. Carve pockets so parts
+   don't fight (e.g. dip the rhythm guitars where the solo or vocal lives).
+3. **Control dynamics.** `set_compressor` where it helps (vocals, bass, drums, a featured
+   lead). Ratios 2:1–4:1, attack 10–30 ms to keep transients, tempo-aware release, a
+   little makeup. Snappier attack on drums for punch.
+4. **Balance levels.** Set gains so every part sits right — *after* the processing above,
+   not instead of it.
+5. **Space & depth.** Reverb/delay **sends**, not inserts — leads drier/forward,
+   backgrounds wetter/back.
+6. **Pan for width.** Keep kick/bass/lead centered; spread doubles, guitars, percussion.
+7. **Master last.** Healthy headroom (room before 0 dBFS). Never just turn things up to
+   "win" a comparison.
 
 ## Roles
 Set `set_track_role` so the mix understands intent. Useful roles: `lead_vocal`,

@@ -521,6 +521,18 @@ pub struct MixProject {
     pub chat_messages: Vec<Value>,
 }
 
+// Musical defaults for optional processor params, so the agent can specify just the
+// intent (e.g. threshold + ratio) and a partial action still deserializes & applies
+// instead of failing the whole batch with a 422.
+fn default_slope_db_oct() -> u16 { 12 }
+fn default_q() -> f32 { 1.0 }
+fn default_threshold_db() -> f32 { -18.0 }
+fn default_ratio() -> f32 { 3.0 }
+fn default_attack_ms() -> f32 { 15.0 }
+fn default_release_ms() -> f32 { 150.0 }
+fn default_knee_db() -> f32 { 6.0 }
+fn default_makeup_db() -> f32 { 0.0 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum MixAction {
@@ -546,7 +558,7 @@ pub enum MixAction {
             alias = "hz"
         )]
         frequency_hz: f32,
-        #[serde(alias = "slope", alias = "slope_db_oct", alias = "slopeDbPerOctave", alias = "slopeDbOctave")]
+        #[serde(default = "default_slope_db_oct", alias = "slope", alias = "slope_db_oct", alias = "slopeDbPerOctave", alias = "slopeDbOctave")]
         slope_db_oct: u16,
     },
     SetLowPass {
@@ -561,7 +573,7 @@ pub enum MixAction {
             alias = "hz"
         )]
         frequency_hz: f32,
-        #[serde(alias = "slope", alias = "slope_db_oct", alias = "slopeDbPerOctave", alias = "slopeDbOctave")]
+        #[serde(default = "default_slope_db_oct", alias = "slope", alias = "slope_db_oct", alias = "slopeDbPerOctave", alias = "slopeDbOctave")]
         slope_db_oct: u16,
     },
     SetEqBand {
@@ -579,15 +591,24 @@ pub enum MixAction {
         frequency_hz: f32,
         #[serde(alias = "gain", alias = "gain_db", alias = "db")]
         gain_db: f32,
+        #[serde(default = "default_q")]
         q: f32,
     },
+    // Only track_id + threshold + ratio carry intent; the rest default to musical values
+    // so a partial compressor (or a bare "add compression") still applies cleanly.
     SetCompressor {
         track_id: Id,
+        #[serde(default = "default_threshold_db")]
         threshold_db: f32,
+        #[serde(default = "default_ratio")]
         ratio: f32,
+        #[serde(default = "default_attack_ms")]
         attack_ms: f32,
+        #[serde(default = "default_release_ms")]
         release_ms: f32,
+        #[serde(default = "default_knee_db")]
         knee_db: f32,
+        #[serde(default = "default_makeup_db")]
         makeup_db: f32,
     },
     SetReverbSend { track_id: Id, level_db: f32 },

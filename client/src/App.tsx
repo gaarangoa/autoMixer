@@ -290,8 +290,11 @@ export function App() {
   useEffect(() => {
     const node = chatLogRef.current;
     if (!node) return;
-    node.scrollTop = node.scrollHeight;
-  }, [messages.length, busy]);
+    // Follow the bottom as reasoning/response stream in — but only if the user is already
+    // near the bottom, so scrolling up to read isn't yanked back down.
+    const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 120;
+    if (nearBottom) node.scrollTop = node.scrollHeight;
+  }, [messages.length, busy, streamingTurn?.text, reasoning]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2866,8 +2869,7 @@ export function App() {
       const endSample = exportRegion ? Math.round(exportRegion.end * session.sampleRate) : undefined;
       const trackIds = exportAudioTrackIds.length > 0 ? exportAudioTrackIds : undefined;
       const res = await api.renderMix(session.id, outputPath, startSample, endSample, trackIds, ext);
-      const scope = `${trackIds ? `${trackIds.length} track${trackIds.length === 1 ? "" : "s"} (stems)` : "full mix"}${exportRegion ? `, ${formatTime(exportRegion.start)}–${formatTime(exportRegion.end)}` : ""}`;
-      setMessages((items) => [...items, { role: "system", text: `Exported ${ext.toUpperCase()} (${scope}) → ${res.path}` }]);
+      // No chat/export log — just a brief success toast.
       pushToast("success", `Exported ${ext.toUpperCase()} to ${res.path}`);
     } catch (error) {
       pushSystem(error);
@@ -4518,7 +4520,11 @@ export function App() {
                     </div>
                   ) : null}
 
-                  {streamingTurn?.text ? <pre className="streaming-text">{streamingTurn.text}</pre> : null}
+                  {streamingTurn?.text ? (
+                    <div className="streaming-md turn-prose markdown-body">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{streamingTurn.text}</ReactMarkdown>
+                    </div>
+                  ) : null}
 
                   {autoMixRunning && autoMixStages.length > 0 ? (
                     <div className="activity-stages">
