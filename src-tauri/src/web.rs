@@ -139,12 +139,12 @@ async fn get_skill_catalog() -> Json<SkillCatalog> {
 
 async fn list_sessions(State(state): State<WebState>) -> WebResult<Vec<MixSession>> {
     let store = state.store.lock().map_err(|item| error(item.to_string()))?;
-    store.list_sessions().map(Json).map_err(error)
+    store.list_all_sessions().map(Json).map_err(error)
 }
 
 async fn create_session(State(state): State<WebState>, Json(body): Json<CreateSessionBody>) -> WebResult<MixProject> {
     let store = state.store.lock().map_err(|item| error(item.to_string()))?;
-    store.create_session(body.name.unwrap_or_else(|| "Untitled mix".to_string())).map(Json).map_err(error)
+    store.create_session_default(body.name.unwrap_or_else(|| "Untitled mix".to_string())).map(Json).map_err(error)
 }
 
 async fn get_project(State(state): State<WebState>, AxumPath(session_id): AxumPath<String>) -> WebResult<MixProject> {

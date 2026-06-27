@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog, VideoFilterPreset } from "../../shared/types";
+import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixAlbum, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog, VideoFilterPreset } from "../../shared/types";
 
 function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {
@@ -31,8 +31,15 @@ export const api = {
   inputDevices: () => tauriInvoke<{ devices: string[] }>("list_input_devices"),
   inputDeviceChannelCount: (inputDevice?: string) => tauriInvoke<number>("list_input_device_channels", { inputDevice }),
   skills: () => tauriInvoke<SkillCatalog>("get_skill_catalog"),
-  sessions: () => tauriInvoke<MixSession[]>("list_sessions"),
-  createSession: (name: string) => tauriInvoke<MixProject>("create_session", { name }),
+  sessions: (albumId: string) => tauriInvoke<MixSession[]>("list_sessions", { albumId }),
+  createSession: (albumId: string, name: string) => tauriInvoke<MixProject>("create_session", { albumId, name }),
+  albums: () => tauriInvoke<MixAlbum[]>("list_albums"),
+  createAlbum: (name: string) => tauriInvoke<MixAlbum>("create_album", { name }),
+  getAlbum: (albumId: string) => tauriInvoke<MixAlbum>("get_album", { albumId }),
+  renameAlbum: (albumId: string, name: string) => tauriInvoke<MixAlbum>("rename_album", { albumId, name }),
+  deleteAlbum: (albumId: string) => tauriInvoke<void>("delete_album", { albumId }),
+  setFileMenu: (albums: { id: string; name: string }[], sessions: { id: string; name: string }[], currentAlbumId: string, currentSessionId: string) =>
+    tauriInvoke<void>("set_file_menu", { albums, sessions, currentAlbumId, currentSessionId }),
   getSession: (id: string) => tauriInvoke<MixProject>("get_project", { sessionId: id }),
   importFiles: (sessionId: string, paths: string[]) => tauriInvoke<MixProject>("import_audio_files", { sessionId, paths }),
   createRecordingTrack: (sessionId: string, channels: 1 | 2 = 1) => tauriInvoke<MixProject>("create_recording_track", { sessionId, channels }),

@@ -50,9 +50,9 @@ export function whiteBalanceStyle(g: Grade): CSSProperties | null {
   // temp: warm(+) = orange (R↑ B↓), cool(−) = blue (R↓ B↑).
   // tint: magenta(+) = R↑ B↑ G↓, green(−) = G↑ R↓ B↓.
   const cl = (x: number) => Math.round(Math.max(0, Math.min(255, x)));
-  const r = cl(128 + temp * 80 + tint * 40);
-  const gr = cl(128 - tint * 55);
-  const b = cl(128 - temp * 80 + tint * 40);
+  const r = cl(128 + temp * 110 + tint * 60);
+  const gr = cl(128 - tint * 75);
+  const b = cl(128 - temp * 110 + tint * 60);
   const strength = Math.min(1, Math.abs(temp) + Math.abs(tint));
   return {
     position: "absolute",
@@ -60,7 +60,7 @@ export function whiteBalanceStyle(g: Grade): CSSProperties | null {
     pointerEvents: "none",
     backgroundColor: `rgb(${r}, ${gr}, ${b})`,
     mixBlendMode: "soft-light",
-    opacity: strength * 0.75,
+    opacity: Math.min(0.9, strength * 1.5),
   };
 }
 

@@ -250,9 +250,16 @@ export type Bus = {
   gainDb: number;
 };
 
+export type MixAlbum = {
+  id: Id;
+  name: string;
+  songOrder: Id[];
+};
+
 export type MixSession = {
   id: Id;
   name: string;
+  albumId?: Id;
   sampleRate: number;
   bpm?: number;
   sourceFiles: SourceFile[];

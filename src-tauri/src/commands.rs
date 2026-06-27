@@ -331,13 +331,64 @@ pub fn list_input_device_channels(input_device: Option<String>) -> Result<u32, S
 }
 
 #[tauri::command]
-pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<MixSession>, String> {
-    state.store.lock().map_err(|error| error.to_string())?.list_sessions()
+pub fn list_sessions(state: State<'_, AppState>, album_id: String) -> Result<Vec<MixSession>, String> {
+    state.store.lock().map_err(|error| error.to_string())?.list_sessions(&album_id)
 }
 
 #[tauri::command]
-pub fn create_session(state: State<'_, AppState>, name: String) -> Result<MixProject, String> {
-    state.store.lock().map_err(|error| error.to_string())?.create_session(name)
+pub fn create_session(state: State<'_, AppState>, album_id: String, name: String) -> Result<MixProject, String> {
+    state.store.lock().map_err(|error| error.to_string())?.create_session(&album_id, name)
+}
+
+// ---- Native menu (File submenu with album/song switching) ----
+
+#[derive(serde::Deserialize)]
+pub struct MenuEntry {
+    pub id: String,
+    pub name: String,
+}
+
+#[tauri::command]
+pub fn set_file_menu(
+    app: AppHandle,
+    albums: Vec<MenuEntry>,
+    sessions: Vec<MenuEntry>,
+    current_album_id: String,
+    current_session_id: String,
+) -> Result<(), String> {
+    // Menu mutation must run on the main thread (macOS).
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = crate::build_and_set_menu(&handle, &albums, &sessions, &current_album_id, &current_session_id);
+    })
+    .map_err(|error| error.to_string())
+}
+
+// ---- Albums (projects) ----
+
+#[tauri::command]
+pub fn list_albums(state: State<'_, AppState>) -> Result<Vec<crate::model::MixAlbum>, String> {
+    state.store.lock().map_err(|error| error.to_string())?.list_albums()
+}
+
+#[tauri::command]
+pub fn create_album(state: State<'_, AppState>, name: String) -> Result<crate::model::MixAlbum, String> {
+    state.store.lock().map_err(|error| error.to_string())?.create_album(name)
+}
+
+#[tauri::command]
+pub fn get_album(state: State<'_, AppState>, album_id: String) -> Result<crate::model::MixAlbum, String> {
+    state.store.lock().map_err(|error| error.to_string())?.get_album(&album_id)
+}
+
+#[tauri::command]
+pub fn rename_album(state: State<'_, AppState>, album_id: String, name: String) -> Result<crate::model::MixAlbum, String> {
+    state.store.lock().map_err(|error| error.to_string())?.rename_album(&album_id, name)
+}
+
+#[tauri::command]
+pub fn delete_album(state: State<'_, AppState>, album_id: String) -> Result<(), String> {
+    state.store.lock().map_err(|error| error.to_string())?.delete_album(&album_id)
 }
 
 #[tauri::command]
@@ -745,6 +796,13 @@ pub async fn set_hermes_model(
         .hermes_service
         .wait_ready(std::time::Duration::from_secs(30))
         .await;
+    // Re-warm the new model in the background (the restart dropped the prior warm-up),
+    // so the user's first turn on the freshly-set model reuses a cached system prompt
+    // instead of paying the ~40s cold prefill.
+    let hermes_for_warm = state.hermes_service.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = hermes_for_warm.warmup().await;
+    });
     Ok(())
 }
 
@@ -1936,7 +1994,8 @@ fn export_target_box(src_w: i32, src_h: i32, aspect: &str, max_dim: Option<u32>)
 /// - `mode`: "fit" letterbox/pad (show everything) or "fill" cover/crop (fill the frame).
 /// Always re-encodes at high quality (slow/CRF 17, AAC 320k).
 #[tauri::command]
-pub fn export_video(
+pub async fn export_video(
+    app: AppHandle,
     source_path: String,
     output_path: String,
     aspect: String,
@@ -1951,22 +2010,55 @@ pub fn export_video(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    // Run the (blocking) encode off the main thread so the UI stays responsive,
+    // and stream ffmpeg's progress out as `video-export:progress` events.
+    tokio::task::spawn_blocking(move || run_export_blocking(app, source, path, aspect, max_dimension, mode))
+        .await
+        .map_err(|error| format!("export task failed: {error}"))?
+}
+
+/// Total duration in seconds via ffprobe (None if unavailable → indeterminate progress).
+fn probe_video_duration(path: &Path) -> Option<f64> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok()
+}
+
+fn run_export_blocking(
+    app: AppHandle,
+    source: PathBuf,
+    path: PathBuf,
+    aspect: String,
+    max_dimension: Option<u32>,
+    mode: Option<String>,
+) -> Result<RenderResponse, String> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
     let (src_w, src_h) = probe_video_dimensions(&source)?;
     let (t_w, t_h) = export_target_box(src_w as i32, src_h as i32, &aspect, max_dimension);
+    let total_secs = probe_video_duration(&source).unwrap_or(0.0);
 
     // "fill" scales to cover the box then center-crops; "fit" scales to fit then pads.
     let fill = mode.as_deref() == Some("fill");
     let filter = if fill {
-        format!(
-            "scale={t_w}:{t_h}:force_original_aspect_ratio=increase,crop={t_w}:{t_h},setsar=1,format=yuv420p"
-        )
+        format!("scale={t_w}:{t_h}:force_original_aspect_ratio=increase,crop={t_w}:{t_h},setsar=1,format=yuv420p")
     } else {
-        format!(
-            "scale={t_w}:{t_h}:force_original_aspect_ratio=decrease,pad={t_w}:{t_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p"
-        )
+        format!("scale={t_w}:{t_h}:force_original_aspect_ratio=decrease,pad={t_w}:{t_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p")
     };
 
-    let output = Command::new("ffmpeg")
+    let emit = |percent: f64, stage: &str| {
+        let _ = app.emit("video-export:progress", serde_json::json!({ "percent": percent, "stage": stage }));
+    };
+    emit(0.0, "start");
+
+    let mut child = Command::new("ffmpeg")
         .arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
         .arg("-i").arg(&source)
         .arg("-vf").arg(&filter)
@@ -1976,15 +2068,43 @@ pub fn export_video(
         .arg("-pix_fmt").arg("yuv420p")
         .arg("-movflags").arg("+faststart")
         .arg("-c:a").arg("aac").arg("-b:a").arg("320k")
+        .arg("-progress").arg("pipe:1").arg("-nostats")
         .arg(&path)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "ffmpeg export failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            // ffmpeg progress emits out_time_us / out_time_ms (both microseconds).
+            let micros = line
+                .strip_prefix("out_time_us=")
+                .or_else(|| line.strip_prefix("out_time_ms="));
+            if let Some(v) = micros {
+                if let Ok(us) = v.trim().parse::<i64>() {
+                    if total_secs > 0.0 {
+                        let pct = (us as f64 / 1_000_000.0 / total_secs * 100.0).clamp(0.0, 99.0);
+                        emit(pct, "encoding");
+                    }
+                }
+            } else if line == "progress=end" {
+                emit(99.0, "finishing");
+            }
+        }
     }
+
+    let status = child.wait().map_err(|error| format!("ffmpeg wait failed: {error}"))?;
+    if !status.success() {
+        let mut err = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut err);
+        }
+        emit(0.0, "error");
+        return Err(format!("ffmpeg export failed: {}", err.trim()));
+    }
+    emit(100.0, "done");
     Ok(RenderResponse { path: path.to_string_lossy().to_string() })
 }
 

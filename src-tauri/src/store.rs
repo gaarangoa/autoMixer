@@ -9,7 +9,7 @@ use crate::{
     actions::record_patch,
     defaults::{default_master, make_track},
     engine::source::{import_to_session_rate, write_to_cache, ImportedAudio},
-    model::{ClipRegion, HistorySource, JsonPatchOp, MixProject, MixSession, SourceFile, TrackAnalysis, TrackKind, VideoClipRegion, VideoLayout, VideoSourceFile},
+    model::{ClipRegion, HistorySource, JsonPatchOp, MixAlbum, MixProject, MixSession, SourceFile, TrackAnalysis, TrackKind, VideoClipRegion, VideoLayout, VideoSourceFile},
 };
 
 pub struct SessionStore {
@@ -20,11 +20,12 @@ impl SessionStore {
     pub fn new(data_dir: PathBuf) -> Self {
         let store = Self { data_dir };
         let _ = store.init();
+        let _ = store.migrate_legacy_sessions();
         store
     }
 
     pub fn init(&self) -> Result<(), String> {
-        fs::create_dir_all(self.sessions_dir()).map_err(|error| error.to_string())?;
+        fs::create_dir_all(self.albums_dir()).map_err(|error| error.to_string())?;
         fs::create_dir_all(self.sources_dir()).map_err(|error| error.to_string())?;
         fs::create_dir_all(self.peaks_dir()).map_err(|error| error.to_string())?;
         fs::create_dir_all(self.videos_dir()).map_err(|error| error.to_string())?;
@@ -32,11 +33,12 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn create_session(&self, name: String) -> Result<MixProject, String> {
+    pub fn create_session(&self, album_id: &str, name: String) -> Result<MixProject, String> {
         self.init()?;
         let session = MixSession {
             id: Uuid::new_v4().to_string(),
             name,
+            album_id: album_id.to_string(),
             sample_rate: 48000,
             bpm: None,
             source_files: Vec::new(),
@@ -52,37 +54,213 @@ impl SessionStore {
         };
         let project = MixProject { session, history: Vec::new(), redo_stack: Vec::new(), chat_messages: Vec::new() };
         self.save(&project)?;
+        self.add_song_to_album(album_id, &project.session.id)?;
         Ok(project)
     }
 
-    pub fn list_sessions(&self) -> Result<Vec<MixSession>, String> {
+    /// Every song across all albums (used by the headless web/agent surface).
+    pub fn list_all_sessions(&self) -> Result<Vec<MixSession>, String> {
         self.init()?;
-        let mut sessions = Vec::new();
-        for entry in fs::read_dir(self.sessions_dir()).map_err(|error| error.to_string())? {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            if path.extension().and_then(|item| item.to_str()) != Some("json") {
-                continue;
-            }
-            let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
-            let project: MixProject = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-            sessions.push(project.session);
+        let mut out = Vec::new();
+        for album in self.list_albums()? {
+            out.extend(self.list_sessions(&album.id)?);
         }
-        sessions.sort_by(|a, b| a.name.cmp(&b.name));
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Create a song in the default album (for callers without an album context).
+    pub fn create_session_default(&self, name: String) -> Result<MixProject, String> {
+        let album_id = self.default_album_id()?;
+        self.create_session(&album_id, name)
+    }
+
+    /// List the songs (sessions) in one album, in the album's stored order.
+    pub fn list_sessions(&self, album_id: &str) -> Result<Vec<MixSession>, String> {
+        self.init()?;
+        let album = self.get_album(album_id)?;
+        let songs_dir = self.album_dir(album_id).join("songs");
+        let mut by_id: std::collections::HashMap<String, MixSession> = std::collections::HashMap::new();
+        if songs_dir.is_dir() {
+            for entry in fs::read_dir(&songs_dir).map_err(|error| error.to_string())? {
+                let path = entry.map_err(|error| error.to_string())?.path();
+                if path.extension().and_then(|item| item.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(raw) = fs::read_to_string(&path) {
+                    if let Ok(project) = serde_json::from_str::<MixProject>(&raw) {
+                        by_id.insert(project.session.id.clone(), project.session);
+                    }
+                }
+            }
+        }
+        // Ordered by song_order first, then any stragglers by name.
+        let mut sessions: Vec<MixSession> = Vec::new();
+        for id in &album.song_order {
+            if let Some(s) = by_id.remove(id) {
+                sessions.push(s);
+            }
+        }
+        let mut rest: Vec<MixSession> = by_id.into_values().collect();
+        rest.sort_by(|a, b| a.name.cmp(&b.name));
+        sessions.extend(rest);
         Ok(sessions)
     }
 
     pub fn get_project(&self, session_id: &str) -> Result<MixProject, String> {
         self.init()?;
-        let path = self.sessions_dir().join(format!("{session_id}.json"));
+        let path = self
+            .locate_session_file(session_id)
+            .ok_or_else(|| format!("Session {session_id} not found"))?;
         let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
         serde_json::from_str(&raw).map_err(|error| error.to_string())
     }
 
     pub fn save(&self, project: &MixProject) -> Result<(), String> {
         self.init()?;
-        let path = self.sessions_dir().join(format!("{}.json", project.session.id));
+        // Path follows the session's album. Legacy sessions with no album fall back
+        // to (and are adopted by) the default album.
+        let album_id = if project.session.album_id.trim().is_empty() {
+            self.default_album_id()?
+        } else {
+            project.session.album_id.clone()
+        };
+        let songs_dir = self.album_dir(&album_id).join("songs");
+        fs::create_dir_all(&songs_dir).map_err(|error| error.to_string())?;
+        let path = songs_dir.join(format!("{}.json", project.session.id));
         fs::write(path, serde_json::to_string_pretty(project).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())
+    }
+
+    // ---- Album manifest + folder helpers ------------------------------------
+
+    fn album_dir(&self, album_id: &str) -> PathBuf {
+        self.albums_dir().join(album_id)
+    }
+
+    fn album_manifest_path(&self, album_id: &str) -> PathBuf {
+        self.album_dir(album_id).join("album.json")
+    }
+
+    /// Find the on-disk file for a session by scanning album song folders.
+    fn locate_session_file(&self, session_id: &str) -> Option<PathBuf> {
+        let albums = self.albums_dir();
+        let entries = fs::read_dir(albums).ok()?;
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("songs").join(format!("{session_id}.json"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    pub fn list_albums(&self) -> Result<Vec<MixAlbum>, String> {
+        self.init()?;
+        let mut albums = Vec::new();
+        for entry in fs::read_dir(self.albums_dir()).map_err(|error| error.to_string())? {
+            let dir = entry.map_err(|error| error.to_string())?.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let manifest = dir.join("album.json");
+            if let Ok(raw) = fs::read_to_string(&manifest) {
+                if let Ok(album) = serde_json::from_str::<MixAlbum>(&raw) {
+                    albums.push(album);
+                }
+            }
+        }
+        albums.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(albums)
+    }
+
+    pub fn get_album(&self, album_id: &str) -> Result<MixAlbum, String> {
+        let raw = fs::read_to_string(self.album_manifest_path(album_id))
+            .map_err(|_| format!("Album {album_id} not found"))?;
+        serde_json::from_str(&raw).map_err(|error| error.to_string())
+    }
+
+    fn save_album(&self, album: &MixAlbum) -> Result<(), String> {
+        let dir = self.album_dir(&album.id).join("songs");
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        fs::write(
+            self.album_manifest_path(&album.id),
+            serde_json::to_string_pretty(album).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn create_album(&self, name: String) -> Result<MixAlbum, String> {
+        self.init()?;
+        let album = MixAlbum { id: Uuid::new_v4().to_string(), name, song_order: Vec::new() };
+        self.save_album(&album)?;
+        Ok(album)
+    }
+
+    pub fn rename_album(&self, album_id: &str, new_name: String) -> Result<MixAlbum, String> {
+        let mut album = self.get_album(album_id)?;
+        album.name = new_name;
+        self.save_album(&album)?;
+        Ok(album)
+    }
+
+    pub fn delete_album(&self, album_id: &str) -> Result<(), String> {
+        let dir = self.album_dir(album_id);
+        if dir.exists() {
+            fs::remove_dir_all(dir).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn add_song_to_album(&self, album_id: &str, session_id: &str) -> Result<(), String> {
+        let mut album = self.get_album(album_id)?;
+        if !album.song_order.iter().any(|id| id == session_id) {
+            album.song_order.push(session_id.to_string());
+        }
+        self.save_album(&album)
+    }
+
+    /// The default album (created on demand) used for legacy/orphan sessions.
+    fn default_album_id(&self) -> Result<String, String> {
+        if let Some(first) = self.list_albums()?.into_iter().next() {
+            return Ok(first.id);
+        }
+        Ok(self.create_album("My Album".to_string())?.id)
+    }
+
+    /// One-time migration: wrap pre-album `sessions/{id}.json` files into a default
+    /// album folder. Safe to call repeatedly — it no-ops once albums exist.
+    fn migrate_legacy_sessions(&self) -> Result<(), String> {
+        let legacy = self.sessions_dir();
+        if !legacy.is_dir() {
+            return Ok(());
+        }
+        // Already migrated (an album exists) → leave legacy files alone.
+        if !self.list_albums()?.is_empty() {
+            return Ok(());
+        }
+        let mut legacy_files: Vec<PathBuf> = Vec::new();
+        for entry in fs::read_dir(&legacy).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path.extension().and_then(|i| i.to_str()) == Some("json") {
+                legacy_files.push(path);
+            }
+        }
+        if legacy_files.is_empty() {
+            return Ok(());
+        }
+        let album = self.create_album("My Album".to_string())?;
+        for path in legacy_files {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if let Ok(mut project) = serde_json::from_str::<MixProject>(&raw) {
+                    project.session.album_id = album.id.clone();
+                    self.save(&project)?;
+                    self.add_song_to_album(&album.id, &project.session.id)?;
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn add_source_file(&self, session_id: &str, source_path: &Path) -> Result<MixProject, String> {
@@ -769,9 +947,20 @@ impl SessionStore {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<(), String> {
-        let path = self.sessions_dir().join(format!("{session_id}.json"));
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| error.to_string())?;
+        if let Some(path) = self.locate_session_file(session_id) {
+            // albums/{album_id}/songs/{id}.json → album id is the grandparent dir name.
+            let album_id = path
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string());
+            fs::remove_file(&path).map_err(|error| error.to_string())?;
+            if let Some(aid) = album_id {
+                if let Ok(mut album) = self.get_album(&aid) {
+                    album.song_order.retain(|id| id != session_id);
+                    let _ = self.save_album(&album);
+                }
+            }
         }
         Ok(())
     }
@@ -841,6 +1030,7 @@ impl SessionStore {
         let mut project: MixProject = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
 
         project.session.id = Uuid::new_v4().to_string();
+        project.session.album_id = self.default_album_id()?;
 
         for src in &mut project.session.source_files {
             let cache_src = bundle_dir.join(&src.cache_path);
@@ -865,11 +1055,16 @@ impl SessionStore {
         }
 
         self.save(&project)?;
+        self.add_song_to_album(&project.session.album_id, &project.session.id)?;
         Ok(project)
     }
 
     pub fn renders_dir(&self) -> PathBuf {
         self.data_dir.join("renders")
+    }
+
+    fn albums_dir(&self) -> PathBuf {
+        self.data_dir.join("albums")
     }
 
     pub fn videos_dir(&self) -> PathBuf {

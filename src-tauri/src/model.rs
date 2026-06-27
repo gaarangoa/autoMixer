@@ -427,6 +427,10 @@ impl Default for MixerProfile {
 pub struct MixSession {
     pub id: Id,
     pub name: String,
+    /// The album (project) this song belongs to. Empty on legacy sessions until
+    /// migration assigns them to the default album.
+    #[serde(default)]
+    pub album_id: Id,
     pub sample_rate: u32,
     pub bpm: Option<f32>,
     pub source_files: Vec<SourceFile>,
@@ -443,6 +447,18 @@ pub struct MixSession {
     pub mixer_profile: MixerProfile,
     #[serde(default)]
     pub video_canvas: VideoCanvas,
+}
+
+/// An album (project): a named, ordered collection of songs (sessions). Stored as
+/// a lightweight manifest at albums/{id}/album.json; the songs live alongside it
+/// in albums/{id}/songs/{session-id}.json.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixAlbum {
+    pub id: Id,
+    pub name: String,
+    #[serde(default)]
+    pub song_order: Vec<Id>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

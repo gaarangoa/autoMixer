@@ -1,8 +1,8 @@
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertCircle, Aperture, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Download, FilePlus2, Focus, FolderOpen, GitCompareArrows, Info, Keyboard, Maximize2, MessageSquare, Mic, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X } from "lucide-react";
-import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
+import { AlertCircle, Aperture, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Download, FilePlus2, Focus, FolderOpen, GitCompareArrows, Info, Keyboard, Maximize2, MessageSquare, Mic, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, Repeat, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X } from "lucide-react";
+import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixAlbum, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -185,9 +185,18 @@ export function App() {
   const [cutCursorSeconds, setCutCursorSeconds] = useState<number | undefined>();
   useEffect(() => { if (!cutToolActive) setCutCursorSeconds(undefined); }, [cutToolActive]);
   const [sessionList, setSessionList] = useState<MixSession[]>([]);
+  const [albums, setAlbums] = useState<MixAlbum[]>([]);
+  const [currentAlbumId, setCurrentAlbumId] = useState<string>("");
+  const currentAlbum = albums.find((a) => a.id === currentAlbumId);
   const [renameDraft, setRenameDraft] = useState<string | null>(null);
   const [newDraft, setNewDraft] = useState<string | null>(null);
+  const [albumNewDraft, setAlbumNewDraft] = useState<string | null>(null);
+  const [albumRenameDraft, setAlbumRenameDraft] = useState<string | null>(null);
+  const [fileMenuOpen, setFileMenuOpen] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; message: string; elapsedSeconds: number } | null>(null);
+  // Seconds the current agent turn has been running — shown so a slow (esp. first) turn
+  // never looks frozen. The first turn warms a large model prompt and is the slowest.
+  const [turnElapsed, setTurnElapsed] = useState(0);
   const [videoEditorOpen, setVideoEditorOpen] = useState(false);
   const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("2");
   const [agentVideoModel, setAgentVideoModel] = useState(() => initialAgentVideoModelRef.current ?? DEFAULT_AGENT_VIDEO_MODEL);
@@ -401,6 +410,51 @@ export function App() {
     void bootstrap();
   }, []);
 
+  // Native macOS File menu: dispatch its events to the matching handlers. A ref
+  // keeps the latest closures so the listeners can be registered once.
+  const menuHandlersRef = useRef<Record<string, (id?: string) => void>>({});
+  menuHandlersRef.current = {
+    "menu:new-album": () => setAlbumNewDraft("New Album"),
+    "menu:new-song": () => setNewDraft("New song"),
+    "menu:rename-album": () => setAlbumRenameDraft(currentAlbum?.name ?? ""),
+    "menu:rename-song": () => setRenameDraft(session?.name ?? ""),
+    "menu:delete-album": () => { void deleteCurrentAlbum(); },
+    "menu:delete-song": () => { void deleteCurrentSession(); },
+    "menu:save-bundle": () => { void saveProjectBundle(); },
+    "menu:open-bundle": () => { void openProjectBundle(); },
+    "menu:open-album": (id) => { if (id) void switchAlbum(id); },
+    "menu:open-song": (id) => { if (id) void switchSession(id); },
+  };
+  useEffect(() => {
+    const simple = ["menu:new-album", "menu:new-song", "menu:rename-album", "menu:rename-song", "menu:delete-album", "menu:delete-song", "menu:save-bundle", "menu:open-bundle"];
+    const unsubs: (() => void)[] = [];
+    for (const name of simple) {
+      void listen(name, () => menuHandlersRef.current[name]?.()).then((fn) => unsubs.push(fn));
+    }
+    void listen<{ id: string }>("menu:open-album", (e) => menuHandlersRef.current["menu:open-album"]?.(e.payload.id)).then((fn) => unsubs.push(fn));
+    void listen<{ id: string }>("menu:open-song", (e) => menuHandlersRef.current["menu:open-song"]?.(e.payload.id)).then((fn) => unsubs.push(fn));
+    return () => unsubs.forEach((f) => f());
+  }, []);
+
+  // Keep the native File menu's album/song lists (and checkmarks) in sync.
+  useEffect(() => {
+    if (!session) return;
+    void api.setFileMenu(
+      albums.map((a) => ({ id: a.id, name: a.name })),
+      sessionList.map((s) => ({ id: s.id, name: s.name })),
+      currentAlbumId,
+      session.id,
+    ).catch(() => undefined);
+  }, [albums, sessionList, currentAlbumId, session?.id]);
+
+  // Show the current album / song in the native macOS title bar (instead of an
+  // in-window breadcrumb).
+  useEffect(() => {
+    if (!session) return;
+    const title = currentAlbum?.name ? `${currentAlbum.name} — ${session.name}` : session.name;
+    void getCurrentWebviewWindow().setTitle(title).catch(() => undefined);
+  }, [currentAlbum?.name, session?.name]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listen<{ sessionId: string }>("mixer:session-updated", (event) => {
@@ -421,6 +475,9 @@ export function App() {
   useEffect(() => {
     if (!session) return;
     void api.setVideoSelection(session.id, selectedTrackIds).catch(() => undefined);
+    // Keep the monitor pointed at the CURRENT session too — otherwise switching
+    // sessions leaves it showing the previous session's clips.
+    void videoMonitorRef.current?.emit("video-monitor:session", { sessionId: session.id }).catch(() => undefined);
     void videoMonitorRef.current?.emit("video-monitor:selection", { trackIds: selectedTrackIds }).catch(() => undefined);
   }, [selectedTrackIds, session?.id]);
 
@@ -588,6 +645,15 @@ export function App() {
     }));
     return () => { cancelled = true; unlisteners.forEach((fn) => fn()); };
   }, []);
+
+  // Tick an elapsed-seconds counter while the agent is working, so the activity card
+  // always shows visible progress even during the long cold-start prompt prefill.
+  useEffect(() => {
+    if (!busy && !autoMixRunning) { setTurnElapsed(0); return; }
+    setTurnElapsed(0);
+    const t = setInterval(() => setTurnElapsed((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [busy, autoMixRunning]);
 
   // Live reasoning (the agent's "thinking") and the tool calls it has made this
   // turn — surfaced inline in the chat so long operations never look frozen.
@@ -832,6 +898,15 @@ export function App() {
     void updateCameraPreviewWindow(buildCameraPreviewTracks());
   }, [session, selectedTrackIds.join("|"), JSON.stringify(trackCameraDevices), cameraDevices.length, armedVideoTrackIds.join("|"), videoRecordingTrackIds.join("|"), playing, Math.round(playhead * 5)]);
 
+  // Arming a video track (R) pops up the live camera preview so you see the take.
+  const prevArmedVideoCountRef = useRef(0);
+  useEffect(() => {
+    if (armedVideoTrackIds.length > 0 && prevArmedVideoCountRef.current === 0) {
+      void openCameraPreviewWindow(buildCameraPreviewTracks(), true);
+    }
+    prevArmedVideoCountRef.current = armedVideoTrackIds.length;
+  }, [armedVideoTrackIds]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listen<CameraPreviewLayoutEvent>("camera-preview:clip-layout", (event) => {
@@ -1074,8 +1149,9 @@ export function App() {
   }
 
   async function refreshSessionList() {
+    if (!currentAlbumId) return;
     try {
-      const sessions = await api.sessions();
+      const sessions = await api.sessions(currentAlbumId);
       setSessionList(sessions);
     } catch (error) {
       pushSystem(error);
@@ -1109,7 +1185,7 @@ export function App() {
     await flushChat();
     setBusy(true);
     try {
-      const created = await api.createSession(trimmed);
+      const created = await api.createSession(currentAlbumId, trimmed);
       setProject(created);
       setSelectedTrackIds([]);
       setSelectedRegionIds([]);
@@ -1146,15 +1222,95 @@ export function App() {
     setBusy(true);
     try {
       await api.deleteSession(session.id);
-      const remaining = (await api.sessions()).filter((s) => s.id !== session.id);
+      const remaining = (await api.sessions(currentAlbumId)).filter((s) => s.id !== session.id);
       setSessionList(remaining);
       const next = remaining[0]
         ? await api.getSession(remaining[0].id)
-        : await api.createSession("AutoMixer session");
+        : await api.createSession(currentAlbumId, "AutoMixer session");
       setProject(next);
       setSelectedTrackIds([]);
       setSelectedRegionIds([]);
       playbackAnchorRef.current = undefined;
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshAlbums() {
+    try {
+      setAlbums(await api.albums());
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
+  async function switchAlbum(albumId: string) {
+    if (!albumId || albumId === currentAlbumId) return;
+    await flushChat();
+    setBusy(true);
+    try {
+      setCurrentAlbumId(albumId);
+      const sessions = await api.sessions(albumId);
+      const next = sessions[0] ? await api.getSession(sessions[0].id) : await api.createSession(albumId, "AutoMixer session");
+      setProject(next);
+      setSessionList(sessions.length > 0 ? sessions : [next.session]);
+      setSelectedTrackIds([]);
+      setSelectedRegionIds([]);
+      playbackAnchorRef.current = undefined;
+      pausedAtRef.current = 0;
+      setPlayhead(0);
+      setPlaying(false);
+      await api.stop().catch(() => undefined);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function commitNewAlbum(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    try {
+      const album = await api.createAlbum(trimmed);
+      setAlbums((current) => [...current, album]);
+      await switchAlbum(album.id);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
+  async function commitAlbumRename(name: string) {
+    if (!currentAlbumId) return;
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === currentAlbum?.name) return;
+    try {
+      const updated = await api.renameAlbum(currentAlbumId, trimmed);
+      setAlbums((current) => current.map((a) => (a.id === updated.id ? updated : a)));
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
+  async function deleteCurrentAlbum() {
+    if (!currentAlbumId) return;
+    const confirmed = await confirmAction({
+      title: "Delete album",
+      message: `Delete album "${currentAlbum?.name}" and all its songs? This cannot be undone.`,
+      confirmLabel: "Delete album",
+    });
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      await api.deleteAlbum(currentAlbumId);
+      let remaining = await api.albums();
+      if (remaining.length === 0) remaining = [await api.createAlbum("My Album")];
+      setAlbums(remaining);
+      const targetId = remaining[0].id;
+      setCurrentAlbumId("");
+      await switchAlbum(targetId);
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -1205,7 +1361,7 @@ export function App() {
   async function bootstrap() {
     setLoading(true);
     try {
-      const [config, sessions] = await Promise.all([api.config().catch(() => undefined), api.sessions()]);
+      const [config, albumList] = await Promise.all([api.config().catch(() => undefined), api.albums()]);
       if (config) {
         if (!initialOllamaUrlRef.current) setOllamaUrl(config.ollamaBaseUrl);
         if (!initialOllamaModelRef.current) {
@@ -1222,7 +1378,16 @@ export function App() {
         setVideoUrl(m.baseUrl);
         setVideoModelName(m.model);
       }).catch(() => undefined);
-      const loaded = sessions[0] ? await api.getSession(sessions[0].id) : await api.createSession("AutoMixer session");
+      // Albums (projects) own the songs (sessions). Ensure at least one album.
+      let albumsNow = albumList;
+      if (albumsNow.length === 0) {
+        albumsNow = [await api.createAlbum("My Album")];
+      }
+      setAlbums(albumsNow);
+      const albumId = albumsNow[0].id;
+      setCurrentAlbumId(albumId);
+      const sessions = await api.sessions(albumId);
+      const loaded = sessions[0] ? await api.getSession(sessions[0].id) : await api.createSession(albumId, "AutoMixer session");
       setProject(loaded);
       setSessionList(sessions.length > 0 ? sessions : [loaded.session]);
     } catch (error) {
@@ -2512,6 +2677,24 @@ export function App() {
     void api.seek(Math.round(safe * session.sampleRate)).catch(() => undefined);
   }
 
+  // Whether the current loop matches the selected region (so the Repeat button can
+  // show its active state).
+  const selectionLoopActive = !!(loopSection && selectedRange
+    && Math.abs(loopSection.start - Math.min(selectedRange.start, selectedRange.end)) < 0.01
+    && Math.abs(loopSection.end - Math.max(selectedRange.start, selectedRange.end)) < 0.01);
+
+  // Toggle looping over the selected region (the Repeat toolbar button + the band).
+  function toggleSelectionLoop() {
+    if (!selectedRange) return;
+    const lo = Math.min(selectedRange.start, selectedRange.end);
+    const hi = Math.max(selectedRange.start, selectedRange.end);
+    if (hi - lo < 0.02) return;
+    setLoopSection((current) =>
+      current && Math.abs(current.start - lo) < 0.01 && Math.abs(current.end - hi) < 0.01
+        ? null
+        : { start: lo, end: hi });
+  }
+
   async function stop() {
     if (videoRecordingTrackIds.length > 0 || Object.keys(videoRecordersRef.current).length > 0) {
       try {
@@ -3210,121 +3393,24 @@ export function App() {
 
   return (
     <main className="app">
-      <section className="mix">
-        <header className="topbar">
-          <div className="title-block">
-            <h1>AutoMixer</h1>
-            <div className="session-picker">
-              <button
-                className="session-current"
-                onClick={() => {
-                  setSessionMenuOpen((open) => {
-                    if (!open) void refreshSessionList();
-                    return !open;
-                  });
-                }}
-                disabled={busy}
-                title="Session menu"
-              >
-                <strong>{session.name}</strong>
-                <ChevronDown size={14} />
-              </button>
-              {sessionMenuOpen ? (
-                <div className="session-menu" onMouseLeave={() => { setSessionMenuOpen(false); setRenameDraft(null); setNewDraft(null); }}>
-                  <div className="session-menu-section">
-                    {sessionList.length === 0 ? (
-                      <div className="session-menu-empty">No saved sessions</div>
-                    ) : (
-                      sessionList.map((entry) => (
-                        <button
-                          key={entry.id}
-                          className={`session-menu-item ${entry.id === session.id ? "active" : ""}`}
-                          onClick={() => {
-                            setSessionMenuOpen(false);
-                            void switchSession(entry.id);
-                          }}
-                        >
-                          {entry.name}
-                        </button>
-                      ))
-                    )}
-                  </div>
-                  <div className="session-menu-divider" />
-                  {newDraft !== null ? (
-                    <form
-                      className="session-menu-form"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        const value = newDraft;
-                        setNewDraft(null);
-                        setSessionMenuOpen(false);
-                        void commitNewSession(value);
-                      }}
-                    >
-                      <input
-                        autoFocus
-                        value={newDraft}
-                        onChange={(event) => setNewDraft(event.target.value)}
-                        onKeyDown={(event) => { if (event.key === "Escape") setNewDraft(null); }}
-                        placeholder="Session name"
-                      />
-                      <button type="submit">Create</button>
-                    </form>
-                  ) : (
-                    <button className="session-menu-item" onClick={() => setNewDraft("AutoMixer session")}>
-                      <FilePlus2 size={14} /> New session
-                    </button>
-                  )}
-                  {renameDraft !== null ? (
-                    <form
-                      className="session-menu-form"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        const value = renameDraft;
-                        setRenameDraft(null);
-                        setSessionMenuOpen(false);
-                        void commitRename(value);
-                      }}
-                    >
-                      <input
-                        autoFocus
-                        value={renameDraft}
-                        onChange={(event) => setRenameDraft(event.target.value)}
-                        onKeyDown={(event) => { if (event.key === "Escape") setRenameDraft(null); }}
-                        placeholder="New name"
-                      />
-                      <button type="submit">Rename</button>
-                    </form>
-                  ) : (
-                    <button className="session-menu-item" onClick={() => setRenameDraft(session.name)}>
-                      <Pencil size={14} /> Rename
-                    </button>
-                  )}
-                  <button className="session-menu-item" onClick={() => { setSessionMenuOpen(false); void saveProjectBundle(); }}>
-                    <Save size={14} /> Save project as bundle…
-                  </button>
-                  <button className="session-menu-item" onClick={() => { setSessionMenuOpen(false); void openProjectBundle(); }}>
-                    <FolderOpen size={14} /> Open project bundle…
-                  </button>
-                  <div className="session-menu-divider" />
-                  <button className="session-menu-item danger" onClick={() => { setSessionMenuOpen(false); void deleteCurrentSession(); }}>
-                    <Trash2 size={14} /> Delete this session
-                  </button>
-                </div>
-              ) : null}
+      <header className="topbar">
+          <div className="topbar-left">
+            <div className="topbar-group" role="group" aria-label="History">
+              <button onClick={doUndo} disabled={busy} title={`Undo (${MOD_KEY}Z)`}><RotateCcw size={15} /></button>
+              <button onClick={doRedo} disabled={busy} title={`Redo (${SHIFT_KEY}${MOD_KEY}Z)`}><RotateCw size={15} /></button>
             </div>
           </div>
-          <div className="transport-center">
+          <div className="topbar-center">
             <div className="topbar-group" role="group" aria-label="Transport">
-              <button onClick={() => void goToStart()} title="Jump to start"><SkipBack size={15} /></button>
+              <button onClick={() => void goToStart()} title="Jump to start"><SkipBack size={14} /></button>
               <button
                 className={`transport-play ${playing ? "playing" : ""}`}
                 onClick={() => void togglePlay()}
                 title={playing ? "Pause (Space)" : "Play (Space)"}
               >
-                {playing ? <Pause size={18} /> : <Play size={18} />}
+                {playing ? <Pause size={15} /> : <Play size={15} />}
               </button>
-              <button onClick={() => void stop()} title="Stop"><Square size={15} /></button>
+              <button onClick={() => void stop()} title="Stop"><Square size={14} /></button>
             </div>
             <div className="lcd">
               <div className="lcd-main">
@@ -3339,17 +3425,9 @@ export function App() {
                 <TransportMeter />
               </div>
             </div>
-          </div>
-          <div className="transport">
+            <span className="topbar-sep" aria-hidden="true" />
             <div className="topbar-group" role="group" aria-label="Editing tools">
-              <button
-                onClick={() => setAddTrackMenuOpen(true)}
-                disabled={busy}
-                title="Add a track"
-                aria-haspopup="dialog"
-              >
-                <Plus size={18} />
-              </button>
+              <button onClick={() => setAddTrackMenuOpen(true)} disabled={busy} title="Add a track" aria-haspopup="dialog"><Plus size={15} /></button>
               <button
                 className={cutToolActive ? "active" : ""}
                 onClick={() => setCutToolActive((on) => !on)}
@@ -3357,10 +3435,21 @@ export function App() {
                 title={cutToolActive ? "Cut tool active. Click again to disable." : "Cut tool — click a clip to split it"}
                 aria-pressed={cutToolActive}
               >
-                <Scissors size={18} />
+                <Scissors size={15} />
               </button>
-              <button onClick={doUndo} disabled={busy} title={`Undo (${MOD_KEY}Z)`}><RotateCcw size={18} /></button>
-              <button onClick={doRedo} disabled={busy} title={`Redo (${SHIFT_KEY}${MOD_KEY}Z)`}><RotateCw size={18} /></button>
+              <button
+                className={selectionLoopActive ? "active" : ""}
+                onClick={toggleSelectionLoop}
+                disabled={busy || !selectedRange || Math.abs(selectedRange.end - selectedRange.start) < 0.02}
+                title={
+                  !selectedRange || Math.abs(selectedRange.end - selectedRange.start) < 0.02
+                    ? "Select a region first, then toggle loop/repeat"
+                    : selectionLoopActive ? "Repeat ON — playback loops the selected region. Click to turn off." : "Repeat the selected region (loop playback)"
+                }
+                aria-pressed={selectionLoopActive}
+              >
+                <Repeat size={15} />
+              </button>
             </div>
             <span className="topbar-sep" aria-hidden="true" />
             <div className="topbar-group" role="group" aria-label="Monitoring">
@@ -3370,27 +3459,27 @@ export function App() {
                 title={bypass ? "Hearing ORIGINAL (no processing). Click for the mix." : "Hearing the MIX (with all processing). Click for the original."}
                 aria-pressed={bypass}
               >
-                <GitCompareArrows size={16} />
+                <GitCompareArrows size={14} />
                 <span className="bypass-label">{bypass ? "ORIG" : "MIX"}</span>
               </button>
               <button
                 className={`ai-bulk ${session.tracks.length > 0 && session.tracks.every((t) => t.aiGenerated) ? "active" : ""}`}
                 onClick={() => void toggleAllAi()}
                 disabled={busy || session.tracks.length === 0}
-                title="Toggle AI-generated flag on all tracks (Suno, demucs, etc.). The agent uses gentler EQ/compression and lower reverb on AI stems."
+                title="Toggle AI-generated flag on all tracks. The agent uses gentler EQ/compression and lower reverb on AI stems."
               >
                 All AI
               </button>
             </div>
             <span className="topbar-sep" aria-hidden="true" />
-            <div className="topbar-group" role="group" aria-label="File and help">
+            <div className="topbar-group" role="group" aria-label="Windows">
               <button
                 className={mixerWindowOpen ? "active" : ""}
                 onClick={() => void toggleMixerWindow()}
                 title={mixerWindowOpen ? "Hide mixer window" : "Show mixer window"}
                 aria-pressed={mixerWindowOpen}
               >
-                <SlidersHorizontal size={18} />
+                <SlidersHorizontal size={15} />
               </button>
               <button
                 className={videoMonitorOpen ? "active" : ""}
@@ -3398,18 +3487,21 @@ export function App() {
                 title={videoMonitorOpen ? "Hide video monitor" : "Show video monitor"}
                 aria-pressed={videoMonitorOpen}
               >
-                <Video size={18} />
-              </button>
-              <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={18} /></button>
-              <button className="upload" onClick={() => void importFiles()} title="Import audio">
-                <Upload size={18} />
-              </button>
-              <button onClick={() => setShortcutsOpen(true)} title="Keyboard shortcuts (?)" aria-haspopup="dialog">
-                <Keyboard size={18} />
+                <Video size={15} />
               </button>
             </div>
+            <span className="topbar-sep" aria-hidden="true" />
+            <div className="topbar-group" role="group" aria-label="File">
+              <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={15} /></button>
+              <button className="upload" onClick={() => void importFiles()} title="Import audio"><Upload size={15} /></button>
+              <button onClick={() => setShortcutsOpen(true)} title="Keyboard shortcuts (?)" aria-haspopup="dialog"><Keyboard size={15} /></button>
+            </div>
           </div>
+          <div className="topbar-right" />
         </header>
+
+      <div className="app-body">
+        <section className="mix">
 
         {analysisProgress ? (
           <div className={`progress-banner stage-${analysisProgress.stage}`}>
@@ -3782,8 +3874,18 @@ export function App() {
                   setSelectedClip(undefined);
                   setSelectedClips([]);
                   setSelectedRange({ start: Math.min(start, end), end: Math.max(start, end) });
-                  // A fresh region replaces any previous loop — re-click the band to activate.
+                  // A fresh region (new drag on the ruler) replaces any previous loop.
                   setLoopSection(null);
+                }}
+                onMove={(start, end) => {
+                  // Moving/resizing an existing region: update the selection AND carry an
+                  // active loop along so dragging the section doesn't drop repeat.
+                  const lo = Math.min(start, end);
+                  const hi = Math.max(start, end);
+                  setSelectedClip(undefined);
+                  setSelectedClips([]);
+                  setSelectedRange({ start: lo, end: hi });
+                  setLoopSection((current) => (current ? { start: lo, end: hi } : null));
                 }}
                 onClear={() => { setSelectedRange(undefined); setLoopSection(null); }}
                 onToggleLoop={() => {
@@ -4044,10 +4146,6 @@ export function App() {
 
       <aside className="assistant">
         <div className="assistant-head">
-          <div className="assistant-title">
-            <MessageSquare size={14} />
-            <span>Assistant</span>
-          </div>
           <div className="assistant-head-actions">
             {agentUsage ? (
               <span
@@ -4353,16 +4451,8 @@ export function App() {
                     );
                   }
                   if (message.role === "video") {
-                    return (
-                      <button key={index} type="button" className="chat-video-chip" onClick={() => void toggleVideoMonitor(true)} title="Open in the video monitor">
-                        <span className="chip-play"><Play size={14} /></span>
-                        <span className="chip-text">
-                          <strong>Video edit ready</strong>
-                          <span className="chip-meta">{message.cuts} cuts{message.lookPreset ? ` · ${message.lookPreset}` : ""}</span>
-                        </span>
-                        <Maximize2 size={14} className="chip-open" />
-                      </button>
-                    );
+                    // "Video edit ready · N cuts" chip — hidden (no longer needed).
+                    return null;
                   }
                   return <div key={index} className={`message ${message.role}`}>{message.text}</div>;
                 })
@@ -4372,6 +4462,7 @@ export function App() {
                   <div className="activity-head">
                     <span className="activity-dot" />
                     <span>{autoMixRunning ? "Auto-mixing…" : agentEditProgress ? "Editing video…" : "Working…"}</span>
+                    <span className="activity-elapsed">{turnElapsed}s</span>
                     {agentUsage ? (
                       <span className="activity-tokens" title="Estimated tokens generated this session (reply · reasoning).">
                         {agentUsage.output.toLocaleString()} out · {agentUsage.thought.toLocaleString()} reasoning
@@ -4380,6 +4471,16 @@ export function App() {
                       <span className="activity-tokens">{liveTokens.prompt.toLocaleString()} → {liveTokens.response.toLocaleString()} tok</span>
                     ) : null}
                   </div>
+
+                  {/* Cold-start hint: nothing has streamed yet and it's taking a moment —
+                      the first message warms a large model prompt. Tell the user. */}
+                  {!autoMixRunning && !agentEditProgress && !liveReasoning && !streamingTurn && liveTools.length === 0 && turnElapsed >= 2 ? (
+                    <div className="activity-warmup">
+                      {messages.filter((m) => m.role === "assistant-turn" || m.role === "assistant").length === 0
+                        ? "Starting the agent and warming up the model — the first message processes a large prompt, so it can take a minute. Later replies are much faster."
+                        : "Thinking…"}
+                    </div>
+                  ) : null}
 
                   {liveReasoning ? (
                     <details className="activity-reasoning" open>
@@ -4494,6 +4595,32 @@ export function App() {
           </>
         )}
       </aside>
+      </div>
+      {(() => {
+        const prompt =
+          albumNewDraft !== null ? { value: albumNewDraft, set: setAlbumNewDraft, title: "New album", placeholder: "Album name", submit: (v: string) => commitNewAlbum(v) } :
+          albumRenameDraft !== null ? { value: albumRenameDraft, set: setAlbumRenameDraft, title: "Rename album", placeholder: "Album name", submit: (v: string) => commitAlbumRename(v) } :
+          newDraft !== null ? { value: newDraft, set: setNewDraft, title: "New song", placeholder: "Song name", submit: (v: string) => commitNewSession(v) } :
+          renameDraft !== null ? { value: renameDraft, set: setRenameDraft, title: "Rename song", placeholder: "Song name", submit: (v: string) => commitRename(v) } :
+          null;
+        if (!prompt) return null;
+        return (
+          <div className="name-prompt-backdrop" onPointerDown={() => prompt.set(null)}>
+            <form
+              className="name-prompt"
+              onPointerDown={(e) => e.stopPropagation()}
+              onSubmit={(e) => { e.preventDefault(); const v = prompt.value; prompt.set(null); void prompt.submit(v); }}
+            >
+              <div className="name-prompt-title">{prompt.title}</div>
+              <input autoFocus value={prompt.value} placeholder={prompt.placeholder} onChange={(e) => prompt.set(e.target.value)} onKeyDown={(e) => { if (e.key === "Escape") prompt.set(null); }} />
+              <div className="name-prompt-actions">
+                <button type="button" onClick={() => prompt.set(null)}>Cancel</button>
+                <button type="submit" className="primary">OK</button>
+              </div>
+            </form>
+          </div>
+        );
+      })()}
       {settingsOpen ? (
         <div className="settings-backdrop" onPointerDown={() => setSettingsOpen(false)}>
           <div className="settings-modal" role="dialog" aria-modal="true" aria-label="Settings" onPointerDown={(e) => e.stopPropagation()}>
@@ -4865,6 +4992,7 @@ function TimeRuler({
   bpm,
   onSeek,
   onSelect,
+  onMove,
   onClear,
   onToggleLoop,
 }: {
@@ -4875,13 +5003,14 @@ function TimeRuler({
   bpm?: number;
   onSeek: (seconds: number) => void;
   onSelect: (start: number, end: number) => void;
+  onMove: (start: number, end: number) => void;
   onClear: () => void;
   onToggleLoop: () => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ start: number; moved: boolean } | null>(null);
   const resizeRef = useRef<{ anchor: number } | null>(null);
-  const bandRef = useRef<{ start: number; moved: boolean } | null>(null);
+  const bandRef = useRef<{ pointer: number; origStart: number; origEnd: number; moved: boolean } | null>(null);
   const secondsFromClientX = (clientX: number) => {
     const rect = wrapRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return 0;
@@ -4898,7 +5027,9 @@ function TimeRuler({
     const resize = resizeRef.current;
     if (!resize) return;
     event.stopPropagation();
-    onSelect(resize.anchor, secondsFromClientX(event.clientX));
+    // Resizing an existing region keeps an active loop in sync (onMove), so it doesn't
+    // drop the repeat while you adjust the edges.
+    onMove(resize.anchor, secondsFromClientX(event.clientX));
   };
   const handleEdgeUp = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!resizeRef.current) return;
@@ -4906,11 +5037,18 @@ function TimeRuler({
     event.stopPropagation();
     event.currentTarget.releasePointerCapture(event.pointerId);
   };
-  // Click on the selection band toggles the loop; a drag inside it redraws the region.
+  // Click inside the selection band moves the playhead (yellow marker) to that point;
+  // a drag inside it MOVES the whole region (keeping its length). Looping is toggled
+  // from the Repeat toolbar button, not by clicking the band.
   const handleBandDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || !selection) return;
     event.stopPropagation();
-    bandRef.current = { start: secondsFromClientX(event.clientX), moved: false };
+    bandRef.current = {
+      pointer: secondsFromClientX(event.clientX),
+      origStart: Math.min(selection.start, selection.end),
+      origEnd: Math.max(selection.start, selection.end),
+      moved: false,
+    };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
   const handleBandMove = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -4918,10 +5056,14 @@ function TimeRuler({
     if (!band) return;
     event.stopPropagation();
     const seconds = secondsFromClientX(event.clientX);
-    if (Math.abs(seconds - band.start) > 0.02) {
-      band.moved = true;
-      onSelect(band.start, seconds);
-    }
+    if (!band.moved && Math.abs(seconds - band.pointer) <= 0.02) return;
+    band.moved = true;
+    const width = band.origEnd - band.origStart;
+    // Shift by the drag delta, clamped so the region stays within [0, duration].
+    const delta = Math.max(-band.origStart, Math.min(duration - band.origEnd, seconds - band.pointer));
+    // Move the whole region — and carry an active loop with it (onMove), so dragging
+    // the section doesn't turn off repeat.
+    onMove(band.origStart + delta, band.origStart + delta + width);
   };
   const handleBandUp = (event: React.PointerEvent<HTMLDivElement>) => {
     const band = bandRef.current;
@@ -4929,7 +5071,8 @@ function TimeRuler({
     bandRef.current = null;
     event.stopPropagation();
     event.currentTarget.releasePointerCapture(event.pointerId);
-    if (!band.moved) onToggleLoop();
+    // A click (no drag) inside the region just sets the playhead there.
+    if (!band.moved) onSeek(band.pointer);
   };
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -5016,7 +5159,7 @@ function TimeRuler({
             onPointerDown={handleBandDown}
             onPointerMove={handleBandMove}
             onPointerUp={handleBandUp}
-            title={loopActive ? "Loop active. Click to disable." : "Click to loop this region."}
+            title="Click to set the playhead here · drag to move the region · use the Repeat button to loop"
           >
             <div
               className="time-ruler-handle start"
@@ -5312,6 +5455,47 @@ const ADJUST_SECTIONS: AdjustSectionDef[] = [
   },
 ];
 
+// Photos "Filters" tab — named looks. Each applies a patch over the neutral
+// look fields (so filters are mutually exclusive). "Original" = neutral.
+type PhotoFilterDef = { id: string; name: string; patch: Record<string, number> };
+const PHOTO_FILTERS: PhotoFilterDef[] = [
+  { id: "original", name: "Original", patch: {} },
+  { id: "vivid", name: "Vivid", patch: { saturation: 1.35, contrast: 1.12 } },
+  { id: "vivid-warm", name: "Vivid Warm", patch: { saturation: 1.35, contrast: 1.12, temperature: 0.35 } },
+  { id: "vivid-cool", name: "Vivid Cool", patch: { saturation: 1.35, contrast: 1.12, temperature: -0.35 } },
+  { id: "dramatic", name: "Dramatic", patch: { saturation: 0.82, contrast: 1.38, brightness: 0.95 } },
+  { id: "dramatic-warm", name: "Dramatic Warm", patch: { saturation: 0.82, contrast: 1.38, brightness: 0.95, temperature: 0.3 } },
+  { id: "dramatic-cool", name: "Dramatic Cool", patch: { saturation: 0.82, contrast: 1.38, brightness: 0.95, temperature: -0.3 } },
+  { id: "mono", name: "Mono", patch: { saturation: 0, contrast: 1.06 } },
+  { id: "silvertone", name: "Silvertone", patch: { saturation: 0, contrast: 1.1, temperature: 0.16 } },
+  { id: "noir", name: "Noir", patch: { saturation: 0, contrast: 1.45, brightness: 0.9 } },
+];
+
+// Neutral look fields a filter resets before applying its patch.
+const FILTER_NEUTRAL = { saturation: 1, contrast: 1, brightness: 1, temperature: 0, tint: 0 };
+
+// CSS for a tiny filter thumbnail. Temperature/tint are rendered by the same
+// white-balance overlay used on the tiles (CSS can't cast a color), so warm/cool
+// variants read correctly here too.
+function filterThumbCss(patch: Record<string, number>): string {
+  return `saturate(${patch.saturation ?? 1}) contrast(${patch.contrast ?? 1}) brightness(${patch.brightness ?? 1})`;
+}
+
+function FilterRow({ filter, clipSrc, active, onClick }: {
+  filter: PhotoFilterDef; clipSrc: string; active: boolean; onClick: () => void;
+}) {
+  const wb = whiteBalanceStyle(filter.patch as unknown as VideoLayout);
+  return (
+    <button type="button" className={`ph-filter ${active ? "active" : ""}`} onClick={onClick}>
+      <span className="ph-filter-thumb">
+        <video src={clipSrc} muted playsInline preload="auto" style={{ filter: filterThumbCss(filter.patch) }} />
+        {wb ? <div style={wb} /> : null}
+      </span>
+      <span className="ph-filter-name">{filter.name}</span>
+    </button>
+  );
+}
+
 function AdjustSection({ section, grade, open, onToggleOpen, onAdjust }: {
   section: AdjustSectionDef; grade: VideoLayout; open: boolean; onToggleOpen: () => void; onAdjust: (patch: Record<string, number>) => void;
 }) {
@@ -5412,10 +5596,14 @@ export function VideoMonitorApp() {
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
+  const [exportProgress, setExportProgress] = useState<number | null>(null);
+  const [exportStage, setExportStage] = useState<string>("");
   // Photos-style adjust: the clip being edited and its live (un-persisted) grade.
   const [focusedClipId, setFocusedClipId] = useState<string | null>(null);
   const [draftLayout, setDraftLayout] = useState<VideoLayout | null>(null);
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({ light: true, color: true });
+  const [panelTab, setPanelTab] = useState<"adjust" | "filters">("adjust");
+  const [selectedFilter, setSelectedFilter] = useState("original");
   const persistTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
@@ -5432,6 +5620,10 @@ export function VideoMonitorApp() {
     void listen<{ trackIds: string[] }>("video-monitor:selection", (e) => setSelectedIds(e.payload.trackIds ?? [])).then((fn) => unsubs.push(fn));
     void api.onSessionExternallyUpdated((e) => setProject((prev) => (prev && prev.session.id === e.sessionId ? e.project : prev))).then((fn) => unsubs.push(fn));
     void api.onPlayhead((e) => { playRef.current = { sample: e.sample, running: e.running }; }).then((fn) => unsubs.push(fn));
+    void listen<{ percent: number; stage: string }>("video-export:progress", (e) => {
+      setExportProgress(e.payload.percent);
+      setExportStage(e.payload.stage);
+    }).then((fn) => unsubs.push(fn));
     return () => unsubs.forEach((f) => f());
   }, []);
 
@@ -5472,14 +5664,15 @@ export function VideoMonitorApp() {
     if (target) {
       setFocusedClipId(target.id);
       setDraftLayout(target.layout);
+      setSelectedFilter("original");
     }
   }, [selectedIds, allClips, focusedClipId]);
 
-  // Show only the selected video tracks when a selection exists; otherwise all.
-  const clips = useMemo(() => {
-    const selected = allClips.filter((c) => selectedIds.includes(c.trackId));
-    return selected.length > 0 ? selected : allClips;
-  }, [allClips, selectedIds]);
+  // Show only the selected video tracks. If nothing is selected, show nothing.
+  const clips = useMemo(
+    () => allClips.filter((c) => selectedIds.includes(c.trackId)),
+    [allClips, selectedIds],
+  );
 
   // Keep every tile's playback locked to the engine playhead.
   useEffect(() => {
@@ -5559,7 +5752,9 @@ export function VideoMonitorApp() {
     });
     if (!outputPath) return;
     setExporting(true);
-    setExportStatus("Exporting…");
+    setExportStatus(null);
+    setExportProgress(0);
+    setExportStage("start");
     try {
       const res = await api.exportVideo(
         exportClip.path,
@@ -5568,11 +5763,13 @@ export function VideoMonitorApp() {
         exportRes === "source" ? undefined : exportRes,
         exportMode,
       );
+      setExportProgress(100);
       setExportStatus(`Exported to ${res.path}`);
     } catch (error) {
       setExportStatus(error instanceof Error ? error.message : String(error));
     } finally {
       setExporting(false);
+      setExportProgress(null);
     }
   }
 
@@ -5582,6 +5779,7 @@ export function VideoMonitorApp() {
   function focusClip(c: MonitorClip) {
     setFocusedClipId(c.id);
     setDraftLayout(c.layout);
+    setSelectedFilter("original");
     void emit("video-monitor:select", { trackId: c.trackId }).catch(() => undefined);
   }
 
@@ -5628,32 +5826,61 @@ export function VideoMonitorApp() {
     </main>
     {focusGrade && focusedClip ? (
       <aside className="video-monitor-adjust photos">
-        <div className="ph-head">
-          <span>ADJUST</span>
-          <button type="button" className="ph-share" onClick={() => setShareOpen(true)} title="Share / Export">
-            <Share2 size={11} />
-            Share
-          </button>
+        <div className="ph-tabs">
+          <button type="button" className={panelTab === "adjust" ? "active" : ""} onClick={() => setPanelTab("adjust")}>Adjust</button>
+          <button type="button" className={panelTab === "filters" ? "active" : ""} onClick={() => setPanelTab("filters")}>Filters</button>
         </div>
-        <div className="ph-sections">
-          {ADJUST_SECTIONS.map((sec) => (
-            <AdjustSection
-              key={sec.id}
-              section={sec}
-              grade={focusGrade}
-              open={!!openSections[sec.id]}
-              onToggleOpen={() => setOpenSections((o) => ({ ...o, [sec.id]: !o[sec.id] }))}
-              onAdjust={(p) => adjust(p as Partial<VideoLayout>)}
-            />
-          ))}
-        </div>
-        <button
-          type="button"
-          className="ph-reset-all"
-          onClick={() => adjust({ exposure: 0, highlights: 0, shadows: 0, gamma: 1, brightness: 1, contrast: 1, saturation: 1, temperature: 0, tint: 0, sharpen: 0, grain: 0, vignette: 0, blur: 0, preset: "none" })}
-        >
-          Reset Adjustments
-        </button>
+        {panelTab === "adjust" ? (
+          <>
+            <div className="ph-head">
+              <span>ADJUST</span>
+              <button type="button" className="ph-share" onClick={() => setShareOpen(true)} title="Share / Export">
+                <Share2 size={11} />
+                Share
+              </button>
+            </div>
+            <div className="ph-sections">
+              {ADJUST_SECTIONS.map((sec) => (
+                <AdjustSection
+                  key={sec.id}
+                  section={sec}
+                  grade={focusGrade}
+                  open={!!openSections[sec.id]}
+                  onToggleOpen={() => setOpenSections((o) => ({ ...o, [sec.id]: !o[sec.id] }))}
+                  onAdjust={(p) => adjust(p as Partial<VideoLayout>)}
+                />
+              ))}
+            </div>
+            <button
+              type="button"
+              className="ph-reset-all"
+              onClick={() => adjust({ exposure: 0, highlights: 0, shadows: 0, gamma: 1, brightness: 1, contrast: 1, saturation: 1, temperature: 0, tint: 0, sharpen: 0, grain: 0, vignette: 0, blur: 0, preset: "none" })}
+            >
+              Reset Adjustments
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="ph-head">
+              <span>FILTERS</span>
+              <button type="button" className="ph-share" onClick={() => setShareOpen(true)} title="Share / Export">
+                <Share2 size={11} />
+                Share
+              </button>
+            </div>
+            <div className="ph-filters">
+              {PHOTO_FILTERS.map((f) => (
+                <FilterRow
+                  key={f.id}
+                  filter={f}
+                  clipSrc={convertFileSrc(focusedClip.path)}
+                  active={selectedFilter === f.id}
+                  onClick={() => { setSelectedFilter(f.id); adjust({ ...FILTER_NEUTRAL, ...f.patch }); }}
+                />
+              ))}
+            </div>
+          </>
+        )}
       </aside>
     ) : (
       <aside className="video-monitor-adjust photos empty">
@@ -5691,7 +5918,22 @@ export function VideoMonitorApp() {
               </select>
             </label>
             {exportDims ? <div className="share-dims">Output · {exportDims}</div> : null}
-            {exportStatus ? <div className="share-status">{exportStatus}</div> : null}
+            {exporting ? (
+              <div className="share-progress">
+                <div className="share-progress-head">
+                  <span>{exportStage === "finishing" || exportStage === "done" ? "Finalizing…" : "Building video…"}</span>
+                  <span>{exportProgress != null ? `${Math.round(exportProgress)}%` : ""}</span>
+                </div>
+                <div className="share-progress-track">
+                  <div
+                    className={`share-progress-fill ${exportProgress == null || exportProgress <= 0 ? "indeterminate" : ""}`}
+                    style={exportProgress != null && exportProgress > 0 ? { width: `${exportProgress}%` } : undefined}
+                  />
+                </div>
+              </div>
+            ) : exportStatus ? (
+              <div className="share-status">{exportStatus}</div>
+            ) : null}
           </div>
           <div className="share-modal-foot">
             <button type="button" className="share-cancel" onClick={() => setShareOpen(false)} disabled={exporting}>Cancel</button>
@@ -7306,26 +7548,47 @@ function InspectorSlider({
 }) {
   const [local, setLocal] = useState(value);
   const draggingRef = useRef(false);
+  const lastLiveRef = useRef(0);
   useEffect(() => { if (!draggingRef.current) setLocal(value); }, [value]);
   const commit = (v: number) => { draggingRef.current = false; onCommit(v); };
+  const reset = () => { draggingRef.current = false; setLocal(resetValue); onCommit(resetValue); };
+  // Live update while dragging so Vol/Pan affect the track in real time, throttled
+  // to ~14 Hz so we don't flood the backend; the final value commits on release.
+  const onDrag = (v: number) => {
+    setLocal(v);
+    const now = performance.now();
+    if (now - lastLiveRef.current >= 70) {
+      lastLiveRef.current = now;
+      onCommit(v);
+    }
+  };
+  const span = max - min || 1;
+  const frac = Math.min(1, Math.max(0, (local - min) / span));
+  const bipolar = min < 0 && max > 0;
+  const origin = bipolar ? (0 - min) / span : 0;
+  const a = Math.min(origin, frac);
+  const b = Math.max(origin, frac);
+  // Same pill design as the video-monitor Adjust sliders.
   return (
-    <label className="inspector-field" title={title}>
-      <span>{label}</span>
+    <div className="ph-slider" title={title} onDoubleClick={reset}>
+      <div className="ph-slider-fill" style={{ left: `${a * 100}%`, width: `${(b - a) * 100}%` }} />
+      <div className="ph-slider-tick" style={{ left: `${frac * 100}%` }} />
+      <span className="ph-slider-label">{label}</span>
+      <span className="ph-slider-value">{format(local)}</span>
       <input
+        className="ph-slider-input"
         type="range"
         min={min}
         max={max}
         step={step}
         value={local}
         onPointerDown={() => { draggingRef.current = true; }}
-        onChange={(event) => setLocal(Number(event.target.value))}
+        onChange={(event) => onDrag(Number(event.target.value))}
         onPointerUp={(event) => commit(Number((event.currentTarget as HTMLInputElement).value))}
         onKeyUp={(event) => commit(Number((event.currentTarget as HTMLInputElement).value))}
         onBlur={() => { draggingRef.current = false; }}
-        onDoubleClick={() => { draggingRef.current = false; setLocal(resetValue); onCommit(resetValue); }}
       />
-      <em>{format(local)}</em>
-    </label>
+    </div>
   );
 }
 
@@ -7523,19 +7786,17 @@ function TrackInspector({
                 </>
               );
             })()}
-            <label className="inspector-field" title="Input gain. Double-click the slider to reset to 0 dB.">
-              <span>In</span>
-              <input
-                type="range"
-                min="-24"
-                max="24"
-                step="0.5"
-                value={inputGainDb}
-                onChange={(event) => onInputGainChange(track.id, Number(event.target.value))}
-                onDoubleClick={() => onInputGainChange(track.id, 0)}
-              />
-              <em>{formatDb(inputGainDb)}</em>
-            </label>
+            <InspectorSlider
+              label="In"
+              title="Input gain. Double-click the slider to reset to 0 dB."
+              value={inputGainDb}
+              min={-24}
+              max={24}
+              step={0.5}
+              format={formatDb}
+              resetValue={0}
+              onCommit={(v) => onInputGainChange(track.id, v)}
+            />
             <InspectorSlider
               label="Latency"
               title="Compensates the recording's placement on the timeline to align with what was actually playing. Positive ms = shift earlier. Double-click the slider to reset."

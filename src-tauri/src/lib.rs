@@ -38,6 +38,71 @@ pub struct AppState {
     pub input_monitor: Mutex<Option<recorder::InputMonitorHandle>>,
 }
 
+/// Build the full app menu (default + Edit extras + a dynamic File submenu with
+/// album/song switching) and set it. Called at setup and whenever the frontend's
+/// album/song list changes via the `set_file_menu` command. macOS menu mutation
+/// must happen on the main thread.
+pub fn build_and_set_menu(
+    app: &tauri::AppHandle,
+    albums: &[commands::MenuEntry],
+    sessions: &[commands::MenuEntry],
+    current_album: &str,
+    current_session: &str,
+) -> tauri::Result<()> {
+    use tauri::menu::{CheckMenuItemBuilder, SubmenuBuilder};
+
+    let mut albums_b = SubmenuBuilder::new(app, "Open Album");
+    for a in albums {
+        let item = CheckMenuItemBuilder::with_id(format!("album::{}", a.id), a.name.as_str())
+            .checked(a.id == current_album)
+            .build(app)?;
+        albums_b = albums_b.item(&item);
+    }
+    let albums_sub = albums_b.build()?;
+
+    let mut songs_b = SubmenuBuilder::new(app, "Open Song");
+    for s in sessions {
+        let item = CheckMenuItemBuilder::with_id(format!("song::{}", s.id), s.name.as_str())
+            .checked(s.id == current_session)
+            .build(app)?;
+        songs_b = songs_b.item(&item);
+    }
+    let songs_sub = songs_b.build()?;
+
+    let file = SubmenuBuilder::new(app, "File")
+        .text("file_new_album", "New Album")
+        .text("file_new_song", "New Song")
+        .separator()
+        .item(&albums_sub)
+        .item(&songs_sub)
+        .separator()
+        .text("file_rename_album", "Rename Album")
+        .text("file_rename_song", "Rename Song")
+        .separator()
+        .text("file_delete_album", "Delete Album")
+        .text("file_delete_song", "Delete Song")
+        .separator()
+        .text("file_save_bundle", "Save Project Bundle…")
+        .text("file_open_bundle", "Open Project Bundle…")
+        .build()?;
+
+    let menu = Menu::default(app)?;
+    let detect = MenuItemBuilder::with_id("edit_detect_structure", "Detect Song Structure")
+        .accelerator("CmdOrCtrl+Shift+D")
+        .build(app)?;
+    let level = MenuItemBuilder::with_id("edit_level_sections", "Level Song Sections")
+        .accelerator("CmdOrCtrl+Shift+L")
+        .build(app)?;
+    if let Some(MenuItemKind::Submenu(edit)) = menu.get("Edit") {
+        edit.append(&PredefinedMenuItem::separator(app)?)?;
+        edit.append(&detect)?;
+        edit.append(&level)?;
+    }
+    menu.insert(&file, 1)?;
+    app.set_menu(menu)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let config = Config::load();
@@ -69,27 +134,32 @@ pub fn run() {
             input_monitor: Mutex::new(None),
         })
         .setup(move |app| {
-            let menu = Menu::default(app.handle())?;
-            let detect_structure = MenuItemBuilder::with_id("edit_detect_structure", "Detect Song Structure")
-                .accelerator("CmdOrCtrl+Shift+D")
-                .build(app)?;
-            let level_sections = MenuItemBuilder::with_id("edit_level_sections", "Level Song Sections")
-                .accelerator("CmdOrCtrl+Shift+L")
-                .build(app)?;
-            if let Some(MenuItemKind::Submenu(edit)) = menu.get("Edit") {
-                edit.append(&PredefinedMenuItem::separator(app)?)?;
-                edit.append(&detect_structure)?;
-                edit.append(&level_sections)?;
-            }
-            app.set_menu(menu)?;
-            app.on_menu_event(|app, event| match event.id().as_ref() {
-                "edit_detect_structure" => {
-                    let _ = app.emit("menu:detect-structure", serde_json::json!({}));
+            let handle = app.handle().clone();
+            build_and_set_menu(&handle, &[], &[], "", "")?;
+            app.on_menu_event(|app, event| {
+                let id = event.id().as_ref();
+                if let Some(album_id) = id.strip_prefix("album::") {
+                    let _ = app.emit("menu:open-album", serde_json::json!({ "id": album_id }));
+                    return;
                 }
-                "edit_level_sections" => {
-                    let _ = app.emit("menu:level-sections", serde_json::json!({}));
+                if let Some(song_id) = id.strip_prefix("song::") {
+                    let _ = app.emit("menu:open-song", serde_json::json!({ "id": song_id }));
+                    return;
                 }
-                _ => {}
+                let event_name = match id {
+                    "edit_detect_structure" => "menu:detect-structure",
+                    "edit_level_sections" => "menu:level-sections",
+                    "file_new_album" => "menu:new-album",
+                    "file_new_song" => "menu:new-song",
+                    "file_rename_album" => "menu:rename-album",
+                    "file_rename_song" => "menu:rename-song",
+                    "file_delete_album" => "menu:delete-album",
+                    "file_delete_song" => "menu:delete-song",
+                    "file_save_bundle" => "menu:save-bundle",
+                    "file_open_bundle" => "menu:open-bundle",
+                    _ => return,
+                };
+                let _ = app.emit(event_name, serde_json::json!({}));
             });
             engine::telemetry::spawn_telemetry(app.handle().clone(), shared.clone());
             // In-process HTTP control surface that the Hermes agent sidecar drives
@@ -119,6 +189,12 @@ pub fn run() {
             commands::list_input_device_channels,
             commands::list_sessions,
             commands::create_session,
+            commands::list_albums,
+            commands::create_album,
+            commands::get_album,
+            commands::rename_album,
+            commands::delete_album,
+            commands::set_file_menu,
             commands::get_project,
             commands::import_audio_files,
             commands::create_recording_track,

@@ -270,13 +270,25 @@ async def reset(body: ResetBody):
 
 @app.post("/warmup")
 async def warmup():
-    """Pre-spawn the agent's MCP tool server (and connect the ACP session) at app
-    startup so the user's first real chat turn doesn't pay that one-time cost. Uses a
-    throwaway session that's dropped immediately."""
+    """Warm the agent at app startup so the user's FIRST real chat turn is fast.
+    Beyond spawning the MCP tool server, we send a tiny throwaway prompt through the
+    agent: that forces the LLM to PREFILL the large system prompt (base prompt + tool
+    schemas + ~11k-token skills snapshot) once, which llama.cpp then caches — so the
+    user's first message reuses the cache instead of paying the ~40s prefill. Runs in a
+    throwaway session that's dropped immediately, so it doesn't pollute any conversation."""
     sid = "__warmup__"
     try:
         async with bridge.turn_lock:
-            await bridge.acp_session_for(sid)
+            acp_sid = await bridge.acp_session_for(sid)
+            # A trivial prompt — its only purpose is to make the model ingest the system
+            # prompt so it's cached. We don't care about the answer.
+            try:
+                await bridge.conn.prompt(
+                    prompt=[acp.text_block("Reply with just: ready")],
+                    session_id=acp_sid,
+                )
+            except Exception:
+                pass
     except Exception:
         pass
     finally:
