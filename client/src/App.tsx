@@ -197,6 +197,9 @@ export function App() {
   // Seconds the current agent turn has been running — shown so a slow (esp. first) turn
   // never looks frozen. The first turn warms a large model prompt and is the slowest.
   const [turnElapsed, setTurnElapsed] = useState(0);
+  // Audio-download modal (format + scope) opened by the main Download button.
+  const [downloadOpen, setDownloadOpen] = useState(false);
+  const [exportFormat, setExportFormat] = useState<"wav" | "mp3">("mp3");
   const [videoEditorOpen, setVideoEditorOpen] = useState(false);
   const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("2");
   const [agentVideoModel, setAgentVideoModel] = useState(() => initialAgentVideoModelRef.current ?? DEFAULT_AGENT_VIDEO_MODEL);
@@ -2836,18 +2839,36 @@ export function App() {
     }
   }
 
-  async function renderCurrentMix() {
+  // Audio tracks in the current selection (video tracks have no real audio) — drives the
+  // "stems" export. A region narrows the time span. Both shown in the download modal.
+  const exportAudioTrackIds = useMemo(
+    () => (session ? selectedTrackIds.filter((id) => session.tracks.some((t) => t.id === id && t.kind !== "video")) : []),
+    [session, selectedTrackIds],
+  );
+  const exportRegion = selectedRange && Math.abs(selectedRange.end - selectedRange.start) > 0.02
+    ? { start: Math.max(0, Math.min(selectedRange.start, selectedRange.end)), end: Math.max(selectedRange.start, selectedRange.end) }
+    : undefined;
+
+  // Run the audio export with the chosen format, scoped to the selected region/tracks.
+  async function doDownloadAudio() {
     if (!session) return;
+    const ext = exportFormat;
+    const base = session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix";
     const outputPath = await save({
-      defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}.wav`,
-      filters: [{ name: "WAV", extensions: ["wav"] }]
+      defaultPath: `${base}.${ext}`,
+      filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
     });
     if (!outputPath) return;
+    setDownloadOpen(false);
     setBusy(true);
     try {
-      await api.renderMix(session.id, outputPath);
-      setMessages((items) => [...items, { role: "system", text: `Rendered ${outputPath}` }]);
-      pushToast("success", `Exported WAV to ${outputPath}`);
+      const startSample = exportRegion ? Math.round(exportRegion.start * session.sampleRate) : undefined;
+      const endSample = exportRegion ? Math.round(exportRegion.end * session.sampleRate) : undefined;
+      const trackIds = exportAudioTrackIds.length > 0 ? exportAudioTrackIds : undefined;
+      const res = await api.renderMix(session.id, outputPath, startSample, endSample, trackIds, ext);
+      const scope = `${trackIds ? `${trackIds.length} track${trackIds.length === 1 ? "" : "s"} (stems)` : "full mix"}${exportRegion ? `, ${formatTime(exportRegion.start)}–${formatTime(exportRegion.end)}` : ""}`;
+      setMessages((items) => [...items, { role: "system", text: `Exported ${ext.toUpperCase()} (${scope}) → ${res.path}` }]);
+      pushToast("success", `Exported ${ext.toUpperCase()} to ${res.path}`);
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -3492,7 +3513,7 @@ export function App() {
             </div>
             <span className="topbar-sep" aria-hidden="true" />
             <div className="topbar-group" role="group" aria-label="File">
-              <button onClick={() => void renderCurrentMix()} title="Export WAV"><Download size={15} /></button>
+              <button onClick={() => setDownloadOpen(true)} title="Export audio (WAV / MP3)"><Download size={15} /></button>
               <button className="upload" onClick={() => void importFiles()} title="Import audio"><Upload size={15} /></button>
               <button onClick={() => setShortcutsOpen(true)} title="Keyboard shortcuts (?)" aria-haspopup="dialog"><Keyboard size={15} /></button>
             </div>
@@ -4621,6 +4642,48 @@ export function App() {
           </div>
         );
       })()}
+      {downloadOpen ? (
+        <div className="settings-backdrop" onPointerDown={() => setDownloadOpen(false)}>
+          <div className="settings-modal download-modal" role="dialog" aria-modal="true" aria-label="Export audio" onPointerDown={(e) => e.stopPropagation()}>
+            <header className="settings-modal-head">
+              <h2>Export audio</h2>
+              <button className="icon-btn" onClick={() => setDownloadOpen(false)} aria-label="Close"><X size={18} /></button>
+            </header>
+            <div className="settings-modal-body">
+              <section className="settings-group">
+                <label className="settings-field">
+                  <span>Format</span>
+                  <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as "wav" | "mp3")}>
+                    <option value="mp3">MP3 — 320 kbps</option>
+                    <option value="wav">WAV — 24-bit, lossless</option>
+                  </select>
+                </label>
+              </section>
+              <section className="settings-group">
+                <div className="settings-group-title">What gets exported</div>
+                <ul className="download-scope">
+                  <li>
+                    <span>Tracks</span>
+                    <strong>{exportAudioTrackIds.length > 0 ? `${exportAudioTrackIds.length} selected (stems)` : "Full mix (all tracks)"}</strong>
+                  </li>
+                  <li>
+                    <span>Range</span>
+                    <strong>{exportRegion ? `${formatTime(exportRegion.start)}–${formatTime(exportRegion.end)}` : "Whole song"}</strong>
+                  </li>
+                </ul>
+                <p className="settings-group-desc">Select tracks and/or drag a region on the ruler to narrow the export.</p>
+              </section>
+              <div className="download-actions">
+                <button type="button" className="download-cancel" onClick={() => setDownloadOpen(false)}>Cancel</button>
+                <button type="button" className="download-export" onClick={() => void doDownloadAudio()} disabled={busy}>
+                  <Download size={15} />
+                  <span>Export {exportFormat.toUpperCase()}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {settingsOpen ? (
         <div className="settings-backdrop" onPointerDown={() => setSettingsOpen(false)}>
           <div className="settings-modal" role="dialog" aria-modal="true" aria-label="Settings" onPointerDown={(e) => e.stopPropagation()}>

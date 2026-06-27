@@ -97,31 +97,11 @@ def _track_summary_compact(project: dict) -> list[dict]:
 
 @mcp.tool()
 def get_session(session_id: str) -> dict:
-    """Return the AutoMixer session's tracks (id, name, role, gain, pan, mute, solo,
-    and for video tracks their clips + crop).
-
-    IMPORTANT — respect the user's selection: the response includes
-    `selectedTrackIds`, and every track has `selected: true/false`.
-
-    FOCUS MODE — if exactly ONE video track is selected, the user is editing THAT track
-    in isolation. You MUST:
-      • act ONLY on the selected track — never read, change, or even mention the other
-        cameras;
-      • for a LOOK/color/grade change ("make it vivid", "warmer", "cinematic"), call
-        edit_video with the look in `instructions`. It RENDERS the selected track with
-        the grade as a new output and does NOT touch the source recording. Rendering is
-        expected — that is how the look is produced.
-      • NEVER bake a look into the source by calling set_clip_layout with
-        saturation/brightness/contrast — that permanently alters the original footage,
-        which the user does not want. set_clip_layout is only for geometry the user asks
-        to persist (crop/reframe/rotate), not for color grading.
-    So "make it vivid" on a selected track = edit_video(instructions="vivid, saturated").
-    The sources stay exactly as recorded.
-
-    If several tracks are selected, act on exactly those (edit_video cuts a multicam edit
-    of them). If nothing is selected and the user named specific cameras, call
-    select_tracks(...) first to scope the edit to exactly those source tracks — do not
-    fall back to "all tracks". Never include the "Agent video edit" output as a source."""
+    """Return the AutoMixer session's tracks (id, name, role, gain, pan, mute, solo, and
+    for video tracks their clips + crop), plus `selectedTrackIds` and a `selected` flag on
+    each track. Respect the user's selection — if any tracks are selected, act only on
+    those. For audio work see the audio-mixing skill; for video work see the
+    video-editing skill (selection/focus-mode rules and which tool to use live there)."""
     project = _request("GET", f"/control/session/{session_id}")
     selected = set()
     try:
@@ -151,50 +131,14 @@ def select_tracks(session_id: str, track_ids: list[str]) -> dict:
 
 
 @mcp.tool()
-def set_track_gain(session_id: str, track_id: str, gain_db: float) -> dict:
-    """Set a track's volume in decibels (clamped by the app to [-24, +24] dB)."""
-    project = _request(
-        "POST",
-        f"/control/session/{session_id}/actions",
-        {
-            "actions": [{"tool": "set_track_gain", "trackId": track_id, "gainDb": gain_db}],
-            "explanation": "hermes: set_track_gain",
-        },
-    )
-    applied = next((t for t in _track_summary_compact(project) if t["id"] == track_id), None)
-    return {"ok": True, "track": applied}
-
-
-@mcp.tool()
 def apply_actions(session_id: str, actions: list[dict], explanation: str = "") -> dict:
-    """Apply one or more mixing actions to the session (the full audio surface). Each
-    action is a flat object with a `tool` discriminator (snake_case) and camelCase
-    fields; trackIds/regionIds come from get_session. Combine many in one call.
+    """Apply one or more audio mixing actions (gain, pan, mute/solo, EQ, filters,
+    compression, sends, regions, automation, master). Each action is a flat object with a
+    snake_case `tool` discriminator and camelCase fields; trackIds/regionIds come from
+    get_session. Combine many in one call; all changes are reversible via undo.
 
-    Available actions:
-      {"tool":"set_track_gain","trackId":"..","gainDb":-3.0}        # [-24..24]
-      {"tool":"adjust_track_gain","trackId":"..","deltaDb":-2.0}
-      {"tool":"set_track_pan","trackId":"..","pan":-0.3}            # [-1 L .. 1 R]
-      {"tool":"mute_track","trackId":"..","muted":true}
-      {"tool":"solo_track","trackId":"..","solo":true}
-      {"tool":"set_high_pass","trackId":"..","frequencyHz":90,"slopeDbOct":12}   # slope 12|24
-      {"tool":"set_low_pass","trackId":"..","frequencyHz":12000,"slopeDbOct":12}
-      {"tool":"set_eq_band","trackId":"..","band":1,"frequencyHz":300,"gainDb":-2.0,"q":1.1}  # band 0..3
-      {"tool":"set_compressor","trackId":"..","thresholdDb":-18,"ratio":2.5,"attackMs":12,"releaseMs":180,"kneeDb":6,"makeupDb":2}
-      {"tool":"set_reverb_send","trackId":"..","levelDb":-12}       # [-60..0]
-      {"tool":"set_delay_send","trackId":"..","levelDb":-18}
-      {"tool":"rename_track","trackId":"..","name":"Lead Vocal"}
-      {"tool":"set_track_role","trackId":"..","role":"lead_vocal"}
-      {"tool":"set_track_ai_generated","trackId":"..","aiGenerated":true}
-      {"tool":"delete_track","trackId":".."}
-      {"tool":"set_master_gain","gainDb":-1.0}
-      {"tool":"adjust_master_gain","deltaDb":-0.5}
-      {"tool":"create_region","name":"Chorus 1","startSample":0,"endSample":480000,"trackIds":["..."]}
-      {"tool":"set_region_gain","regionId":"..","trackId":"..","gainDb":1.5}
-      {"tool":"apply_section_automation","regionId":"..","trackId":"..","param":"gainDb","value":-1.0}
-
-    All changes are reversible via undo. Returns the updated track summary.
-    """
+    See the **audio-mixing** skill for the full action vocabulary (exact field names and
+    ranges) and how to approach a mix — read it before doing non-trivial audio work."""
     project = _request(
         "POST",
         f"/control/session/{session_id}/actions",
@@ -258,16 +202,12 @@ def set_clip_layout(
     saturation: float | None = None,
     blur: float | None = None,
 ) -> dict:
-    """Persistently change a SOURCE clip's geometry. `crop_*` = percent to REMOVE from
-    each edge (0-45). x/y/width/height = percent of the canvas (reposition/resize).
-    rotation = degrees. Get track_id + clip_id from get_session (video tracks list
-    their clips). Only pass the fields you want to change. Takes effect on the next
-    video render; the monitor previews it live.
-
-    This MODIFIES the original recording, so use it only when the user explicitly wants
-    a permanent geometry change. For a LOOK/color grade (vivid, warm, cinematic) do NOT
-    use the saturation/brightness/contrast fields here — call edit_video instead, which
-    grades the rendered OUTPUT and leaves the source footage untouched."""
+    """Persistently change a SOURCE clip's GEOMETRY (crop/reframe/rotate/reposition). Get
+    track_id + clip_id from get_session. Only pass fields you want to change. This MODIFIES
+    the original recording — use it only for a permanent geometry change. For a LOOK/color
+    grade, use edit_video instead (do NOT use the brightness/contrast/saturation fields
+    here). See the **video-editing** skill for the field meanings/ranges and which video
+    tool to use for which request."""
     fields = {
         "trackId": track_id, "clipId": clip_id,
         "cropTop": crop_top, "cropRight": crop_right, "cropBottom": crop_bottom, "cropLeft": crop_left,

@@ -8376,3 +8376,84 @@ button.primary:hover { filter: brightness(1.09); }
 /* Tighter chat. */
 .assistant .assistant-head { height: 36px; }
 .assistant .message { padding: 6px 8px; }
+
+/* Audio download modal — format choice + export scope. */
+.download-modal { max-width: 460px; }
+.download-format { display: flex; gap: 10px; }
+.download-format-chip {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #29362c;
+  background: #0c0e0e;
+  color: var(--text, #e6edf3);
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+.download-format-chip span { font-size: var(--text-xs, 11px); color: var(--text-dim, #8b96a2); }
+.download-format-chip.active {
+  border-color: rgba(111, 183, 216, 0.55);
+  background: var(--accent-soft, rgba(125, 184, 255, 0.12));
+}
+.download-scope {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.download-scope li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 10px;
+  border: 1px solid #29362c;
+  border-radius: 8px;
+  background: #131a14;
+  font-size: var(--text-sm, 12px);
+}
+.download-scope li > span { color: var(--text-dim, #8b96a2); }
+.download-scope li > strong { color: var(--text, #e6edf3); }
+
+/* Download modal — action row with a clear primary Export button. */
+.download-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+.download-cancel {
+  padding: 9px 14px;
+  border-radius: 9px;
+  border: 1px solid #29362c;
+  background: transparent;
+  color: var(--text-dim, #9aa6b2);
+  font-size: var(--text-sm, 12px);
+  cursor: pointer;
+}
+.download-cancel:hover { color: var(--text, #e6edf3); border-color: #3a4a3e; }
+.download-export {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 18px;
+  border-radius: 9px;
+  border: 1px solid rgba(111, 183, 216, 0.5);
+  background: var(--accent-soft, rgba(125, 184, 255, 0.16));
+  color: var(--accent-strong, #7db8ff);
+  font-weight: 600;
+  font-size: var(--text-sm, 12.5px);
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+.download-export:hover:not(:disabled) {
+  background: rgba(125, 184, 255, 0.24);
+  border-color: rgba(125, 184, 255, 0.7);
+}
+.download-export:disabled { opacity: 0.5; cursor: default; }

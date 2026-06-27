@@ -1843,11 +1843,68 @@ pub async fn analyze_master_structure(
 }
 
 #[tauri::command]
-pub fn render_mix(state: State<'_, AppState>, session_id: String, output_path: String) -> Result<RenderResponse, String> {
-    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
-    let path = normalize_wav_path(PathBuf::from(output_path));
-    audio::render_mix(&project.session, &path)?;
-    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+pub fn render_mix(
+    state: State<'_, AppState>,
+    session_id: String,
+    output_path: String,
+    // Optional region (samples) — when set, only that span is rendered.
+    start_sample: Option<u64>,
+    end_sample: Option<u64>,
+    // Optional track subset — when non-empty, renders a STEM of just those tracks.
+    track_ids: Option<Vec<String>>,
+    // "wav" (default) or "mp3".
+    format: Option<String>,
+) -> Result<RenderResponse, String> {
+    let mut project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+
+    // Stems: keep only the requested tracks (in their original order) when a non-empty
+    // list is given; otherwise render the full mix.
+    if let Some(ids) = track_ids.as_ref().filter(|v| !v.is_empty()) {
+        let want: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+        project.session.tracks.retain(|t| want.contains(t.id.as_str()));
+        if project.session.tracks.is_empty() {
+            return Err("None of the selected tracks were found to export.".into());
+        }
+    }
+
+    let want_mp3 = format.as_deref() == Some("mp3");
+    let requested = PathBuf::from(&output_path);
+    // Render WAV first — straight to the final path for WAV, or to a temp for MP3.
+    let wav_path = if want_mp3 {
+        std::env::temp_dir().join(format!("automixer-export-{}.wav", uuid::Uuid::new_v4()))
+    } else {
+        normalize_wav_path(requested.clone())
+    };
+    match (start_sample, end_sample) {
+        (Some(s), Some(e)) if e > s => {
+            crate::engine::render::render_session_range(&project.session, &wav_path, s, e)?;
+        }
+        _ => {
+            audio::render_mix(&project.session, &wav_path)?;
+        }
+    }
+
+    if want_mp3 {
+        let mp3_path = if requested.extension().and_then(|x| x.to_str()) == Some("mp3") {
+            requested
+        } else {
+            requested.with_extension("mp3")
+        };
+        let output = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&wav_path)
+            .args(["-codec:a", "libmp3lame", "-b:a", "320k"])
+            .arg(&mp3_path)
+            .output()
+            .map_err(|e| format!("Could not run ffmpeg for MP3 export. Install ffmpeg: {e}"))?;
+        let _ = fs::remove_file(&wav_path);
+        if !output.status.success() {
+            return Err(format!("ffmpeg MP3 encode failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        }
+        return Ok(RenderResponse { path: mp3_path.to_string_lossy().to_string() });
+    }
+
+    Ok(RenderResponse { path: wav_path.to_string_lossy().to_string() })
 }
 
 #[tauri::command]

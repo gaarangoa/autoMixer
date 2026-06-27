@@ -88,7 +88,9 @@ export const api = {
     listen("menu:detect-structure", () => cb()),
   onMenuLevelSections: (cb: () => void): Promise<UnlistenFn> =>
     listen("menu:level-sections", () => cb()),
-  renderMix: (sessionId: string, outputPath: string) => tauriInvoke<{ path: string }>("render_mix", { sessionId, outputPath }),
+  // Export the audio mix. Optional region (samples) + track subset (stems) + format.
+  renderMix: (sessionId: string, outputPath: string, startSample?: number, endSample?: number, trackIds?: string[], format: "wav" | "mp3" = "wav") =>
+    tauriInvoke<{ path: string }>("render_mix", { sessionId, outputPath, startSample, endSample, trackIds, format }),
   saveVideoRecording: (sessionId: string, trackId: string, fileName: string, mimeType: string, startSample: number, durationMs: number, dataBase64: string, createAudioTrack = false, sourceOffsetMs = 0) =>
     tauriInvoke<MixProject>("save_video_recording", { sessionId, trackId, fileName, mimeType, startSample, durationMs, dataBase64, createAudioTrack, sourceOffsetMs }),
   renderVideoMix: (sessionId: string, outputPath: string, startSample?: number, endSample?: number, trackIds?: string[], aspectRatio?: ExportAspect, quality?: ExportQuality) =>

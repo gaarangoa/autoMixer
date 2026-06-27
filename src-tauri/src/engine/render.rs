@@ -223,6 +223,52 @@ fn build_render_mixer(session: &MixSession, master_bypass: bool) -> Result<(Mixe
     Ok((mixer, total_with_tail, channels, sample_rate))
 }
 
+/// Like `render_session`, but writes only the sub-range [range_start, range_end) — used
+/// by the WAV download when the user has a region selected on the ruler.
+pub fn render_session_range(
+    session: &MixSession,
+    output_path: &Path,
+    range_start: u64,
+    range_end: u64,
+) -> Result<PathBuf, String> {
+    let path = if output_path.extension().is_some() {
+        output_path.to_path_buf()
+    } else {
+        output_path.with_extension("wav")
+    };
+    let (mut mixer, total_with_tail, channels, _sample_rate) = build_render_mixer(session, false)?;
+    let safe_end = range_end.min(total_with_tail);
+    let start = range_start.min(safe_end);
+    let spec = WavSpec {
+        channels,
+        sample_rate: session.sample_rate,
+        bits_per_sample: 24,
+        sample_format: SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(&path, spec).map_err(|e| e.to_string())?;
+    // Seek to the region start (the Play command is drained on the first render call).
+    mixer.playhead = start as f64;
+    mixer.shared.playhead.store(start, std::sync::atomic::Ordering::Relaxed);
+    let frames_needed = safe_end.saturating_sub(start) as usize;
+    let mut block = vec![0.0_f32; RENDER_BLOCK * channels as usize];
+    let mut produced: usize = 0;
+    while produced < frames_needed {
+        mixer.render(&mut block);
+        let frames_this_block = block.len() / channels as usize;
+        let to_write = (frames_needed - produced).min(frames_this_block);
+        for f in 0..to_write {
+            for c in 0..channels as usize {
+                let s = block[f * channels as usize + c].clamp(-1.0, 1.0);
+                let i32_sample = (s * 8_388_607.0) as i32;
+                writer.write_sample(i32_sample).map_err(|e| e.to_string())?;
+            }
+        }
+        produced += to_write;
+    }
+    writer.finalize().map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 pub fn render_session(session: &MixSession, output_path: &Path) -> Result<PathBuf, String> {
     let path = if output_path.extension().is_some() {
         output_path.to_path_buf()

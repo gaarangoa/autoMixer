@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -206,12 +207,36 @@ class Bridge:
         no_skills = Path.home() / ".automixer" / "hermes-no-skills"
         no_skills.mkdir(parents=True, exist_ok=True)
         env["HERMES_BUNDLED_SKILLS"] = str(no_skills)
+        # Deploy AutoMixer's CURATED skills (mixing/video/auto-mix doctrine) into the
+        # dedicated home's skills dir, so the agent loads only these — the heavy
+        # vocabulary/taste lives here (loaded on demand) instead of bloating every tool
+        # description. Synced each launch so editing a repo skill updates the agent.
+        self._deploy_skills(env.get("HERMES_HOME"))
         self._cm = acp.spawn_agent_process(self, HERMES, "acp", env=env)
         self.conn, self.proc = await self._cm.__aenter__()
         await self.conn.initialize(
             protocol_version=acp.PROTOCOL_VERSION,
             client_capabilities={"fs": {"readTextFile": False, "writeTextFile": False}},
         )
+
+    @staticmethod
+    def _deploy_skills(hermes_home: str | None) -> None:
+        if not hermes_home:
+            return
+        src = Path(__file__).parent / "automixer-skills"
+        if not src.exists():
+            return
+        dst_root = Path(hermes_home) / "skills"
+        dst_root.mkdir(parents=True, exist_ok=True)
+        for skill_dir in src.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            dst = dst_root / skill_dir.name
+            try:
+                shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(skill_dir, dst)
+            except Exception:
+                pass
 
     async def stop(self) -> None:
         if self._cm is not None:
