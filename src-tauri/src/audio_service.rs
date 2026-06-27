@@ -15,6 +15,30 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_PORT: u16 = 7321;
 
+/// Kill any process still bound to `port` — a stale sidecar from a previous
+/// launch that didn't clean up on a hard exit. Lets a fresh app own its sidecar.
+fn free_stale_port(port: u16) {
+    let Ok(out) = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+    else {
+        return;
+    };
+    let me = std::process::id();
+    let mut killed = false;
+    for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+        if let Ok(n) = pid.parse::<u32>() {
+            if n != me {
+                let _ = Command::new("kill").arg("-9").arg(n.to_string()).status();
+                killed = true;
+            }
+        }
+    }
+    if killed {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Section {
@@ -60,6 +84,9 @@ impl AudioService {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(DEFAULT_PORT);
         let base_url = format!("http://127.0.0.1:{port}");
+        // Kill any stale sidecar still holding this port from a previous launch
+        // (a hard exit skips the Drop cleanup), so we always own a fresh sidecar.
+        free_stale_port(port);
 
         let log_path = log_path();
         let log_handle = log_path

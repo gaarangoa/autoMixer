@@ -79,8 +79,35 @@ impl HermesService {
         }
     }
 
+    /// Kill any process still bound to `port` — a stale sidecar left over from a
+    /// previous launch that didn't clean up on a hard exit (e.g. a `tauri dev`
+    /// rebuild SIGKILL). Without this, a new app would talk to the dead sidecar
+    /// and every chat would abort mid-stream ("error decoding response body").
+    fn free_stale_port(port: u16) {
+        let Ok(out) = Command::new("lsof")
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output()
+        else {
+            return;
+        };
+        let me = std::process::id();
+        let mut killed = false;
+        for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            if let Ok(n) = pid.parse::<u32>() {
+                if n != me {
+                    let _ = Command::new("kill").arg("-9").arg(n.to_string()).status();
+                    killed = true;
+                }
+            }
+        }
+        if killed {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+
     /// Build and launch the uvicorn sidecar process for the given port.
     fn spawn_child(port: u16) -> Option<Child> {
+        Self::free_stale_port(port);
         let log_path = log_path();
         let log_handle = log_path.as_ref().and_then(|p| std::fs::File::create(p).ok());
         let stdout_target = log_handle

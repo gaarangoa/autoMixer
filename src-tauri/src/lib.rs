@@ -51,7 +51,7 @@ pub fn build_and_set_menu(
 ) -> tauri::Result<()> {
     use tauri::menu::{CheckMenuItemBuilder, SubmenuBuilder};
 
-    let mut albums_b = SubmenuBuilder::new(app, "Open Album");
+    let mut albums_b = SubmenuBuilder::new(app, "Recent Albums");
     for a in albums {
         let item = CheckMenuItemBuilder::with_id(format!("album::{}", a.id), a.name.as_str())
             .checked(a.id == current_album)
@@ -60,7 +60,7 @@ pub fn build_and_set_menu(
     }
     let albums_sub = albums_b.build()?;
 
-    let mut songs_b = SubmenuBuilder::new(app, "Open Song");
+    let mut songs_b = SubmenuBuilder::new(app, "Songs");
     for s in sessions {
         let item = CheckMenuItemBuilder::with_id(format!("song::{}", s.id), s.name.as_str())
             .checked(s.id == current_session)
@@ -69,8 +69,9 @@ pub fn build_and_set_menu(
     }
     let songs_sub = songs_b.build()?;
 
-    let file = SubmenuBuilder::new(app, "File")
-        .text("file_new_album", "New Album")
+    let file = SubmenuBuilder::new(app, "Project")
+        .text("file_new_album", "New Album…")
+        .text("file_open_album", "Open Album…")
         .text("file_new_song", "New Song")
         .separator()
         .item(&albums_sub)
@@ -87,6 +88,11 @@ pub fn build_and_set_menu(
         .build()?;
 
     let menu = Menu::default(app)?;
+    // Tauri's default menu may already include a "File" submenu — drop it so we
+    // don't end up with two.
+    if let Some(MenuItemKind::Submenu(existing_file)) = menu.get("File") {
+        let _ = menu.remove(&existing_file);
+    }
     let detect = MenuItemBuilder::with_id("edit_detect_structure", "Detect Song Structure")
         .accelerator("CmdOrCtrl+Shift+D")
         .build(app)?;
@@ -150,6 +156,7 @@ pub fn run() {
                     "edit_detect_structure" => "menu:detect-structure",
                     "edit_level_sections" => "menu:level-sections",
                     "file_new_album" => "menu:new-album",
+                    "file_open_album" => "menu:open-album",
                     "file_new_song" => "menu:new-song",
                     "file_rename_album" => "menu:rename-album",
                     "file_rename_song" => "menu:rename-song",
@@ -190,7 +197,10 @@ pub fn run() {
             commands::list_sessions,
             commands::create_session,
             commands::list_albums,
+            commands::list_recents,
             commands::create_album,
+            commands::open_album,
+            commands::create_default_session,
             commands::get_album,
             commands::rename_album,
             commands::delete_album,

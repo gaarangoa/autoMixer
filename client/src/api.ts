@@ -34,7 +34,11 @@ export const api = {
   sessions: (albumId: string) => tauriInvoke<MixSession[]>("list_sessions", { albumId }),
   createSession: (albumId: string, name: string) => tauriInvoke<MixProject>("create_session", { albumId, name }),
   albums: () => tauriInvoke<MixAlbum[]>("list_albums"),
-  createAlbum: (name: string) => tauriInvoke<MixAlbum>("create_album", { name }),
+  recents: () => tauriInvoke<{ id: string; name: string; path: string }[]>("list_recents"),
+  // Document model: createAlbum saves a new album folder inside `dir`; openAlbum loads one from disk.
+  createAlbum: (name: string, dir: string) => tauriInvoke<MixAlbum>("create_album", { name, dir }),
+  openAlbum: (path: string) => tauriInvoke<MixAlbum>("open_album", { path }),
+  createDefaultSession: (name: string) => tauriInvoke<MixProject>("create_default_session", { name }),
   getAlbum: (albumId: string) => tauriInvoke<MixAlbum>("get_album", { albumId }),
   renameAlbum: (albumId: string, name: string) => tauriInvoke<MixAlbum>("rename_album", { albumId, name }),
   deleteAlbum: (albumId: string) => tauriInvoke<void>("delete_album", { albumId }),

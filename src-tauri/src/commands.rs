@@ -372,8 +372,27 @@ pub fn list_albums(state: State<'_, AppState>) -> Result<Vec<crate::model::MixAl
 }
 
 #[tauri::command]
-pub fn create_album(state: State<'_, AppState>, name: String) -> Result<crate::model::MixAlbum, String> {
-    state.store.lock().map_err(|error| error.to_string())?.create_album(name)
+pub fn list_recents(state: State<'_, AppState>) -> Result<Vec<crate::store::RecentAlbum>, String> {
+    state.store.lock().map_err(|error| error.to_string())?.list_recents()
+}
+
+// Document model: `create_album` saves a NEW album folder inside `dir`; `open_album`
+// loads an existing album folder picked from disk.
+#[tauri::command]
+pub fn create_album(state: State<'_, AppState>, name: String, dir: String) -> Result<crate::model::MixAlbum, String> {
+    state.store.lock().map_err(|error| error.to_string())?.create_album_in(std::path::Path::new(&dir), name)
+}
+
+#[tauri::command]
+pub fn open_album(state: State<'_, AppState>, path: String) -> Result<crate::model::MixAlbum, String> {
+    state.store.lock().map_err(|error| error.to_string())?.open_album(std::path::Path::new(&path))
+}
+
+// Startup fallback: ensure there's a song to show when no albums exist yet
+// (creates a default app-managed album + song).
+#[tauri::command]
+pub fn create_default_session(state: State<'_, AppState>, name: String) -> Result<MixProject, String> {
+    state.store.lock().map_err(|error| error.to_string())?.create_session_default(name)
 }
 
 #[tauri::command]

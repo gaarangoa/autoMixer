@@ -8457,3 +8457,45 @@ button.primary:hover { filter: brightness(1.09); }
   border-color: rgba(125, 184, 255, 0.7);
 }
 .download-export:disabled { opacity: 0.5; cursor: default; }
+
+/* ===== Auto-mix stage panel (live + report) ===== */
+.automix-panel {
+  border: 1px solid #20262b;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  padding: 8px 10px;
+  margin: 6px 0;
+  font-size: 11px;
+}
+.automix-panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.automix-panel-title { font-weight: 700; letter-spacing: 0.02em; }
+.automix-panel-progress { color: #8a949c; font-variant-numeric: tabular-nums; }
+.automix-panel-list { display: flex; flex-direction: column; gap: 5px; }
+.automix-stage { border-left: 2px solid #2a3138; padding-left: 8px; }
+.automix-stage.running { border-left-color: #4aa3ff; }
+.automix-stage.complete { border-left-color: #3ddc84; }
+.automix-stage.error { border-left-color: #ff5d5d; }
+.automix-stage.skipped { border-left-color: #555; opacity: 0.7; }
+.automix-stage-row { display: flex; align-items: center; gap: 6px; }
+.automix-stage .stage-icon { width: 12px; text-align: center; }
+.automix-stage.running .stage-icon { color: #4aa3ff; animation: amx-pulse 1s ease-in-out infinite; }
+.automix-stage.complete .stage-icon { color: #3ddc84; }
+.automix-stage.error .stage-icon { color: #ff5d5d; }
+.automix-stage .stage-name { font-weight: 600; }
+.automix-stage .stage-count {
+  color: #cdd6dd;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 10px;
+}
+.automix-stage .stage-meta { margin-left: auto; color: #8a949c; font-size: 10px; font-variant-numeric: tabular-nums; }
+.automix-stage-note { color: #aeb8c0; margin: 2px 0 0 18px; line-height: 1.35; }
+.automix-stage-warn { color: #e8b53a; margin: 2px 0 0 18px; }
+.automix-stage-err { color: #ff7676; margin: 2px 0 0 18px; }
+@keyframes amx-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }

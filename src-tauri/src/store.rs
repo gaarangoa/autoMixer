@@ -12,14 +12,63 @@ use crate::{
     model::{ClipRegion, HistorySource, JsonPatchOp, MixAlbum, MixProject, MixSession, SourceFile, TrackAnalysis, TrackKind, VideoClipRegion, VideoLayout, VideoSourceFile},
 };
 
+/// A recently opened/created album: its id, display name, and on-disk folder.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecentAlbum {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+fn sanitize_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() { "Untitled Album".to_string() } else { trimmed.to_string() }
+}
+
+/// A non-colliding album folder named after `name` inside `parent`.
+fn unique_album_dir(parent: &Path, name: &str) -> PathBuf {
+    let base = sanitize_name(name);
+    let mut candidate = parent.join(&base);
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = parent.join(format!("{base} {n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Given an album folder, its songs/ dir, or a song file inside it, return the
+/// album folder (the dir containing album.json).
+fn resolve_album_dir(path: &Path) -> Option<PathBuf> {
+    let mut dir = if path.is_file() { path.parent()?.to_path_buf() } else { path.to_path_buf() };
+    for _ in 0..3 {
+        if dir.join("album.json").is_file() {
+            return Some(dir);
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => break,
+        }
+    }
+    None
+}
+
 pub struct SessionStore {
     data_dir: PathBuf,
+    /// album id -> on-disk album folder (user-chosen, document model).
+    album_index: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
 }
 
 impl SessionStore {
     pub fn new(data_dir: PathBuf) -> Self {
-        let store = Self { data_dir };
+        let store = Self { data_dir, album_index: std::sync::Mutex::new(std::collections::HashMap::new()) };
         let _ = store.init();
+        store.index_recent_albums();
+        let _ = store.migrate_legacy_albums();
         let _ = store.migrate_legacy_sessions();
         store
     }
@@ -79,7 +128,7 @@ impl SessionStore {
     pub fn list_sessions(&self, album_id: &str) -> Result<Vec<MixSession>, String> {
         self.init()?;
         let album = self.get_album(album_id)?;
-        let songs_dir = self.album_dir(album_id).join("songs");
+        let songs_dir = self.album_dir(album_id).ok_or_else(|| format!("Album {album_id} not open"))?.join("songs");
         let mut by_id: std::collections::HashMap<String, MixSession> = std::collections::HashMap::new();
         if songs_dir.is_dir() {
             for entry in fs::read_dir(&songs_dir).map_err(|error| error.to_string())? {
@@ -118,36 +167,86 @@ impl SessionStore {
 
     pub fn save(&self, project: &MixProject) -> Result<(), String> {
         self.init()?;
-        // Path follows the session's album. Legacy sessions with no album fall back
-        // to (and are adopted by) the default album.
-        let album_id = if project.session.album_id.trim().is_empty() {
-            self.default_album_id()?
-        } else {
-            project.session.album_id.clone()
+        // Path follows the session's album folder. If the album isn't known (legacy
+        // or orphan), fall back to (and adopt) the default app-managed album.
+        let dir = match self.album_dir(&project.session.album_id) {
+            Some(d) => d,
+            None => {
+                let id = self.default_album_id()?;
+                self.album_dir(&id).ok_or_else(|| "default album folder missing".to_string())?
+            }
         };
-        let songs_dir = self.album_dir(&album_id).join("songs");
+        let songs_dir = dir.join("songs");
         fs::create_dir_all(&songs_dir).map_err(|error| error.to_string())?;
         let path = songs_dir.join(format!("{}.json", project.session.id));
         fs::write(path, serde_json::to_string_pretty(project).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())
     }
 
-    // ---- Album manifest + folder helpers ------------------------------------
+    // ---- Album folders (document model — user-chosen locations) -------------
 
-    fn album_dir(&self, album_id: &str) -> PathBuf {
-        self.albums_dir().join(album_id)
+    fn recents_path(&self) -> PathBuf {
+        self.data_dir.join("recents.json")
     }
 
-    fn album_manifest_path(&self, album_id: &str) -> PathBuf {
-        self.album_dir(album_id).join("album.json")
+    fn read_recents(&self) -> Vec<RecentAlbum> {
+        fs::read_to_string(self.recents_path())
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
     }
 
-    /// Find the on-disk file for a session by scanning album song folders.
+    fn write_recents(&self, recents: &[RecentAlbum]) {
+        if let Ok(json) = serde_json::to_string_pretty(recents) {
+            let _ = fs::write(self.recents_path(), json);
+        }
+    }
+
+    /// Record an album at the front of the recents list (deduped, capped).
+    fn add_recent(&self, id: &str, name: &str, path: &Path) {
+        let mut recents = self.read_recents();
+        recents.retain(|r| r.id != id && Path::new(&r.path) != path);
+        recents.insert(0, RecentAlbum { id: id.to_string(), name: name.to_string(), path: path.to_string_lossy().to_string() });
+        recents.truncate(24);
+        self.write_recents(&recents);
+    }
+
+    /// Load every recent album's folder into the id->path index (dropping any
+    /// whose folder/manifest has gone missing).
+    fn index_recent_albums(&self) {
+        let recents = self.read_recents();
+        let mut still_valid = Vec::new();
+        if let Ok(mut index) = self.album_index.lock() {
+            for r in recents {
+                let dir = PathBuf::from(&r.path);
+                if dir.join("album.json").is_file() {
+                    index.insert(r.id.clone(), dir);
+                    still_valid.push(r);
+                }
+            }
+        }
+        self.write_recents(&still_valid);
+    }
+
+    fn album_dir(&self, album_id: &str) -> Option<PathBuf> {
+        self.album_index.lock().ok()?.get(album_id).cloned()
+    }
+
+    fn register_album(&self, id: &str, dir: &Path) {
+        if let Ok(mut index) = self.album_index.lock() {
+            index.insert(id.to_string(), dir.to_path_buf());
+        }
+    }
+
+    fn album_manifest_path(&self, album_id: &str) -> Option<PathBuf> {
+        self.album_dir(album_id).map(|d| d.join("album.json"))
+    }
+
+    /// Find the on-disk file for a session by scanning every open album folder.
     fn locate_session_file(&self, session_id: &str) -> Option<PathBuf> {
-        let albums = self.albums_dir();
-        let entries = fs::read_dir(albums).ok()?;
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("songs").join(format!("{session_id}.json"));
+        let dirs: Vec<PathBuf> = self.album_index.lock().ok()?.values().cloned().collect();
+        for dir in dirs {
+            let candidate = dir.join("songs").join(format!("{session_id}.json"));
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -155,45 +254,58 @@ impl SessionStore {
         None
     }
 
+    /// All known (recent) albums, freshest first; drops any whose folder vanished.
     pub fn list_albums(&self) -> Result<Vec<MixAlbum>, String> {
         self.init()?;
         let mut albums = Vec::new();
-        for entry in fs::read_dir(self.albums_dir()).map_err(|error| error.to_string())? {
-            let dir = entry.map_err(|error| error.to_string())?.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            let manifest = dir.join("album.json");
-            if let Ok(raw) = fs::read_to_string(&manifest) {
-                if let Ok(album) = serde_json::from_str::<MixAlbum>(&raw) {
-                    albums.push(album);
-                }
+        for r in self.read_recents() {
+            if let Ok(album) = self.get_album(&r.id) {
+                albums.push(album);
             }
         }
-        albums.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(albums)
     }
 
+    pub fn list_recents(&self) -> Result<Vec<RecentAlbum>, String> {
+        Ok(self.read_recents())
+    }
+
     pub fn get_album(&self, album_id: &str) -> Result<MixAlbum, String> {
-        let raw = fs::read_to_string(self.album_manifest_path(album_id))
-            .map_err(|_| format!("Album {album_id} not found"))?;
+        let manifest = self.album_manifest_path(album_id).ok_or_else(|| format!("Album {album_id} not open"))?;
+        let raw = fs::read_to_string(manifest).map_err(|_| format!("Album {album_id} not found on disk"))?;
         serde_json::from_str(&raw).map_err(|error| error.to_string())
     }
 
     fn save_album(&self, album: &MixAlbum) -> Result<(), String> {
-        let dir = self.album_dir(&album.id).join("songs");
-        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let dir = self.album_dir(&album.id).ok_or_else(|| format!("Album {} not open", album.id))?;
+        fs::create_dir_all(dir.join("songs")).map_err(|error| error.to_string())?;
         fs::write(
-            self.album_manifest_path(&album.id),
+            dir.join("album.json"),
             serde_json::to_string_pretty(album).map_err(|error| error.to_string())?,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        self.add_recent(&album.id, &album.name, &dir);
+        Ok(())
     }
 
-    pub fn create_album(&self, name: String) -> Result<MixAlbum, String> {
-        self.init()?;
+    /// Create a new album folder named `name` inside `parent_dir` (document model).
+    pub fn create_album_in(&self, parent_dir: &Path, name: String) -> Result<MixAlbum, String> {
+        let folder = unique_album_dir(parent_dir, &name);
+        fs::create_dir_all(folder.join("songs")).map_err(|error| error.to_string())?;
         let album = MixAlbum { id: Uuid::new_v4().to_string(), name, song_order: Vec::new() };
+        self.register_album(&album.id, &folder);
         self.save_album(&album)?;
+        Ok(album)
+    }
+
+    /// Open an existing album from its folder on disk.
+    pub fn open_album(&self, path: &Path) -> Result<MixAlbum, String> {
+        // Accept either the album folder, or a song file / songs dir inside it.
+        let dir = resolve_album_dir(path).ok_or_else(|| format!("No album.json found at {}", path.display()))?;
+        let raw = fs::read_to_string(dir.join("album.json")).map_err(|error| error.to_string())?;
+        let album: MixAlbum = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        self.register_album(&album.id, &dir);
+        self.add_recent(&album.id, &album.name, &dir);
         Ok(album)
     }
 
@@ -204,11 +316,13 @@ impl SessionStore {
         Ok(album)
     }
 
+    /// Forget an album (remove from recents/index). Leaves the folder on disk.
     pub fn delete_album(&self, album_id: &str) -> Result<(), String> {
-        let dir = self.album_dir(album_id);
-        if dir.exists() {
-            fs::remove_dir_all(dir).map_err(|error| error.to_string())?;
+        if let Ok(mut index) = self.album_index.lock() {
+            index.remove(album_id);
         }
+        let recents: Vec<RecentAlbum> = self.read_recents().into_iter().filter(|r| r.id != album_id).collect();
+        self.write_recents(&recents);
         Ok(())
     }
 
@@ -220,23 +334,48 @@ impl SessionStore {
         self.save_album(&album)
     }
 
-    /// The default album (created on demand) used for legacy/orphan sessions.
+    /// A default app-managed album (in the data dir) for callers without a chosen
+    /// location (the headless web/agent surface, or orphan sessions).
     fn default_album_id(&self) -> Result<String, String> {
-        if let Some(first) = self.list_albums()?.into_iter().next() {
-            return Ok(first.id);
+        if let Some(first) = self.read_recents().into_iter().next() {
+            if self.album_dir(&first.id).is_some() {
+                return Ok(first.id);
+            }
         }
-        Ok(self.create_album("My Album".to_string())?.id)
+        Ok(self.create_album_in(&self.albums_dir(), "My Album".to_string())?.id)
+    }
+
+    /// Register any pre-existing app-data albums (from the earlier in-app model)
+    /// into recents so users keep their albums after the move to the document model.
+    fn migrate_legacy_albums(&self) -> Result<(), String> {
+        let root = self.albums_dir();
+        if !root.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
+            let dir = entry.map_err(|error| error.to_string())?.path();
+            let manifest = dir.join("album.json");
+            if !manifest.is_file() {
+                continue;
+            }
+            if let Ok(raw) = fs::read_to_string(&manifest) {
+                if let Ok(album) = serde_json::from_str::<MixAlbum>(&raw) {
+                    self.register_album(&album.id, &dir);
+                    self.add_recent(&album.id, &album.name, &dir);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One-time migration: wrap pre-album `sessions/{id}.json` files into a default
-    /// album folder. Safe to call repeatedly — it no-ops once albums exist.
+    /// album. No-ops once any album exists.
     fn migrate_legacy_sessions(&self) -> Result<(), String> {
         let legacy = self.sessions_dir();
         if !legacy.is_dir() {
             return Ok(());
         }
-        // Already migrated (an album exists) → leave legacy files alone.
-        if !self.list_albums()?.is_empty() {
+        if !self.read_recents().is_empty() {
             return Ok(());
         }
         let mut legacy_files: Vec<PathBuf> = Vec::new();
@@ -249,7 +388,7 @@ impl SessionStore {
         if legacy_files.is_empty() {
             return Ok(());
         }
-        let album = self.create_album("My Album".to_string())?;
+        let album = self.create_album_in(&self.albums_dir(), "My Album".to_string())?;
         for path in legacy_files {
             if let Ok(raw) = fs::read_to_string(&path) {
                 if let Ok(mut project) = serde_json::from_str::<MixProject>(&raw) {

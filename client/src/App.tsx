@@ -15,6 +15,14 @@ const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "gpt-oss:20b";
 const DEFAULT_AGENT_VIDEO_MODEL = "qwen2.5vl:latest";
 
+// Cap the backing-store resolution of the UI canvases (waveforms, meters). Full Retina
+// 2–3× is wasted GPU fill for these — 1.5× is plenty sharp and noticeably lighter. The
+// <video> elements aren't canvases, so they keep full resolution.
+const UI_MAX_PIXEL_RATIO = 1.5;
+function uiPixelRatio(): number {
+  return Math.min(typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1, UI_MAX_PIXEL_RATIO);
+}
+
 const IS_MAC = typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent);
 const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
 const ALT_KEY = IS_MAC ? "⌥" : "Alt";
@@ -193,6 +201,7 @@ export function App() {
   const [albumNewDraft, setAlbumNewDraft] = useState<string | null>(null);
   const [albumRenameDraft, setAlbumRenameDraft] = useState<string | null>(null);
   const [fileMenuOpen, setFileMenuOpen] = useState(false);
+  const pendingAlbumDirRef = useRef<string | null>(null);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; message: string; elapsedSeconds: number } | null>(null);
   // Seconds the current agent turn has been running — shown so a slow (esp. first) turn
   // never looks frozen. The first turn warms a large model prompt and is the slowest.
@@ -420,7 +429,12 @@ export function App() {
   // keeps the latest closures so the listeners can be registered once.
   const menuHandlersRef = useRef<Record<string, (id?: string) => void>>({});
   menuHandlersRef.current = {
-    "menu:new-album": () => setAlbumNewDraft("New Album"),
+    "menu:new-album": () => {
+      void (async () => {
+        const dir = await open({ directory: true, title: "Choose a folder to save the new album" });
+        if (typeof dir === "string") { pendingAlbumDirRef.current = dir; setAlbumNewDraft("New Album"); }
+      })();
+    },
     "menu:new-song": () => setNewDraft("New song"),
     "menu:rename-album": () => setAlbumRenameDraft(currentAlbum?.name ?? ""),
     "menu:rename-song": () => setRenameDraft(session?.name ?? ""),
@@ -428,7 +442,15 @@ export function App() {
     "menu:delete-song": () => { void deleteCurrentSession(); },
     "menu:save-bundle": () => { void saveProjectBundle(); },
     "menu:open-bundle": () => { void openProjectBundle(); },
-    "menu:open-album": (id) => { if (id) void switchAlbum(id); },
+    "menu:open-album": (id) => {
+      // From the Recent submenu we get an id (already-open album → switch).
+      // From "Open Album…" there's no id → show the folder picker.
+      if (id) { void switchAlbum(id); return; }
+      void (async () => {
+        const dir = await open({ directory: true, title: "Open album" });
+        if (typeof dir === "string") void openAlbumPath(dir);
+      })();
+    },
     "menu:open-song": (id) => { if (id) void switchSession(id); },
   };
   useEffect(() => {
@@ -1278,10 +1300,23 @@ export function App() {
 
   async function commitNewAlbum(name: string) {
     const trimmed = name.trim();
-    if (!trimmed) return;
+    const dir = pendingAlbumDirRef.current;
+    if (!trimmed || !dir) return;
+    pendingAlbumDirRef.current = null;
     try {
-      const album = await api.createAlbum(trimmed);
-      setAlbums((current) => [...current, album]);
+      const album = await api.createAlbum(trimmed, dir);
+      setAlbums((current) => [album, ...current.filter((a) => a.id !== album.id)]);
+      await switchAlbum(album.id);
+    } catch (error) {
+      pushSystem(error);
+    }
+  }
+
+  // Open an existing album folder picked from disk.
+  async function openAlbumPath(path: string) {
+    try {
+      const album = await api.openAlbum(path);
+      setAlbums((current) => [album, ...current.filter((a) => a.id !== album.id)]);
       await switchAlbum(album.id);
     } catch (error) {
       pushSystem(error);
@@ -1311,12 +1346,21 @@ export function App() {
     setBusy(true);
     try {
       await api.deleteAlbum(currentAlbumId);
-      let remaining = await api.albums();
-      if (remaining.length === 0) remaining = [await api.createAlbum("My Album")];
-      setAlbums(remaining);
-      const targetId = remaining[0].id;
-      setCurrentAlbumId("");
-      await switchAlbum(targetId);
+      const remaining = await api.albums();
+      if (remaining.length === 0) {
+        // Nothing left — fall back to a default app-managed album/song.
+        const proj = await api.createDefaultSession("New song");
+        const newAlbumId = proj.session.albumId ?? "";
+        setAlbums(await api.albums());
+        setCurrentAlbumId(newAlbumId);
+        const sess = await api.sessions(newAlbumId);
+        setSessionList(sess.length > 0 ? sess : [proj.session]);
+        setProject(proj);
+      } else {
+        setAlbums(remaining);
+        setCurrentAlbumId("");
+        await switchAlbum(remaining[0].id);
+      }
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -1384,18 +1428,25 @@ export function App() {
         setVideoUrl(m.baseUrl);
         setVideoModelName(m.model);
       }).catch(() => undefined);
-      // Albums (projects) own the songs (sessions). Ensure at least one album.
+      // Albums (projects) own the songs (sessions). With no album yet (document
+      // model), spin up a default app-managed one so there's a song to show.
       let albumsNow = albumList;
+      let loaded: MixProject;
+      let albumId: string;
       if (albumsNow.length === 0) {
-        albumsNow = [await api.createAlbum("My Album")];
+        loaded = await api.createDefaultSession("New song");
+        albumId = loaded.session.albumId ?? "";
+        albumsNow = await api.albums();
+      } else {
+        albumId = albumsNow[0].id;
+        const sessions = await api.sessions(albumId);
+        loaded = sessions[0] ? await api.getSession(sessions[0].id) : await api.createSession(albumId, "New song");
       }
       setAlbums(albumsNow);
-      const albumId = albumsNow[0].id;
       setCurrentAlbumId(albumId);
-      const sessions = await api.sessions(albumId);
-      const loaded = sessions[0] ? await api.getSession(sessions[0].id) : await api.createSession(albumId, "AutoMixer session");
+      const sess = await api.sessions(albumId);
+      setSessionList(sess.length > 0 ? sess : [loaded.session]);
       setProject(loaded);
-      setSessionList(sessions.length > 0 ? sessions : [loaded.session]);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not start app.";
       setStartupError(message);
@@ -4526,18 +4577,15 @@ export function App() {
                     </div>
                   ) : null}
 
-                  {autoMixRunning && autoMixStages.length > 0 ? (
-                    <div className="activity-stages">
-                      {autoMixStages.map((s) => (
-                        <div key={s.stageId} className={`activity-stage ${s.status}`}>
-                          <span className="stage-icon">{s.status === "running" ? "▸" : s.status === "complete" ? "✓" : s.status === "error" ? "✗" : "·"}</span>
-                          <span className="stage-name">{s.displayName}</span>
-                          {s.actionCount ? <span className="stage-count">{s.actionCount}</span> : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
+                  {autoMixStages.length > 0 ? <AutoMixStagesPanel stages={autoMixStages} /> : null}
 
+                </div>
+              ) : null}
+              {/* Persist the auto-mix stage report after the run ends so the feedback
+                  stays readable (the live activity panel above disappears when idle). */}
+              {!busy && autoMixStages.length > 0 ? (
+                <div className="message activity automix-report">
+                  <AutoMixStagesPanel stages={autoMixStages} done />
                 </div>
               ) : null}
             </div>
@@ -8349,7 +8397,7 @@ const Waveform = memo(function Waveform({ peaks, color }: { peaks?: number[]; co
     const draw = () => {
       const rect = canvas.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
-      const scale = window.devicePixelRatio || 1;
+      const scale = uiPixelRatio();
       canvas.width = Math.max(1, Math.floor(rect.width * scale));
       canvas.height = Math.max(1, Math.floor(rect.height * scale));
       const ctx = canvas.getContext("2d");
@@ -8402,7 +8450,7 @@ function LiveWaveform({ peaks, color }: { peaks: number[]; color: string }) {
     const draw = () => {
       const rect = canvas.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
-      const scale = window.devicePixelRatio || 1;
+      const scale = uiPixelRatio();
       canvas.width = Math.max(1, Math.floor(rect.width * scale));
       canvas.height = Math.max(1, Math.floor(rect.height * scale));
       const ctx = canvas.getContext("2d");
@@ -8735,6 +8783,42 @@ const AUTO_MIX_STAGES = [
   { id: "section_automation", label: "Section automation" },
   { id: "mix_bus_loudness", label: "Mix bus / loudness" },
 ];
+
+type AutoMixStageInfo = { stageId: string; displayName: string; status: string; actionCount: number; warnings: string[]; error?: string; tokens: number; elapsedMs: number; explanation?: string };
+
+/// Live + post-run breakdown of the auto-mix pipeline: each stage with its status,
+/// number of changes, timing, and the model's per-stage rationale (the "feedback").
+function AutoMixStagesPanel({ stages, done }: { stages: AutoMixStageInfo[]; done?: boolean }) {
+  const finished = stages.filter((s) => s.status !== "running").length;
+  const totalChanges = stages.reduce((sum, s) => sum + (s.actionCount || 0), 0);
+  const icon = (status: string) =>
+    status === "running" ? "▸" : status === "complete" ? "✓" : status === "error" ? "✗" : status === "skipped" ? "–" : "·";
+  return (
+    <div className={`automix-panel ${done ? "done" : ""}`}>
+      <div className="automix-panel-head">
+        <span className="automix-panel-title">{done ? "Auto-mix report" : "Auto-mixing"}</span>
+        <span className="automix-panel-progress">
+          {finished}/{stages.length} stages{totalChanges ? ` · ${totalChanges} changes` : ""}
+        </span>
+      </div>
+      <div className="automix-panel-list">
+        {stages.map((s) => (
+          <div key={s.stageId} className={`automix-stage ${s.status}`}>
+            <div className="automix-stage-row">
+              <span className="stage-icon">{icon(s.status)}</span>
+              <span className="stage-name">{s.displayName}</span>
+              {s.actionCount ? <span className="stage-count">{s.actionCount} {s.actionCount === 1 ? "change" : "changes"}</span> : null}
+              {s.elapsedMs ? <span className="stage-meta">{(s.elapsedMs / 1000).toFixed(1)}s</span> : null}
+            </div>
+            {s.explanation ? <div className="automix-stage-note">{s.explanation}</div> : null}
+            {s.warnings && s.warnings.length > 0 ? <div className="automix-stage-warn">⚠ {s.warnings.join("; ")}</div> : null}
+            {s.error ? <div className="automix-stage-err">✗ {s.error}</div> : null}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function AutoMixView({
   stages,
