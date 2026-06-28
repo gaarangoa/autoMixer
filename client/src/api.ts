@@ -144,6 +144,7 @@ export const api = {
   // Read / set the video-edit skill's vision-model endpoint (e.g. Qwen3-VL on the Spark).
   getVideoModel: () => tauriInvoke<{ baseUrl: string; model: string }>("get_video_model"),
   setVideoModel: (baseUrl: string, model: string) => tauriInvoke<void>("set_video_model", { baseUrl, model }),
+  setConfig: (ollamaBaseUrl: string, ollamaModel: string) => tauriInvoke<void>("set_config", { ollamaBaseUrl, ollamaModel }),
   // Push the user's track selection so the video skill edits only selected tracks.
   setVideoSelection: (sessionId: string, trackIds: string[]) => tauriInvoke<void>("set_video_selection", { sessionId, trackIds }),
   getVideoSelection: (sessionId: string) => tauriInvoke<string[]>("get_video_selection", { sessionId }),

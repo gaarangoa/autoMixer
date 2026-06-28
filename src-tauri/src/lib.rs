@@ -221,6 +221,7 @@ pub fn run() {
             commands::clear_chat,
             commands::get_video_model,
             commands::set_video_model,
+            commands::set_config,
             commands::set_video_selection,
             commands::get_video_selection,
             commands::apply_mix_actions,

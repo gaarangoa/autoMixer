@@ -4747,27 +4747,35 @@ export function App() {
             </header>
             <div className="settings-modal-body">
               <section className="settings-group">
-                <div className="settings-group-title">Agent model</div>
-                <p className="settings-group-desc">The model that powers the chat — and the auto-mix. Any OpenAI-compatible endpoint (vLLM / llama.cpp / Ollama).</p>
+                <div className="settings-group-title">Model</div>
+                <p className="settings-group-desc">One OpenAI-compatible endpoint (vLLM / llama.cpp / Ollama). This is the single source — Apply sets the model for <strong>chat, auto-mix, and vision</strong> all at once.</p>
                 <label className="settings-field"><span>Endpoint URL</span>
-                  <input value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://127.0.0.1:2256/v1" />
+                  <input value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://127.0.0.1:2260" />
                 </label>
                 <label className="settings-field"><span>Model</span>
-                  <input value={agentModel} onChange={(e) => setAgentModel(e.target.value)} placeholder="qwen3.6-35b-a3b" />
+                  <input value={agentModel} onChange={(e) => setAgentModel(e.target.value)} placeholder="qwen3.5-4b" />
                 </label>
                 <div className="settings-field-actions">
                   <button className="primary" onClick={async () => {
-                    setAgentStatus("Applying…");
-                    try { await api.setHermesModel(agentUrl.trim(), agentModel.trim()); setAgentStatus("Agent restarted on new model"); }
-                    catch (error) { setAgentStatus(error instanceof Error ? error.message : String(error)); }
-                  }}>Apply</button>
+                    const url = agentUrl.trim();
+                    const model = agentModel.trim();
+                    setAgentStatus("Applying to all configs…");
+                    try {
+                      await api.setHermesModel(url, model);  // chat agent + auto-mix (read_hermes_model)
+                      await api.setConfig(url, model);        // settings.json ollama (fallback / headless web)
+                      await api.setVideoModel(url, model);    // vision / video-edit (same multimodal model)
+                      // Mirror into the other Settings fields so the UI stays consistent.
+                      setVideoUrl(url); setVideoModelName(model); setOllamaUrl(url); setOllamaModel(model);
+                      setAgentStatus("Applied to chat, auto-mix, and vision");
+                    } catch (error) { setAgentStatus(error instanceof Error ? error.message : String(error)); }
+                  }}>Apply to everything</button>
                   <span className="settings-status">{agentStatus}</span>
                 </div>
               </section>
 
               <section className="settings-group">
-                <div className="settings-group-title">Video model</div>
-                <p className="settings-group-desc">The vision model the video-edit skill uses to "see" frames (e.g. Qwen3-VL on the Spark).</p>
+                <div className="settings-group-title">Video model <span style={{ opacity: 0.6, fontWeight: 400 }}>(optional override)</span></div>
+                <p className="settings-group-desc">Only needed if you want vision on a <em>different</em> endpoint than the model above (e.g. a dedicated Qwen3-VL on another machine). Otherwise leave it — "Apply to everything" already points vision at the main model.</p>
                 <label className="settings-field"><span>Endpoint URL</span>
                   <input value={videoUrl} onChange={(e) => setVideoUrl(e.target.value)} placeholder="http://127.0.0.1:11435" />
                 </label>

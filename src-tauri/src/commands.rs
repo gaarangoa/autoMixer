@@ -872,6 +872,17 @@ pub fn set_video_model(base_url: String, model: String) -> Result<(), String> {
     config.save()
 }
 
+/// Persist the app's ollama (auto-mix / fallback / headless) endpoint to
+/// settings.json. The Settings panel calls this alongside set_hermes_model and
+/// set_video_model so one Apply writes every LLM config we have.
+#[tauri::command]
+pub fn set_config(ollama_base_url: String, ollama_model: String) -> Result<(), String> {
+    let mut config = crate::config::Config::load();
+    config.ollama_base_url = ollama_base_url.trim().to_string();
+    config.ollama_model = ollama_model.trim().to_string();
+    config.save()
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoMixSummary {
