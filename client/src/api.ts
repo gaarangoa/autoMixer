@@ -57,6 +57,11 @@ export const api = {
     tauriInvoke<MixProject>("apply_mix_actions", { sessionId, actions, explanation }),
   undo: (sessionId: string) => tauriInvoke<MixProject>("undo_mix_action", { sessionId }),
   redo: (sessionId: string) => tauriInvoke<MixProject>("redo_mix_action", { sessionId }),
+  // Align a re-recorded take (guide + followers) to a reference track by onset correlation.
+  syncTracks: (sessionId: string, referenceTrackId: string, guideTrackId: string, followTrackIds: string[]) =>
+    tauriInvoke<{ project: MixProject; offsetMs: number }>("sync_tracks_to_reference", { sessionId, referenceTrackId, guideTrackId, followTrackIds }),
+  onMenuSyncTracks: (cb: () => void): Promise<UnlistenFn> =>
+    listen("menu:sync-tracks", () => cb()),
   // Time-stretch the whole song (tempo change, pitch preserved). rate 0.75 = 25% slower.
   stretchTempo: (sessionId: string, percent: number) => tauriInvoke<MixProject>("stretch_session_tempo", { sessionId, percent }),
   applyPatch: (sessionId: string, forwardPatch: JsonPatch[], inversePatch: JsonPatch[], explanation?: string) =>

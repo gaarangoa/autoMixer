@@ -89,9 +89,17 @@ pub fn build_and_set_menu(
         .build()?;
 
     let menu = Menu::default(app)?;
-    // Tauri's default menu may already include a "File" submenu — drop it so we
-    // don't end up with two.
-    if let Some(MenuItemKind::Submenu(existing_file)) = menu.get("File") {
+    // The default menu's submenus have auto-generated IDs, NOT their titles — so
+    // menu.get("File")/menu.get("Edit") silently return None. Find submenus by
+    // their visible TEXT instead.
+    let find_submenu = |title: &str| -> Option<tauri::menu::Submenu<tauri::Wry>> {
+        menu.items().ok()?.into_iter().find_map(|item| match item {
+            MenuItemKind::Submenu(sub) if sub.text().map(|t| t == title).unwrap_or(false) => Some(sub),
+            _ => None,
+        })
+    };
+    // Drop the default "File" submenu so our "Project" doesn't coexist with it.
+    if let Some(existing_file) = find_submenu("File") {
         let _ = menu.remove(&existing_file);
     }
     let detect = MenuItemBuilder::with_id("edit_detect_structure", "Detect Song Structure")
@@ -100,10 +108,24 @@ pub fn build_and_set_menu(
     let level = MenuItemBuilder::with_id("edit_level_sections", "Level Song Sections")
         .accelerator("CmdOrCtrl+Shift+L")
         .build(app)?;
-    if let Some(MenuItemKind::Submenu(edit)) = menu.get("Edit") {
+    let sync_tracks = MenuItemBuilder::with_id("edit_sync_tracks", "Sync Tracks to Reference…")
+        .accelerator("CmdOrCtrl+Shift+Y")
+        .build(app)?;
+    if let Some(edit) = find_submenu("Edit") {
         edit.append(&PredefinedMenuItem::separator(app)?)?;
         edit.append(&detect)?;
         edit.append(&level)?;
+        edit.append(&sync_tracks)?;
+    } else {
+        // No "Edit" found (unexpected) — expose the tools in their own submenu so
+        // they're never unreachable.
+        eprintln!("[menu] default Edit submenu not found — adding a Tracks menu");
+        let tracks_menu = SubmenuBuilder::new(app, "Tracks")
+            .item(&detect)
+            .item(&level)
+            .item(&sync_tracks)
+            .build()?;
+        menu.append(&tracks_menu)?;
     }
     menu.insert(&file, 1)?;
     app.set_menu(menu)?;
@@ -156,6 +178,7 @@ pub fn run() {
                 let event_name = match id {
                     "edit_detect_structure" => "menu:detect-structure",
                     "edit_level_sections" => "menu:level-sections",
+                    "edit_sync_tracks" => "menu:sync-tracks",
                     "file_new_album" => "menu:new-album",
                     "file_open_album" => "menu:open-album",
                     "file_new_song" => "menu:new-song",
@@ -240,6 +263,7 @@ pub fn run() {
             commands::redo_mix_action,
             commands::apply_recorded_patch,
             commands::stretch_session_tempo,
+            commands::sync_tracks_to_reference,
             commands::reset_session,
             commands::assistant_request,
             commands::transport_play,

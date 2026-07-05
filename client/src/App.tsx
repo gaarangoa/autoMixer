@@ -250,6 +250,10 @@ export function App() {
   // Tempo (time-stretch) overlay: percent speed, pitch preserved.
   const [tempoOpen, setTempoOpen] = useState(false);
   const [tempoPercent, setTempoPercent] = useState(100);
+  // Sync-to-reference dialog: align a re-recorded take to an existing track.
+  const [syncOpen, setSyncOpen] = useState(false);
+  const [syncReferenceId, setSyncReferenceId] = useState("");
+  const [syncGuideId, setSyncGuideId] = useState("");
   const pendingAlbumDirRef = useRef<string | null>(null);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; message: string; elapsedSeconds: number } | null>(null);
   // Seconds the current agent turn has been running — shown so a slow (esp. first) turn
@@ -3078,8 +3082,28 @@ export function App() {
     reg(api.onMenuLevelSections(() => {
       void balanceSongLevels();
     }));
+    reg(api.onMenuSyncTracks(() => {
+      openSyncDialog();
+    }));
     return () => { cancelled = true; unlisteners.forEach((fn) => fn()); };
-  }, [session, busy]);
+  }, [session, busy, selectedTrackIds]);
+
+  function openSyncDialog() {
+    if (!session) return;
+    const audioTracks = session.tracks.filter((t) => t.kind !== "video");
+    if (audioTracks.length < 2) {
+      pushSystem("Sync needs at least two audio tracks (a reference and the new take).");
+      return;
+    }
+    // Guide defaults to the first SELECTED audio track; reference to the first
+    // audio track that is NOT selected (the thing you recorded against).
+    const selectedAudio = audioTracks.filter((t) => selectedTrackIds.includes(t.id));
+    const guide = selectedAudio[0] ?? audioTracks[audioTracks.length - 1];
+    const reference = audioTracks.find((t) => !selectedTrackIds.includes(t.id) && t.id !== guide.id) ?? audioTracks[0];
+    setSyncGuideId(guide.id);
+    setSyncReferenceId(reference.id === guide.id ? (audioTracks.find((t) => t.id !== guide.id)?.id ?? "") : reference.id);
+    setSyncOpen(true);
+  }
 
   async function analyzeStructure() {
     if (!session) return;
@@ -5020,6 +5044,71 @@ export function App() {
                 <button type="button" className="download-export" onClick={() => void doDownloadAudio()} disabled={busy}>
                   <Download size={15} />
                   <span>Export {exportFormat.toUpperCase()}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {syncOpen && session ? (
+        <div className="settings-backdrop" onPointerDown={() => setSyncOpen(false)}>
+          <div className="settings-modal tempo-modal" role="dialog" aria-modal="true" aria-label="Sync tracks" onPointerDown={(e) => e.stopPropagation()}>
+            <header className="settings-modal-head">
+              <h2>Sync to Reference</h2>
+              <button className="icon-btn" onClick={() => setSyncOpen(false)} aria-label="Close"><X size={18} /></button>
+            </header>
+            <div className="settings-modal-body">
+              <section className="settings-group">
+                <p className="settings-group-desc">
+                  Aligns a re-recorded take to an existing track. The <strong>guide</strong> (the take's audio) is matched against the <strong>reference</strong> by its transients; the guide and every other selected track (e.g. the take's video) shift together. If the shift goes past the start, the head is trimmed.
+                </p>
+                <label className="settings-field"><span>Reference (stays put)</span>
+                  <select value={syncReferenceId} onChange={(e) => setSyncReferenceId(e.target.value)}>
+                    {session.tracks.filter((t) => t.kind !== "video").map((t) => (
+                      <option key={t.id} value={t.id} disabled={t.id === syncGuideId}>{t.name}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="settings-field"><span>Guide (the take's audio)</span>
+                  <select value={syncGuideId} onChange={(e) => setSyncGuideId(e.target.value)}>
+                    {session.tracks.filter((t) => t.kind !== "video").map((t) => (
+                      <option key={t.id} value={t.id} disabled={t.id === syncReferenceId}>{t.name}</option>
+                    ))}
+                  </select>
+                </label>
+                {(() => {
+                  const followers = session.tracks.filter((t) => selectedTrackIds.includes(t.id) && t.id !== syncReferenceId && t.id !== syncGuideId);
+                  return (
+                    <p className="settings-group-desc">
+                      Moves with the guide: {followers.length > 0 ? followers.map((t) => t.name).join(", ") : "(only the guide — select more tracks to move them together)"}
+                    </p>
+                  );
+                })()}
+              </section>
+              <div className="download-actions">
+                <button type="button" className="download-cancel" onClick={() => setSyncOpen(false)}>Cancel</button>
+                <button
+                  type="button"
+                  className="download-export"
+                  disabled={busy || !syncReferenceId || !syncGuideId || syncReferenceId === syncGuideId}
+                  onClick={async () => {
+                    setBusy(true);
+                    try {
+                      const followers = selectedTrackIds.filter((id) => id !== syncReferenceId && id !== syncGuideId);
+                      const { project: updated, offsetMs } = await api.syncTracks(session.id, syncReferenceId, syncGuideId, followers);
+                      setProject(updated);
+                      setSyncOpen(false);
+                      const dir = offsetMs >= 0 ? "earlier" : "later";
+                      pushSystem(`Synced: the take was ${Math.abs(offsetMs).toFixed(0)} ms ${offsetMs >= 0 ? "late" : "early"} — shifted ${dir} to match "${session.tracks.find((t) => t.id === syncReferenceId)?.name}". Undo (${MOD_KEY}Z) to revert.`);
+                    } catch (error) {
+                      pushSystem(error);
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                >
+                  <GitCompareArrows size={15} />
+                  <span>{busy ? "Analyzing…" : "Sync"}</span>
                 </button>
               </div>
             </div>

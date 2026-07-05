@@ -2432,6 +2432,255 @@ fn strip_wav_suffix(name: &str) -> String {
     name.trim_end_matches(".wav").trim_end_matches(".WAV").to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Track sync (align a re-recorded take to a reference by cross-correlation)
+// ---------------------------------------------------------------------------
+
+/// Build a 1ms-hop onset envelope of a track AS PLACED on the timeline (clips
+/// respected; clip-less tracks play their whole source at start_sample).
+fn track_onset_envelope(
+    session: &MixSession,
+    track: &crate::model::Track,
+    hop: usize,
+) -> Result<Vec<f32>, String> {
+    let by_id: std::collections::HashMap<&str, &crate::model::SourceFile> =
+        session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
+    // Synthetic clip list for clip-less tracks.
+    let clips: Vec<(String, u64, u64, u64)> = if track.clips.is_empty() {
+        let Some(src) = by_id.get(track.source_file_id.as_str()) else { return Err(format!("Track {} has no audio source", track.name)) };
+        vec![(src.id.clone(), track.start_sample, track.start_sample + src.duration_samples, 0)]
+    } else {
+        track
+            .clips
+            .iter()
+            .map(|c| (
+                c.source_file_id.clone().unwrap_or_else(|| track.source_file_id.clone()),
+                c.start_sample,
+                c.end_sample,
+                c.source_offset_sample,
+            ))
+            .collect()
+    };
+    let max_end = clips.iter().map(|c| c.2).max().unwrap_or(0);
+    let mut env = vec![0f32; (max_end as usize / hop) + 2];
+    for (source_id, start, end, source_offset) in clips {
+        let Some(src) = by_id.get(source_id.as_str()) else { continue };
+        let (header, samples) = crate::engine::source::cache::read_cache_all(Path::new(&src.cache_path))?;
+        let ch = header.channels.max(1) as usize;
+        let clip_frames = (end.saturating_sub(start)) as usize;
+        for frame in 0..clip_frames {
+            let src_frame = source_offset as usize + frame;
+            let idx = src_frame * ch;
+            if idx + ch > samples.len() {
+                break;
+            }
+            let mut acc = 0f32;
+            for c in 0..ch {
+                acc += samples[idx + c].abs();
+            }
+            let t = start as usize + frame;
+            env[t / hop] += acc / ch as f32;
+        }
+    }
+    // Onset-ify: half-wave rectified first difference of the smoothed envelope —
+    // robust across different mics/timbres of the same performance.
+    let mut smooth = vec![0f32; env.len()];
+    let win = 10usize; // ~10ms
+    let mut acc = 0f32;
+    for i in 0..env.len() {
+        acc += env[i];
+        if i >= win {
+            acc -= env[i - win];
+        }
+        smooth[i] = acc / win as f32;
+    }
+    let mut onset = vec![0f32; smooth.len()];
+    for i in 1..smooth.len() {
+        onset[i] = (smooth[i] - smooth[i - 1]).max(0.0);
+    }
+    // Unit-RMS normalize so correlation scores are comparable.
+    let rms = (onset.iter().map(|v| v * v).sum::<f32>() / onset.len().max(1) as f32).sqrt();
+    if rms > 0.0 {
+        for v in onset.iter_mut() {
+            *v /= rms;
+        }
+    }
+    Ok(onset)
+}
+
+/// Correlate guide against reference over ±max_lag hops (coarse stride then 1-hop
+/// refine). Positive result = guide's content happens LATER than the reference's,
+/// i.e. the take must shift EARLIER by that many hops.
+fn best_lag_hops(reference: &[f32], guide: &[f32], max_lag: i64) -> i64 {
+    let score = |lag: i64| -> f32 {
+        let mut s = 0f32;
+        let len = reference.len().min(guide.len());
+        for t in 0..len {
+            let g = t as i64 + lag;
+            if g >= 0 && (g as usize) < guide.len() {
+                s += reference[t] * guide[g as usize];
+            }
+        }
+        s
+    };
+    let mut best = (f32::MIN, 0i64);
+    let coarse = 20i64; // 20ms steps
+    let mut lag = -max_lag;
+    while lag <= max_lag {
+        let s = score(lag);
+        if s > best.0 {
+            best = (s, lag);
+        }
+        lag += coarse;
+    }
+    let center = best.1;
+    for lag in (center - coarse)..=(center + coarse) {
+        let s = score(lag);
+        if s > best.0 {
+            best = (s, lag);
+        }
+    }
+    best.1
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncTracksResponse {
+    pub project: MixProject,
+    pub offset_ms: f64,
+}
+
+/// Align a newly recorded take to a reference track. `guide` is the take's audio
+/// (correlated against `reference`); every track in `follow_track_ids` (the rest
+/// of the take — e.g. its video) shifts by the same measured offset, trimming the
+/// head when the shift goes past 0. Undoable.
+#[tauri::command]
+pub async fn sync_tracks_to_reference(
+    state: State<'_, AppState>,
+    session_id: String,
+    reference_track_id: String,
+    guide_track_id: String,
+    follow_track_ids: Vec<String>,
+) -> Result<SyncTracksResponse, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let mut project = store.get_project(&session_id)?;
+    let session_rate = project.session.sample_rate as i64;
+    let hop = (project.session.sample_rate / 1000).max(1) as usize; // 1ms
+
+    let reference = project.session.tracks.iter().find(|t| t.id == reference_track_id)
+        .ok_or("Reference track not found")?.clone();
+    let guide = project.session.tracks.iter().find(|t| t.id == guide_track_id)
+        .ok_or("Guide track not found")?.clone();
+    if reference.id == guide.id {
+        return Err("Reference and guide must be different tracks.".into());
+    }
+
+    let ref_env = track_onset_envelope(&project.session, &reference, hop)?;
+    let guide_env = track_onset_envelope(&project.session, &guide, hop)?;
+    let max_lag_hops = 30_000i64; // ±30s
+    let lag_hops = best_lag_hops(&ref_env, &guide_env, max_lag_hops);
+    let delta_samples: i64 = -lag_hops * hop as i64; // shift to APPLY to the take
+    let offset_ms = lag_hops as f64; // 1 hop = 1ms
+
+    // The whole take moves together: guide + followers (reference never moves).
+    let mut move_ids: Vec<String> = vec![guide_track_id.clone()];
+    for id in follow_track_ids {
+        if id != reference_track_id && !move_ids.contains(&id) {
+            move_ids.push(id);
+        }
+    }
+
+    let old_tracks = project.session.tracks.clone();
+    let mut tracks = old_tracks.clone();
+    let ms_per_sample = 1000.0 / session_rate as f64;
+    for track in tracks.iter_mut().filter(|t| move_ids.contains(&t.id)) {
+        if track.clips.is_empty() && !matches!(track.kind, crate::model::TrackKind::Video) {
+            let new_start = track.start_sample as i64 + delta_samples;
+            if new_start >= 0 {
+                track.start_sample = new_start as u64;
+            } else {
+                // Head-trim: clips replace the base source in the engine, so wrap
+                // the trimmed remainder in a single clip starting at 0.
+                let cut = (-new_start) as u64;
+                let duration = project.session.source_files.iter()
+                    .find(|s| s.id == track.source_file_id)
+                    .map(|s| s.duration_samples)
+                    .unwrap_or(0);
+                if duration > cut {
+                    track.clips.push(crate::model::ClipRegion {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        source_file_id: Some(track.source_file_id.clone()),
+                        name: None,
+                        start_sample: 0,
+                        end_sample: duration - cut,
+                        source_offset_sample: cut,
+                        gain_db: 0.0,
+                    });
+                    track.start_sample = 0;
+                }
+            }
+        } else {
+            track.clips.retain_mut(|clip| {
+                let new_start = clip.start_sample as i64 + delta_samples;
+                let new_end = clip.end_sample as i64 + delta_samples;
+                if new_end <= 0 {
+                    return false; // clip fully before 0 — gone
+                }
+                if new_start >= 0 {
+                    clip.start_sample = new_start as u64;
+                    clip.end_sample = new_end as u64;
+                } else {
+                    let cut = (-new_start) as u64;
+                    clip.start_sample = 0;
+                    clip.end_sample = new_end as u64;
+                    clip.source_offset_sample += cut;
+                }
+                true
+            });
+        }
+        // Video clips shift the same way (offset expressed in ms in the media).
+        track.video_clips.retain_mut(|clip| {
+            let new_start = clip.start_sample as i64 + delta_samples;
+            let new_end = clip.end_sample as i64 + delta_samples;
+            if new_end <= 0 {
+                return false;
+            }
+            if new_start >= 0 {
+                clip.start_sample = new_start as u64;
+                clip.end_sample = new_end as u64;
+            } else {
+                let cut = (-new_start) as u64;
+                clip.start_sample = 0;
+                clip.end_sample = new_end as u64;
+                clip.source_offset_ms += (cut as f64 * ms_per_sample).round() as u64;
+            }
+            true
+        });
+        for lane in track.automation.iter_mut() {
+            for point in lane.points.iter_mut() {
+                point.sample = (point.sample as i64 + delta_samples).max(0) as u64;
+            }
+        }
+    }
+
+    let jp = |path: &str, value: serde_json::Value| JsonPatchOp { op: "replace".into(), path: path.into(), value: Some(value) };
+    let forward = vec![jp("/tracks", serde_json::to_value(&tracks).map_err(|e| e.to_string())?)];
+    let inverse = vec![jp("/tracks", serde_json::to_value(&old_tracks).map_err(|e| e.to_string())?)];
+    record_patch(
+        &mut project,
+        forward,
+        inverse,
+        HistorySource::User,
+        Some(format!("Synced {} track(s) to \"{}\" (offset {:.0} ms)", move_ids.len(), reference.name, -offset_ms)),
+    )?;
+    store.save(&project)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(SyncTracksResponse { project, offset_ms })
+}
+
 /// Start native (ffmpeg/AVFoundation) camera captures — one process per camera.
 /// Blocks until every camera reports frames flowing, so the caller can start the
 /// transport knowing all takes are already rolling.
