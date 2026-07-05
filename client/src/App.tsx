@@ -109,6 +109,8 @@ type CameraPreviewPayload = {
 
 type VideoMonitorCameraPayload = CameraPreviewPayload & {
   sessionId: string;
+  /** The main window's ruler region (seconds) — Share exports honor it. */
+  range?: { start: number; end: number };
 };
 
 type VideoEditorWindowPayload = {
@@ -1104,7 +1106,7 @@ export function App() {
   useEffect(() => {
     if (!session) return;
     void updateVideoMonitorWindow(buildCameraPreviewTracks());
-  }, [session, selectedTrackIds.join("|"), JSON.stringify(trackCameraDevices), cameraDevices.length, armedVideoTrackIds.join("|"), videoRecordingTrackIds.join("|"), playing, Math.round(playhead * 5)]);
+  }, [session, selectedTrackIds.join("|"), JSON.stringify(trackCameraDevices), cameraDevices.length, armedVideoTrackIds.join("|"), videoRecordingTrackIds.join("|"), playing, Math.round(playhead * 5), selectedRange?.start, selectedRange?.end]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -1770,6 +1772,13 @@ export function App() {
   }
 
 
+  function currentRulerRange(): { start: number; end: number } | undefined {
+    if (!selectedRange) return undefined;
+    const lo = Math.min(selectedRange.start, selectedRange.end);
+    const hi = Math.max(selectedRange.start, selectedRange.end);
+    return hi - lo > 0.02 ? { start: lo, end: hi } : undefined;
+  }
+
   async function updateVideoMonitorWindow(tracks: CameraPreviewTrack[]) {
     if (!session) return;
     const monitor = await WebviewWindow.getByLabel("video-monitor").catch(() => null);
@@ -1779,6 +1788,7 @@ export function App() {
       sessionId: session.id,
       tracks,
       canvas: normalizeVideoCanvas(session.videoCanvas),
+      range: currentRulerRange(),
     } satisfies VideoMonitorCameraPayload).catch(() => undefined);
   }
 
@@ -1926,6 +1936,7 @@ export function App() {
             sessionId: session.id,
             tracks: cameraTracks,
             canvas: normalizeVideoCanvas(session.videoCanvas),
+            range: currentRulerRange(),
           } satisfies VideoMonitorCameraPayload);
         });
         created.once("tauri://destroyed", () => {
@@ -1944,6 +1955,7 @@ export function App() {
           sessionId: session.id,
           tracks: cameraTracks,
           canvas: normalizeVideoCanvas(session.videoCanvas),
+          range: currentRulerRange(),
         } satisfies VideoMonitorCameraPayload).catch(() => undefined);
       }
       await monitor.show().catch(() => undefined);
@@ -6511,14 +6523,31 @@ export function VideoMonitorApp() {
     setExporting(true);
     setExportStatus(null);
     setExportProgress(0);
-    setExportStage("start");
+    setExportStage("rendering mix");
     try {
+      // Stage 1 — render the REAL thing: the selected video tracks composited
+      // with their color grade (Adjust/Filters) plus the session's audio MIX.
+      // (Exporting the raw clip file skipped both — no mix, no effects.)
+      const videoTrackIds = (project?.session.tracks ?? [])
+        .filter((t) => t.kind === "video" && selectedIds.includes(t.id))
+        .map((t) => t.id);
+      const trackIds = videoTrackIds.length > 0 ? videoTrackIds : [exportClip.trackId];
+      const mixTmp = `${outputPath}.mix-tmp.mp4`;
+      // Honor the main window's ruler region: export ONLY that span when set.
+      const range = cameraPayload?.sessionId === sessionId ? cameraPayload.range : undefined;
+      const startSample = range ? Math.round(range.start * sr) : undefined;
+      const endSample = range ? Math.round(range.end * sr) : undefined;
+      await api.renderVideoMix(sessionId, mixTmp, startSample, endSample, trackIds, undefined, "high");
+      // Stage 2 — shape/resolution/fit re-frame of the rendered mix (streams
+      // progress events); deletes the intermediate file when done.
+      setExportStage("start");
       const res = await api.exportVideo(
-        exportClip.path,
+        mixTmp,
         outputPath,
         exportAspect,
         exportRes === "source" ? undefined : exportRes,
         exportMode,
+        true,
       );
       setExportProgress(100);
       setExportStatus(`Exported to ${res.path}`);
@@ -6713,6 +6742,14 @@ export function VideoMonitorApp() {
             ) : null}
           </div>
           <div className="share-modal-foot">
+            {(() => {
+              const r = cameraPayload?.sessionId === sessionId ? cameraPayload.range : undefined;
+              return (
+                <span className="share-range-note">
+                  {r ? `Region ${formatTime(r.start)}–${formatTime(r.end)}` : "Full timeline"}
+                </span>
+              );
+            })()}
             <button type="button" className="share-cancel" onClick={() => setShareOpen(false)} disabled={exporting}>Cancel</button>
             <button type="button" className="share-export" onClick={() => void doExport()} disabled={exporting || !exportClip}>
               {exporting ? "Exporting…" : "Export MP4"}

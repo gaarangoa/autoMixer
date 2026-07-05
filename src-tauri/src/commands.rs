@@ -2969,6 +2969,7 @@ pub async fn export_video(
     aspect: String,
     max_dimension: Option<u32>,
     mode: Option<String>,
+    delete_source_after: Option<bool>,
 ) -> Result<RenderResponse, String> {
     let source = PathBuf::from(&source_path);
     if !source.exists() {
@@ -2980,9 +2981,20 @@ pub async fn export_video(
     }
     // Run the (blocking) encode off the main thread so the UI stays responsive,
     // and stream ffmpeg's progress out as `video-export:progress` events.
-    tokio::task::spawn_blocking(move || run_export_blocking(app, source, path, aspect, max_dimension, mode))
+    let result = tokio::task::spawn_blocking(move || run_export_blocking(app, source.clone(), path, aspect, max_dimension, mode).map(|r| (r, source)))
         .await
-        .map_err(|error| format!("export task failed: {error}"))?
+        .map_err(|error| format!("export task failed: {error}"))?;
+    match result {
+        Ok((response, source)) => {
+            // Two-stage exports pass an intermediate mix render as the source —
+            // clean it up once the final file is written.
+            if delete_source_after.unwrap_or(false) {
+                let _ = fs::remove_file(&source);
+            }
+            Ok(response)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Total duration in seconds via ffprobe (None if unavailable → indeterminate progress).
@@ -4447,6 +4459,71 @@ fn aspect_target_box(out_w: i32, out_h: i32, aspect: Option<&str>) -> Option<(i3
     Some((even_dimension(t_w), even_dimension(t_h)))
 }
 
+/// The full color-grade filter chain for a clip layout — eq, Photos-style
+/// adjustments (exposure/temperature/tint/highlights/shadows), preset, blur,
+/// sharpen, grain, vignette. Shared by every video render path so the monitor
+/// preview, the agent render, and the Share export all look identical.
+fn color_grade_suffix(layout: &VideoLayout) -> String {
+    let mut suffix = String::new();
+    let eq_brightness = (layout.brightness - 1.0).clamp(-0.8, 0.8);
+    suffix.push_str(&format!(
+        ",eq=brightness={eq_brightness:.3}:contrast={:.3}:saturation={:.3}:gamma={:.3}",
+        layout.contrast.clamp(0.2, 2.0),
+        layout.saturation.clamp(0.0, 2.0),
+        layout.gamma.clamp(0.5, 1.8),
+    ));
+    let exposure = layout.exposure.clamp(-1.0, 1.0);
+    if exposure.abs() >= 0.005 {
+        let gain = 2f32.powf(exposure);
+        suffix.push_str(&format!(",colorchannelmixer=rr={gain:.4}:gg={gain:.4}:bb={gain:.4}"));
+    }
+    let temp = layout.temperature.clamp(-1.0, 1.0);
+    let tint = layout.tint.clamp(-1.0, 1.0);
+    if temp.abs() >= 0.005 || tint.abs() >= 0.005 {
+        suffix.push_str(&format!(
+            ",colorbalance=rm={:.4}:gm={:.4}:bm={:.4}",
+            temp * 0.3,
+            -tint * 0.3,
+            -temp * 0.3,
+        ));
+    }
+    let hl = layout.highlights.clamp(-1.0, 1.0);
+    let sh = layout.shadows.clamp(-1.0, 1.0);
+    if hl.abs() >= 0.005 || sh.abs() >= 0.005 {
+        let sy = (0.25 + sh * 0.15).clamp(0.0, 1.0);
+        let hy = (0.75 + hl * 0.15).clamp(0.0, 1.0);
+        suffix.push_str(&format!(",curves=m=0/0 0.25/{sy:.3} 0.75/{hy:.3} 1/1"));
+    }
+    match layout.preset {
+        VideoFilterPreset::Warm => suffix.push_str(",colorchannelmixer=rr=1.06:gg=1.01:bb=0.94"),
+        VideoFilterPreset::Cool => suffix.push_str(",colorchannelmixer=rr=0.94:gg=1.01:bb=1.08"),
+        VideoFilterPreset::Mono => suffix.push_str(",hue=s=0"),
+        VideoFilterPreset::Punch => suffix.push_str(",eq=contrast=1.12:saturation=1.14"),
+        VideoFilterPreset::Dream => suffix.push_str(",boxblur=1:1,eq=brightness=0.04:saturation=0.82"),
+        VideoFilterPreset::Cinema => suffix.push_str(",eq=contrast=1.10:saturation=1.05,colorchannelmixer=rr=1.08:gg=0.98:bb=0.90"),
+        VideoFilterPreset::Noir => suffix.push_str(",eq=contrast=1.28,hue=s=0"),
+        VideoFilterPreset::Moody => suffix.push_str(",eq=brightness=-0.06:contrast=1.18:saturation=0.85,colorchannelmixer=rr=0.93:gg=0.97:bb=1.08"),
+        VideoFilterPreset::Vintage => suffix.push_str(",eq=contrast=0.94:saturation=0.70,colorchannelmixer=rr=1.06:gg=0.98:bb=0.86"),
+        VideoFilterPreset::Golden => suffix.push_str(",eq=brightness=0.04:saturation=1.12,colorchannelmixer=rr=1.10:gg=1.02:bb=0.82"),
+        VideoFilterPreset::Cold => suffix.push_str(",eq=contrast=1.05:saturation=0.92,colorchannelmixer=rr=0.84:gg=0.95:bb=1.16"),
+        VideoFilterPreset::None => {}
+    }
+    if layout.blur >= 0.5 {
+        suffix.push_str(&format!(",boxblur={}:1", layout.blur.round().clamp(1.0, 10.0)));
+    }
+    if layout.sharpen.clamp(0.0, 2.0) >= 0.02 {
+        suffix.push_str(&format!(",unsharp=5:5:{:.3}:5:5:0.0", layout.sharpen.clamp(0.0, 2.0)));
+    }
+    if layout.grain.clamp(0.0, 1.0) >= 0.02 {
+        suffix.push_str(&format!(",noise=alls={}:allf=t", (layout.grain.clamp(0.0, 1.0) * 30.0).round() as i32));
+    }
+    if layout.vignette.clamp(0.0, 1.0) >= 0.02 {
+        let ang = (layout.vignette.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_3) as f64;
+        suffix.push_str(&format!(",vignette=a={ang:.4}"));
+    }
+    suffix
+}
+
 fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_start: u64, range_end: u64, aspect: Option<&str>) -> String {
     let sample_rate = session.sample_rate;
     let canvas = &session.video_canvas;
@@ -4473,25 +4550,8 @@ fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_sta
         let mut chain = format!(
             "[{index}:v]trim=start={source_offset:.3}:duration={clip_duration:.3},setpts=PTS-STARTPTS+{start:.3}/TB,crop=iw*{crop_w:.5}:ih*{crop_h:.5}:iw*{crop_x:.5}:ih*{crop_y:.5},scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},setsar=1"
         );
-        let eq_brightness = (layout.brightness - 1.0).clamp(-0.8, 0.8);
-        chain.push_str(&format!(",eq=brightness={eq_brightness:.3}:contrast={:.3}:saturation={:.3}", layout.contrast.clamp(0.2, 2.0), layout.saturation.clamp(0.0, 2.0)));
-        match layout.preset {
-            VideoFilterPreset::Warm => chain.push_str(",colorchannelmixer=rr=1.06:gg=1.01:bb=0.94"),
-            VideoFilterPreset::Cool => chain.push_str(",colorchannelmixer=rr=0.94:gg=1.01:bb=1.08"),
-            VideoFilterPreset::Mono => chain.push_str(",hue=s=0"),
-            VideoFilterPreset::Punch => chain.push_str(",eq=contrast=1.12:saturation=1.14"),
-            VideoFilterPreset::Dream => chain.push_str(",boxblur=1:1,eq=brightness=0.04:saturation=0.82"),
-            VideoFilterPreset::Cinema => chain.push_str(",eq=contrast=1.10:saturation=1.05,colorchannelmixer=rr=1.08:gg=0.98:bb=0.90"),
-            VideoFilterPreset::Noir => chain.push_str(",eq=contrast=1.28,hue=s=0"),
-            VideoFilterPreset::Moody => chain.push_str(",eq=brightness=-0.06:contrast=1.18:saturation=0.85,colorchannelmixer=rr=0.93:gg=0.97:bb=1.08"),
-            VideoFilterPreset::Vintage => chain.push_str(",eq=contrast=0.94:saturation=0.70,colorchannelmixer=rr=1.06:gg=0.98:bb=0.86"),
-            VideoFilterPreset::Golden => chain.push_str(",eq=brightness=0.04:saturation=1.12,colorchannelmixer=rr=1.10:gg=1.02:bb=0.82"),
-            VideoFilterPreset::Cold => chain.push_str(",eq=contrast=1.05:saturation=0.92,colorchannelmixer=rr=0.84:gg=0.95:bb=1.16"),
-            VideoFilterPreset::None => {}
-        }
-        if layout.blur >= 0.5 {
-            chain.push_str(&format!(",boxblur={}:1", layout.blur.round().clamp(1.0, 10.0)));
-        }
+        // Full grade — identical to the monitor preview and the agent render.
+        chain.push_str(&color_grade_suffix(&layout));
         if layout.rotation.abs() >= 0.5 {
             let radians = layout.rotation as f64 * std::f64::consts::PI / 180.0;
             chain.push_str(&format!(",rotate={radians:.6}:c=none:ow=rotw(iw):oh=roth(ih),scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black@0"));

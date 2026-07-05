@@ -8636,3 +8636,6 @@ button.primary:hover { filter: brightness(1.09); }
 }
 .tempo-revert { margin-right: auto; }
 .tempo-revert:not(:disabled) { color: #6fb7d8; border-color: rgba(111, 183, 216, 0.4); }
+
+/* Share modal: what span will export (region vs full timeline) */
+.share-range-note { margin-right: auto; font-size: 11px; color: var(--text-dim, #8b96a2); font-variant-numeric: tabular-nums; }
