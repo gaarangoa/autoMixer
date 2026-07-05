@@ -140,6 +140,7 @@ struct AgentAudioWindowFeatures {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentVideoProgress {
+    session_id: String,
     stage: String,
     message: String,
     current: u32,
@@ -653,27 +654,150 @@ pub fn apply_recorded_patch(
     Ok(project)
 }
 
-struct TauriLlmObserver {
-    app: tauri::AppHandle,
+struct AutoMixHeartbeat {
+    handle: tokio::task::JoinHandle<()>,
 }
 
-impl assistant::LlmObserver for TauriLlmObserver {
-    fn chunk(&self, phase: &str, text: &str) {
-        let _ = self.app.emit(
-            "llm:chunk",
-            serde_json::json!({ "phase": phase, "text": text }),
-        );
+impl Drop for AutoMixHeartbeat {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
-    fn stats(&self, phase: &str, stats: &assistant::LlmCallStats) {
-        let _ = self.app.emit(
-            "llm:stats",
-            serde_json::json!({
-                "phase": phase,
-                "promptTokens": stats.prompt_tokens,
-                "responseTokens": stats.response_tokens,
-                "elapsedMs": stats.elapsed_ms,
-            }),
-        );
+}
+
+fn spawn_auto_mix_heartbeat(app: tauri::AppHandle, session_id: &str, stage_id: &str) -> AutoMixHeartbeat {
+    let session_id = session_id.to_string();
+    let phase = stage_id.to_string();
+    let handle = tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let _ = app.emit(
+                "auto-mix:heartbeat",
+                serde_json::json!({ "sessionId": session_id, "phase": phase, "seconds": start.elapsed().as_secs() }),
+            );
+        }
+    });
+    AutoMixHeartbeat { handle }
+}
+
+struct AutoMixRunGuard {
+    app: tauri::AppHandle,
+    session_id: String,
+    completed: bool,
+}
+
+impl AutoMixRunGuard {
+    fn new(app: tauri::AppHandle, session_id: &str) -> Self {
+        Self { app, session_id: session_id.to_string(), completed: false }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for AutoMixRunGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.app.emit("auto-mix:complete", serde_json::json!({ "sessionId": self.session_id }));
+        }
+    }
+}
+
+struct AutoMixStageGuard {
+    app: tauri::AppHandle,
+    session_id: String,
+    stage: crate::auto_mix::AutoMixStage,
+    completed: bool,
+}
+
+impl AutoMixStageGuard {
+    fn new(app: tauri::AppHandle, session_id: &str, stage: crate::auto_mix::AutoMixStage) -> Self {
+        Self { app, session_id: session_id.to_string(), stage, completed: false }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for AutoMixStageGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let report = auto_mix_error_report(
+                self.stage,
+                "Auto-mix stage was interrupted before it completed. The model/tool bridge was disconnected.",
+                0,
+            );
+            emit_auto_mix_stage_done(&self.app, &self.session_id, &report);
+        }
+    }
+}
+
+const AUTO_MIX_STAGE_TIMEOUT_SECS: u64 = 12 * 60;
+
+fn elapsed_ms_u32(started: std::time::Instant) -> u32 {
+    started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
+}
+
+fn auto_mix_error_report(
+    stage: crate::auto_mix::AutoMixStage,
+    error: impl Into<String>,
+    elapsed_ms: u32,
+) -> crate::auto_mix::StageReport {
+    crate::auto_mix::StageReport {
+        stage_id: stage.id().into(),
+        display_name: stage.display_name().into(),
+        status: "error".into(),
+        action_count: 0,
+        explanation: None,
+        warnings: Vec::new(),
+        error: Some(error.into()),
+        tokens: 0,
+        elapsed_ms,
+    }
+}
+
+fn auto_mix_stage_payload(
+    session_id: &str,
+    report: &crate::auto_mix::StageReport,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("sessionId".into(), serde_json::json!(session_id));
+    }
+    value
+}
+
+fn emit_auto_mix_stage_done(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    report: &crate::auto_mix::StageReport,
+) {
+    let _ = app.emit("auto-mix:stage-done", auto_mix_stage_payload(session_id, report));
+}
+
+async fn run_auto_mix_stage_bounded(
+    config: &crate::config::Config,
+    store: std::sync::Arc<std::sync::Mutex<SessionStore>>,
+    session_id: &str,
+    stage: crate::auto_mix::AutoMixStage,
+    observer: std::sync::Arc<dyn assistant::LlmObserver>,
+) -> crate::auto_mix::StageReport {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(
+        Duration::from_secs(AUTO_MIX_STAGE_TIMEOUT_SECS),
+        crate::auto_mix::run_stage(config, store, session_id, stage, observer),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => auto_mix_error_report(stage, error, elapsed_ms_u32(started)),
+        Err(_) => auto_mix_error_report(
+            stage,
+            format!("Auto-mix stage timed out after {AUTO_MIX_STAGE_TIMEOUT_SECS} seconds."),
+            elapsed_ms_u32(started),
+        ),
     }
 }
 
@@ -686,16 +810,92 @@ pub struct HermesModel {
 }
 
 fn hermes_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("AUTOMIXER_HERMES_BIN") {
-        return PathBuf::from(p);
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(&home).join(".local/bin/hermes");
-        if candidate.exists() {
-            return candidate;
+    crate::hermes_service::hermes_bin_path()
+}
+
+const HERMES_MIN_CONTEXT_TOKENS: u64 = 64_000;
+
+fn endpoint_root(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+}
+
+fn model_n_ctx(model_entry: &serde_json::Value) -> Option<u64> {
+    model_entry
+        .pointer("/meta/n_ctx")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| model_entry.pointer("/meta/context_length").and_then(serde_json::Value::as_u64))
+        .or_else(|| model_entry.get("n_ctx").and_then(serde_json::Value::as_u64))
+        .or_else(|| model_entry.get("context_length").and_then(serde_json::Value::as_u64))
+}
+
+fn props_n_ctx(props: &serde_json::Value) -> Option<u64> {
+    props
+        .pointer("/default_generation_settings/n_ctx")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| props.pointer("/default_generation_settings/params/n_ctx").and_then(serde_json::Value::as_u64))
+        .or_else(|| props.get("n_ctx").and_then(serde_json::Value::as_u64))
+        .or_else(|| props.get("context_length").and_then(serde_json::Value::as_u64))
+}
+
+async fn detect_model_context_tokens(base_url: &str, model: &str) -> Result<Option<u64>, String> {
+    let client = reqwest::Client::new();
+    let root = endpoint_root(base_url);
+    let model_id = model.trim();
+
+    let models_url = if base_url.trim().trim_end_matches('/').ends_with("/v1") {
+        format!("{}/models", base_url.trim().trim_end_matches('/'))
+    } else {
+        format!("{root}/v1/models")
+    };
+    if let Ok(response) = client.get(models_url).timeout(Duration::from_secs(5)).send().await {
+        if response.status().is_success() {
+            if let Ok(value) = response.json::<serde_json::Value>().await {
+                if let Some(items) = value.get("data").and_then(serde_json::Value::as_array) {
+                    let selected = items
+                        .iter()
+                        .find(|item| {
+                            item.get("id").and_then(serde_json::Value::as_str) == Some(model_id)
+                                || item.get("model").and_then(serde_json::Value::as_str) == Some(model_id)
+                                || item
+                                    .get("aliases")
+                                    .and_then(serde_json::Value::as_array)
+                                    .map(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(model_id)))
+                                    .unwrap_or(false)
+                        })
+                        .or_else(|| items.first());
+                    if let Some(ctx) = selected.and_then(model_n_ctx) {
+                        return Ok(Some(ctx));
+                    }
+                }
+            }
         }
     }
-    PathBuf::from("hermes")
+
+    let props_url = format!("{root}/props");
+    if let Ok(response) = client.get(props_url).timeout(Duration::from_secs(5)).send().await {
+        if response.status().is_success() {
+            if let Ok(value) = response.json::<serde_json::Value>().await {
+                if let Some(ctx) = props_n_ctx(&value) {
+                    return Ok(Some(ctx));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn validate_hermes_model_context(base_url: &str, model: &str) -> Result<Option<u64>, String> {
+    let Some(ctx) = detect_model_context_tokens(base_url, model).await? else {
+        return Ok(None);
+    };
+    if ctx < HERMES_MIN_CONTEXT_TOKENS {
+        return Err(format!(
+            "Hermes Agent requires at least {HERMES_MIN_CONTEXT_TOKENS} context tokens; `{model}` at `{base_url}` reports {ctx}. Restart llama.cpp with `--ctx-size 65536` or choose a model endpoint with at least 64K context."
+        ));
+    }
+    Ok(Some(ctx))
 }
 
 /// Parse the Hermes agent's orchestration model (base URL, model, provider) out of
@@ -742,7 +942,11 @@ pub fn get_hermes_model() -> Result<HermesModel, String> {
 /// starts fresh (no stale context carrying over, e.g. a previously-applied look).
 #[tauri::command]
 pub async fn clear_chat(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
-    state.hermes_service.reset_session(&session_id).await
+    state.hermes_service.reset_session(&session_id).await?;
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    let mut project = store.get_project(&session_id)?;
+    project.chat_messages.clear();
+    store.save(&project)
 }
 
 /// Warm up the models at app startup so the first agent turn / video edit is fast:
@@ -797,6 +1001,13 @@ pub async fn set_hermes_model(
     // Write to AutoMixer's DEDICATED Hermes home (HERMES_HOME), so model changes land in
     // the isolated config and never touch the shared ~/.hermes / desktop app.
     let home = crate::hermes_service::bootstrap_hermes_home();
+    let previous = read_hermes_model();
+    let base_url = base_url.trim();
+    let model = model.trim();
+    if base_url.is_empty() || model.is_empty() {
+        return Err("Model endpoint URL and model id are required.".into());
+    }
+    let context_tokens = validate_hermes_model_context(base_url, model).await?;
     let set = |key: &str, value: &str| -> Result<(), String> {
         let output = Command::new(&hermes)
             .env("HERMES_HOME", &home)
@@ -812,15 +1023,35 @@ pub async fn set_hermes_model(
             Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
         }
     };
-    set("model.provider", "custom")?;
-    set("model.base_url", base_url.trim())?;
-    set("model.default", model.trim())?;
-    // Relaunch the sidecar so the new model takes effect, then wait for it.
+    let apply_model = |provider: &str, base_url: &str, model: &str| -> Result<(), String> {
+        set("model.provider", provider)?;
+        set("model.base_url", base_url)?;
+        set("model.default", model)?;
+        Ok(())
+    };
+
+    apply_model("custom", base_url, model)?;
+    if let Some(ctx) = context_tokens {
+        set("model.context_length", &ctx.to_string())?;
+    }
+    // Relaunch the sidecar so the new model takes effect, then verify the real
+    // ACP path. `/health` alone is insufficient: Hermes can be alive while the
+    // configured model fails when creating the first agent session.
     state.hermes_service.restart();
-    state
-        .hermes_service
-        .wait_ready(std::time::Duration::from_secs(30))
-        .await;
+    if !state.hermes_service.wait_ready(std::time::Duration::from_secs(30)).await {
+        let _ = apply_model(&previous.provider, &previous.base_url, &previous.model);
+        state.hermes_service.restart();
+        let _ = state.hermes_service.wait_ready(std::time::Duration::from_secs(30)).await;
+        return Err("Hermes sidecar did not become ready after applying the model settings; restored the previous model.".into());
+    }
+    if let Err(error) = state.hermes_service.probe().await {
+        let _ = apply_model(&previous.provider, &previous.base_url, &previous.model);
+        state.hermes_service.restart();
+        let _ = state.hermes_service.wait_ready(std::time::Duration::from_secs(30)).await;
+        return Err(format!(
+            "The model settings were saved but Hermes could not use them, so I restored the previous model. {error}"
+        ));
+    }
     // Re-warm the new model in the background (the restart dropped the prior warm-up),
     // so the user's first turn on the freshly-set model reuses a cached system prompt
     // instead of paying the ~40s cold prefill.
@@ -934,12 +1165,15 @@ pub async fn run_auto_mix_blocking(
         config.ollama_model = agent.model;
     }
     let store = std::sync::Arc::new(std::sync::Mutex::new(SessionStore::new(config.data_dir.clone())));
+    // No hot-path streaming: the user gets each stage's rationale + action count
+    // from the StageReport, plus the 1/sec heartbeat while a stage is running.
     let observer: std::sync::Arc<dyn assistant::LlmObserver> = std::sync::Arc::new(assistant::NoopObserver);
 
     let _ = app.emit(
         "auto-mix:start",
-        serde_json::json!({ "stages": stages.iter().map(|s| s.id()).collect::<Vec<_>>() }),
+        serde_json::json!({ "sessionId": session_id, "stages": stages.iter().map(|s| s.id()).collect::<Vec<_>>() }),
     );
+    let mut run_guard = AutoMixRunGuard::new(app.clone(), session_id);
     let mut total_actions = 0usize;
     let mut summaries = Vec::new();
     for (i, stage) in stages.iter().enumerate() {
@@ -948,20 +1182,29 @@ pub async fn run_auto_mix_blocking(
         }
         let _ = app.emit(
             "auto-mix:stage-start",
-            serde_json::json!({ "index": i, "stageId": stage.id(), "displayName": stage.display_name() }),
+            serde_json::json!({ "sessionId": session_id, "index": i, "stageId": stage.id(), "displayName": stage.display_name() }),
         );
-        let report = crate::auto_mix::run_stage(&config, store.clone(), session_id, *stage, observer.clone()).await?;
+        eprintln!("[automix-step] stage {i} ({}) running", stage.id());
+        let mut stage_guard = AutoMixStageGuard::new(app.clone(), session_id, *stage);
+        let heartbeat = spawn_auto_mix_heartbeat(app.clone(), session_id, stage.id());
+        let report = run_auto_mix_stage_bounded(&config, store.clone(), session_id, *stage, observer.clone()).await;
+        drop(heartbeat);
+        stage_guard.complete();
         let action_count = report.action_count;
         let status = report.status.clone();
         let stage_id = report.stage_id.clone();
-        let _ = app.emit("auto-mix:stage-done", serde_json::json!(report));
+        eprintln!("[automix-step] stage {i} ({stage_id}) report: status={status} actions={action_count}");
+        emit_auto_mix_stage_done(app, session_id, &report);
+        eprintln!("[automix-step] stage {i} syncing audio…");
         let _ = sync_audio_from_app(app, session_id);
+        eprintln!("[automix-step] stage {i} synced; continuing");
         total_actions += action_count;
         summaries.push(serde_json::json!({ "stageId": stage_id, "status": status, "actionCount": action_count }));
         if status == "error" || status == "cancelled" {
             break;
         }
     }
+    run_guard.complete();
     Ok(AutoMixSummary { stages_run: summaries.len(), total_actions, stages: summaries })
 }
 
@@ -1157,13 +1400,15 @@ pub async fn assistant_request(
         ));
     }
 
-    let _ = app.emit("llm:turn-start", serde_json::json!({ "userText": request.user_text }));
+    let session_id = request.session_id.clone();
+    let _ = app.emit("llm:turn-start", serde_json::json!({ "sessionId": &session_id, "userText": &request.user_text }));
 
     // Accumulate the visible assistant message so the finished turn persists in the
     // chat log (the live bubble is cleared on turn-end).
     let message = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let app_cb = app.clone();
     let message_cb = message.clone();
+    let session_id_cb = session_id.clone();
     let result = hermes
         .chat(&request.session_id, &request.user_text, move |event| {
             use crate::hermes_service::ChatEvent;
@@ -1172,10 +1417,10 @@ pub async fn assistant_request(
                     if let Ok(mut buf) = message_cb.lock() {
                         buf.push_str(&text);
                     }
-                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "action", "text": text }));
+                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "sessionId": &session_id_cb, "phase": "action", "text": text }));
                 }
                 ChatEvent::Thought { text } => {
-                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "think", "text": text }));
+                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "sessionId": &session_id_cb, "phase": "think", "text": text }));
                 }
                 ChatEvent::Tool { name, status, .. } => {
                     let label = if status.is_empty() || status == "None" {
@@ -1183,12 +1428,13 @@ pub async fn assistant_request(
                     } else {
                         format!("{name} [{status}]\n")
                     };
-                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "tool", "text": label }));
+                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "sessionId": &session_id_cb, "phase": "tool", "text": label }));
                 }
                 ChatEvent::Usage { output_tokens, thought_tokens, turns_since_compaction, compact_after } => {
                     // Estimated token usage + how full the conversation is before the
                     // next auto-compaction (which resets the context).
                     let _ = app_cb.emit("agent:usage", serde_json::json!({
+                        "sessionId": &session_id_cb,
                         "outputTokens": output_tokens,
                         "thoughtTokens": thought_tokens,
                         "turnsSinceCompaction": turns_since_compaction,
@@ -1197,13 +1443,13 @@ pub async fn assistant_request(
                 }
                 ChatEvent::Done { .. } => {}
                 ChatEvent::Error { message } => {
-                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "phase": "error", "text": message }));
+                    let _ = app_cb.emit("llm:chunk", serde_json::json!({ "sessionId": &session_id_cb, "phase": "error", "text": message }));
                 }
             }
         }, assistant::agent_cancelled)
         .await;
 
-    let _ = app.emit("llm:turn-end", serde_json::json!({}));
+    let _ = app.emit("llm:turn-end", serde_json::json!({ "sessionId": &session_id }));
     if assistant::agent_cancelled() {
         // The user pressed Stop — the sidecar was disconnected and cancelled the
         // ACP turn. Whatever tool calls already landed stay applied (they're real
@@ -1661,8 +1907,7 @@ pub async fn start_auto_mix(
         return Err("No stages selected.".into());
     }
 
-    let observer: std::sync::Arc<dyn assistant::LlmObserver> =
-        std::sync::Arc::new(TauriLlmObserver { app: app.clone() });
+    let observer: std::sync::Arc<dyn assistant::LlmObserver> = std::sync::Arc::new(assistant::NoopObserver);
     let mut config = state.config.clone();
     if let Some(base_url) = options.ollama_base_url.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         config.ollama_base_url = base_url.to_string();
@@ -1677,45 +1922,38 @@ pub async fn start_auto_mix(
     let app_clone = app.clone();
     let session_id_clone = session_id.clone();
     tokio::spawn(async move {
-        let _ = app_clone.emit("auto-mix:start", serde_json::json!({ "stages": options.stages }));
+        let _ = app_clone.emit("auto-mix:start", serde_json::json!({ "sessionId": &session_id_clone, "stages": options.stages }));
         for (i, stage) in stages.iter().enumerate() {
             if assistant::agent_cancelled() {
                 break;
             }
             let _ = app_clone.emit(
                 "auto-mix:stage-start",
-                serde_json::json!({ "index": i, "stageId": stage.id(), "displayName": stage.display_name() }),
+                serde_json::json!({ "sessionId": &session_id_clone, "index": i, "stageId": stage.id(), "displayName": stage.display_name() }),
             );
-            let report =
-                crate::auto_mix::run_stage(&config, store_arc.clone(), &session_id_clone, *stage, observer.clone())
-                    .await;
-            match report {
-                Ok(r) => {
-                    let _ = app_clone.emit("auto-mix:stage-done", serde_json::json!(r));
-                    let _ = sync_audio_from_app(&app_clone, &session_id_clone);
-                    if r.status == "error" || r.status == "cancelled" { break; }
-                }
-                Err(e) => {
-                    let _ = app_clone.emit("auto-mix:stage-done", serde_json::json!({
-                        "stageId": stage.id(),
-                        "displayName": stage.display_name(),
-                        "status": "error",
-                        "actionCount": 0,
-                        "warnings": [],
-                        "error": e,
-                        "tokens": 0,
-                        "elapsedMs": 0,
-                    }));
-                    break;
-                }
+            let heartbeat = spawn_auto_mix_heartbeat(app_clone.clone(), &session_id_clone, stage.id());
+            let report = run_auto_mix_stage_bounded(
+                &config,
+                store_arc.clone(),
+                &session_id_clone,
+                *stage,
+                observer.clone(),
+            )
+            .await;
+            drop(heartbeat);
+            let should_stop = report.status == "error" || report.status == "cancelled";
+            emit_auto_mix_stage_done(&app_clone, &session_id_clone, &report);
+            let _ = sync_audio_from_app(&app_clone, &session_id_clone);
+            if should_stop {
+                break;
             }
         }
         // Reload the project once everything's done so the UI sees the final state.
         if let Ok(p) = state_get_project(&app_clone, &session_id_clone) {
             let _ = sync_audio_from_app(&app_clone, &session_id_clone);
-            let _ = app_clone.emit("auto-mix:complete", serde_json::json!({ "project": p }));
+            let _ = app_clone.emit("auto-mix:complete", serde_json::json!({ "sessionId": &session_id_clone, "project": p }));
         } else {
-            let _ = app_clone.emit("auto-mix:complete", serde_json::json!({}));
+            let _ = app_clone.emit("auto-mix:complete", serde_json::json!({ "sessionId": &session_id_clone }));
         }
     });
     Ok(())
@@ -1984,6 +2222,322 @@ pub fn save_video_recording(
     }
     let _ = fs::remove_file(&temp_path);
     Ok(project)
+}
+
+/// ffmpeg atempo only accepts 0.5–2.0 per stage; chain stages for rates outside.
+fn atempo_chain(rate: f64) -> String {
+    let mut parts = Vec::new();
+    let mut r = rate;
+    while r < 0.5 {
+        parts.push("atempo=0.5".to_string());
+        r /= 0.5;
+    }
+    while r > 2.0 {
+        parts.push("atempo=2.0".to_string());
+        r /= 2.0;
+    }
+    parts.push(format!("atempo={r:.6}"));
+    parts.join(",")
+}
+
+/// Time-stretch the whole song: change tempo while PRESERVING pitch (ffmpeg
+/// `atempo`). `rate` is the speed factor (0.75 = 25% slower, same key). Every
+/// audio source is re-rendered stretched; clips, regions, markers, sections,
+/// automation and BPM are rescaled so the timeline stays consistent. Fully
+/// undoable (recorded as one history entry). Video tracks are left untouched.
+#[tauri::command]
+pub async fn stretch_session_tempo(
+    state: State<'_, AppState>,
+    session_id: String,
+    percent: f64,
+) -> Result<MixProject, String> {
+    // ABSOLUTE semantics: `percent` is speed relative to the ORIGINAL audio
+    // (100 = revert to original). Stretched sources remember their pristine
+    // origin, so every change re-renders from the untouched original — no
+    // generational quality loss, and revert is exact.
+    if !(25.0..=200.0).contains(&percent) {
+        return Err("Speed must be between 25% and 200%.".into());
+    }
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let mut project = store.get_project(&session_id)?;
+    let session_rate = project.session.sample_rate;
+    let current = if project.session.tempo_percent > 0.0 { project.session.tempo_percent as f64 } else { 100.0 };
+    if (percent - current).abs() < 0.5 {
+        return Err(format!("The song is already at {percent:.0}%."));
+    }
+    let rate = percent / 100.0; // vs original (for stretching pristine audio)
+    let scale = current / percent; // timeline position scale vs CURRENT state
+    let scale_u64 = |v: u64| -> u64 { (v as f64 * scale).round() as u64 };
+
+    // Every audio source referenced by a non-video track (track source + clips).
+    let mut wanted: Vec<String> = Vec::new();
+    for track in project.session.tracks.iter().filter(|t| !matches!(t.kind, crate::model::TrackKind::Video)) {
+        if !wanted.contains(&track.source_file_id) {
+            wanted.push(track.source_file_id.clone());
+        }
+        for clip in &track.clips {
+            if let Some(id) = &clip.source_file_id {
+                if !wanted.contains(id) {
+                    wanted.push(id.clone());
+                }
+            }
+        }
+    }
+
+    // Stretch each source's PRISTINE original with ffmpeg atempo → new source.
+    // At 100% we skip ffmpeg entirely and just point tracks back at the pristine
+    // files (exact revert).
+    let filter = atempo_chain(rate);
+    let reverting = (percent - 100.0).abs() < 0.5;
+    let percent_label = percent.round() as i64;
+    let mut remap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut new_sources = Vec::new();
+    for source_id in &wanted {
+        let Some(current_src) = project.session.source_files.iter().find(|s| &s.id == source_id) else { continue };
+        // Resolve the pristine origin (the source itself if it was never stretched).
+        let pristine_id = current_src.pristine_source_id.clone().unwrap_or_else(|| current_src.id.clone());
+        if reverting {
+            if pristine_id != *source_id {
+                remap.insert(source_id.clone(), pristine_id);
+            }
+            continue;
+        }
+        let source = project
+            .session
+            .source_files
+            .iter()
+            .find(|s| s.id == pristine_id)
+            .unwrap_or(current_src);
+        // cache_path is the app's own .f32cache (header + raw f32 interleaved) —
+        // NOT a decodable audio file. Read it and feed ffmpeg raw f32le samples.
+        let cache = PathBuf::from(&source.cache_path);
+        if !cache.exists() {
+            return Err(format!("Source audio missing on disk: {}", source.original_name));
+        }
+        let (header, samples) = crate::engine::source::cache::read_cache_all(&cache)
+            .map_err(|e| format!("read {}: {e}", source.original_name))?;
+        let tmp_dir = std::env::temp_dir();
+        let raw = tmp_dir.join(format!("stretch-in-{}.f32le", uuid::Uuid::new_v4()));
+        let bytes = unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 4) };
+        fs::write(&raw, bytes).map_err(|e| e.to_string())?;
+        let out = tmp_dir.join(format!("stretch-{}.wav", uuid::Uuid::new_v4()));
+        let output = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(["-f", "f32le", "-ar", &header.sample_rate.to_string(), "-ac", &header.channels.to_string(), "-i"])
+            .arg(&raw)
+            .args(["-filter:a", &filter, "-ar", &session_rate.to_string()])
+            .arg(&out)
+            .output()
+            .map_err(|e| format!("ffmpeg failed to start: {e}"))?;
+        let _ = fs::remove_file(&raw);
+        if !output.status.success() {
+            let _ = fs::remove_file(&out);
+            let err = String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or("").to_string();
+            return Err(format!("Time-stretch failed on {}: {err}", source.original_name));
+        }
+        let mut stretched = store.import_source_standalone(&out, session_rate)?;
+        let _ = fs::remove_file(&out);
+        let base = strip_wav_suffix(&source.original_name);
+        stretched.original_name = format!("{base} ({percent_label}%)");
+        stretched.pristine_source_id = Some(source.id.clone());
+        remap.insert(source_id.clone(), stretched.id.clone());
+        new_sources.push(stretched);
+    }
+
+    // Build the transformed session pieces (typed, then serialized into patches).
+    let old_sources = project.session.source_files.clone();
+    let old_tracks = project.session.tracks.clone();
+    let old_regions = project.session.regions.clone();
+    let old_markers = project.session.markers.clone();
+    let old_sections = project.session.sections.clone();
+    let old_bpm = project.session.bpm;
+
+    let mut sources = old_sources.clone();
+    sources.extend(new_sources);
+    let mut tracks = old_tracks.clone();
+    for track in tracks.iter_mut().filter(|t| !matches!(t.kind, crate::model::TrackKind::Video)) {
+        if let Some(new_id) = remap.get(&track.source_file_id) {
+            track.source_file_id = new_id.clone();
+        }
+        track.start_sample = scale_u64(track.start_sample);
+        for clip in track.clips.iter_mut() {
+            if let Some(id) = &clip.source_file_id {
+                if let Some(new_id) = remap.get(id) {
+                    clip.source_file_id = Some(new_id.clone());
+                }
+            }
+            clip.start_sample = scale_u64(clip.start_sample);
+            clip.end_sample = scale_u64(clip.end_sample);
+            clip.source_offset_sample = scale_u64(clip.source_offset_sample);
+        }
+        for lane in track.automation.iter_mut() {
+            for point in lane.points.iter_mut() {
+                point.sample = scale_u64(point.sample);
+            }
+        }
+    }
+    let mut regions = old_regions.clone();
+    for region in regions.iter_mut() {
+        region.start_sample = scale_u64(region.start_sample);
+        region.end_sample = scale_u64(region.end_sample);
+    }
+    let mut markers = old_markers.clone();
+    for marker in markers.iter_mut() {
+        marker.sample = scale_u64(marker.sample);
+    }
+    let mut sections = old_sections.clone();
+    for section in sections.iter_mut() {
+        section.start = (section.start as f64 * scale) as f32;
+        section.end = (section.end as f64 * scale) as f32;
+    }
+    // bpm scales with speed relative to the current state.
+    let bpm = old_bpm.map(|b| (b as f64 * (percent / current)) as f32);
+    let old_tempo_percent = project.session.tempo_percent;
+
+    let jp = |path: &str, value: serde_json::Value| JsonPatchOp { op: "replace".into(), path: path.into(), value: Some(value) };
+    let forward = vec![
+        jp("/sourceFiles", serde_json::to_value(&sources).map_err(|e| e.to_string())?),
+        jp("/tracks", serde_json::to_value(&tracks).map_err(|e| e.to_string())?),
+        jp("/regions", serde_json::to_value(&regions).map_err(|e| e.to_string())?),
+        jp("/markers", serde_json::to_value(&markers).map_err(|e| e.to_string())?),
+        jp("/sections", serde_json::to_value(&sections).map_err(|e| e.to_string())?),
+        jp("/bpm", serde_json::to_value(bpm).map_err(|e| e.to_string())?),
+        jp("/tempoPercent", serde_json::to_value(percent as f32).map_err(|e| e.to_string())?),
+    ];
+    let inverse = vec![
+        jp("/sourceFiles", serde_json::to_value(&old_sources).map_err(|e| e.to_string())?),
+        jp("/tracks", serde_json::to_value(&old_tracks).map_err(|e| e.to_string())?),
+        jp("/regions", serde_json::to_value(&old_regions).map_err(|e| e.to_string())?),
+        jp("/markers", serde_json::to_value(&old_markers).map_err(|e| e.to_string())?),
+        jp("/sections", serde_json::to_value(&old_sections).map_err(|e| e.to_string())?),
+        jp("/bpm", serde_json::to_value(old_bpm).map_err(|e| e.to_string())?),
+        jp("/tempoPercent", serde_json::to_value(old_tempo_percent).map_err(|e| e.to_string())?),
+    ];
+    record_patch(
+        &mut project,
+        forward,
+        inverse,
+        HistorySource::User,
+        Some(if reverting { "Tempo restored to original (100%)".to_string() } else { format!("Tempo {percent_label}% (pitch preserved)") }),
+    )?;
+    store.save(&project)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
+}
+
+fn strip_wav_suffix(name: &str) -> String {
+    name.trim_end_matches(".wav").trim_end_matches(".WAV").to_string()
+}
+
+/// Start native (ffmpeg/AVFoundation) camera captures — one process per camera.
+/// Blocks until every camera reports frames flowing, so the caller can start the
+/// transport knowing all takes are already rolling.
+#[tauri::command]
+pub async fn start_camera_captures(
+    state: State<'_, AppState>,
+    specs: Vec<crate::camera_capture::CaptureSpec>,
+) -> Result<(), String> {
+    let videos_dir = state.store.lock().map_err(|e| e.to_string())?.videos_dir();
+    // Spawning + readiness-waiting is blocking work; keep it off the async core.
+    tauri::async_runtime::spawn_blocking(move || crate::camera_capture::start_captures(videos_dir, specs))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Snapshot each capture's media clock at the instant the transport starts —
+/// that becomes the head-trim aligning the take with the timeline.
+#[tauri::command]
+pub fn mark_camera_transport_start() {
+    crate::camera_capture::mark_transport_start();
+}
+
+/// Where the webview should point its <img> tags for live MJPEG camera previews.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraPreviewInfo {
+    pub port: u16,
+    pub token: String,
+}
+
+#[tauri::command]
+pub fn get_camera_preview_info() -> Result<CameraPreviewInfo, String> {
+    let info = crate::control::info().ok_or("control server not running")?;
+    Ok(CameraPreviewInfo { port: info.port, token: info.token.clone() })
+}
+
+/// Stop live previews (empty list = all). Used when preview windows close.
+#[tauri::command]
+pub fn stop_camera_previews(device_labels: Vec<String>) {
+    crate::camera_capture::stop_previews(&device_labels);
+}
+
+/// Stop native captures. With `discard`, kill + delete everything (cancelled or
+/// failed start). Otherwise finalize each file and register it as a clip on its
+/// track (+ optional camera-audio track), exactly like the old save path.
+#[tauri::command]
+pub async fn stop_camera_captures(
+    state: State<'_, AppState>,
+    session_id: String,
+    specs: Vec<crate::camera_capture::StopSpec>,
+    discard: bool,
+) -> Result<Option<MixProject>, String> {
+    if discard {
+        tauri::async_runtime::spawn_blocking(crate::camera_capture::stop_captures_discard)
+            .await
+            .map_err(|e| e.to_string())??;
+        return Ok(None);
+    }
+    let track_ids: Vec<String> = specs.iter().map(|s| s.track_id.clone()).collect();
+    let finished = tauri::async_runtime::spawn_blocking(move || crate::camera_capture::stop_captures(&track_ids))
+        .await
+        .map_err(|e| e.to_string())??;
+    let mut latest: Option<MixProject> = None;
+    for capture in finished {
+        let Some(spec) = specs.iter().find(|s| s.track_id == capture.track_id) else { continue };
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let file_name = capture
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("capture.mp4")
+            .to_string();
+        let project = store.add_video_recording_clip(
+            &session_id,
+            &capture.track_id,
+            &capture.path,
+            file_name.clone(),
+            "video/mp4".into(),
+            spec.start_sample,
+            capture.duration_ms,
+            capture.offset_ms,
+        )?;
+        let sample_rate = project.session.sample_rate;
+        latest = Some(project);
+        // Camera audio is captured by a parallel audio-only process; trim its head
+        // by ITS OWN media-clock offset (independent from the video's) and add it
+        // as an audio track aligned to the same timeline start.
+        if spec.create_audio_track {
+            if let Some((wav, audio_offset_ms)) = &capture.audio_wav {
+                let trimmed = store
+                    .videos_dir()
+                    .join(format!("{}-audio-{}.wav", Path::new(&file_name).file_stem().and_then(|i| i.to_str()).unwrap_or("camera"), uuid::Uuid::new_v4()));
+                if extract_video_audio(wav, &trimmed, sample_rate, *audio_offset_ms).is_ok() {
+                    if let Ok(updated) = store.add_source_file_at(&session_id, &trimmed, spec.start_sample) {
+                        latest = Some(updated);
+                    }
+                    let _ = fs::remove_file(&trimmed);
+                }
+                let _ = fs::remove_file(wav);
+            }
+        } else if let Some((wav, _)) = &capture.audio_wav {
+            let _ = fs::remove_file(wav);
+        }
+        let _ = fs::remove_file(&capture.path);
+    }
+    Ok(latest)
 }
 
 #[tauri::command]
@@ -2539,7 +3093,7 @@ pub async fn render_agent_video_edit(
 ) -> Result<AgentVideoEditResponse, String> {
     assistant::reset_agent_cancel();
     let started = std::time::Instant::now();
-    emit_agent_progress(&app, &started, "starting", "Preparing Agent Video Edit...", 0, 1);
+    emit_agent_progress(&app, &session_id, &started, "starting", "Preparing Agent Video Edit...", 0, 1);
     let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
     // No save dialog by default — render straight to the renders folder. The frontend
     // adds the result as a new video track; the Download button lets the user export later.
@@ -2559,12 +3113,12 @@ pub async fn render_agent_video_edit(
         .filter(|id| !id.trim().is_empty())
         .collect::<HashSet<_>>();
     if selected_track_ids.is_empty() {
-        emit_agent_progress(&app, &started, "error", "No selected video tracks.", 0, 1);
+        emit_agent_progress(&app, &session_id, &started, "error", "No selected video tracks.", 0, 1);
         return Err("Select one or more video tracks before running Agent Video Edit.".into());
     }
     let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
     if video_inputs.is_empty() {
-        emit_agent_progress(&app, &started, "error", "Selected tracks have no clips in range.", 0, 1);
+        emit_agent_progress(&app, &session_id, &started, "error", "Selected tracks have no clips in range.", 0, 1);
         return Err("The selected video tracks have no recorded clips in the edit range.".into());
     }
     let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0) * project.session.sample_rate as f64).round() as u64).max(1);
@@ -2583,15 +3137,15 @@ pub async fn render_agent_video_edit(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| fallback_model.clone());
     if base_url.is_empty() || vision_model.is_empty() || edit_model.is_empty() {
-        emit_agent_progress(&app, &started, "error", "No Ollama vision model configured.", 0, 1);
-        return Err("Configure Ollama models before running Agent Video Edit.".into());
+        emit_agent_progress(&app, &session_id, &started, "error", "No model server configured.", 0, 1);
+        return Err("Configure the model server before running Agent Video Edit.".into());
     }
     let instructions = instructions
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
     let total_windows = range_end.saturating_sub(range_start).div_ceil(interval_samples).max(1) as u32;
-    emit_agent_progress(&app, &started, "audio", "Rendering mix audio for agent analysis...", 0, total_windows);
+    emit_agent_progress(&app, &session_id, &started, "audio", "Rendering mix audio for agent analysis...", 0, total_windows);
     let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
     fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
     let audio_path = renders_dir.join(format!("{session_id}.agent-video-edit.wav"));
@@ -2604,7 +3158,7 @@ pub async fn render_agent_video_edit(
         range_end,
     )
     .map_err(|error| {
-        emit_agent_progress(&app, &started, "error", "Could not render mix audio for the video agent.", 0, total_windows);
+        emit_agent_progress(&app, &session_id, &started, "error", "Could not render mix audio for the video agent.", 0, total_windows);
         error
     })?;
     let audio_analysis = RenderedAudioAnalysis {
@@ -2621,6 +3175,7 @@ pub async fn render_agent_video_edit(
     }
     emit_agent_progress(
         &app,
+        &session_id,
         &started,
         "sampling",
         &format!("Sampling frames from {} selected video tracks...", selected_track_ids.len()),
@@ -2646,7 +3201,7 @@ pub async fn render_agent_video_edit(
     )
     .await
     .unwrap_or_else(|error| {
-        emit_agent_progress(&app, &started, "fallback", &format!("Vision agent failed; using automatic cuts. {error}"), 0, total_windows);
+        emit_agent_progress(&app, &session_id, &started, "fallback", &format!("Vision agent failed; using automatic cuts. {error}"), 0, total_windows);
         let segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
         let script = build_fallback_agent_script(&video_inputs, &segments, range_start, range_end, total_windows, project.session.sample_rate, &error);
         // Even on agent failure, honor explicit keyword effects from the instructions.
@@ -2656,16 +3211,16 @@ pub async fn render_agent_video_edit(
     });
     let _ = fs::remove_dir_all(&temp_dir);
     if segments.is_empty() {
-        emit_agent_progress(&app, &started, "error", "No visible clips found in selected range.", 0, total_windows);
+        emit_agent_progress(&app, &session_id, &started, "error", "No visible clips found in selected range.", 0, total_windows);
         return Err("Agent Video Edit could not find visible selected clips in the edit range.".into());
     }
 
     if plan_only.unwrap_or(false) {
-        emit_agent_progress(&app, &started, "done", "Plan ready for review.", total_windows, total_windows);
+        emit_agent_progress(&app, &session_id, &started, "done", "Plan ready for review.", total_windows, total_windows);
         return Ok(AgentVideoEditResponse { path: String::new(), script, look_preset: agent_look_preset, color_grade: agent_color_grade, video_effects: agent_effects });
     }
 
-    emit_agent_progress(&app, &started, "audio", "Using analyzed mix audio for video export...", total_windows, total_windows);
+    emit_agent_progress(&app, &session_id, &started, "audio", "Using analyzed mix audio for video export...", total_windows, total_windows);
     // Prefer the free-form color grade when present (richer than a named preset).
     // Fall back to the named preset if the model only voted that.
     let grade_filter = agent_color_grade.as_ref().and_then(build_color_grade_filter);
@@ -2674,13 +3229,13 @@ pub async fn render_agent_video_edit(
     } else {
         agent_look_preset.as_ref().map(|preset| format!("{:?}", preset)).unwrap_or_else(|| "no grade".to_string())
     };
-    emit_agent_progress(&app, &started, "rendering", &format!("Rendering {} selected cuts to MP4 ({look_label})...", segments.len()), total_windows, total_windows);
+    emit_agent_progress(&app, &session_id, &started, "rendering", &format!("Rendering {} selected cuts to MP4 ({look_label})...", segments.len()), total_windows, total_windows);
     render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &path, agent_look_preset.clone(), grade_filter, agent_effects.clone(), false)
         .map_err(|error| {
-            emit_agent_progress(&app, &started, "error", "ffmpeg failed while rendering the agent edit.", total_windows, total_windows);
+            emit_agent_progress(&app, &session_id, &started, "error", "ffmpeg failed while rendering the agent edit.", total_windows, total_windows);
             error
         })?;
-    emit_agent_progress(&app, &started, "done", "Agent Video Edit complete.", total_windows, total_windows);
+    emit_agent_progress(&app, &session_id, &started, "done", "Agent Video Edit complete.", total_windows, total_windows);
     Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script, look_preset: agent_look_preset, color_grade: agent_color_grade, video_effects: agent_effects })
 }
 
@@ -3087,6 +3642,7 @@ fn round2(x: f32) -> f32 { if x.is_finite() { (x * 100.0).round() / 100.0 } else
 
 fn emit_agent_progress(
     app: &AppHandle,
+    session_id: &str,
     started: &std::time::Instant,
     stage: &str,
     message: &str,
@@ -3096,6 +3652,7 @@ fn emit_agent_progress(
     let _ = app.emit(
         "agent-video:progress",
         AgentVideoProgress {
+            session_id: session_id.to_string(),
             stage: stage.to_string(),
             message: message.to_string(),
             current,
@@ -4180,7 +4737,7 @@ async fn build_agent_edit_segments(
             .filter(|(_, clip)| clip.start_sample < next && clip.end_sample > cursor)
             .collect::<Vec<_>>();
         if active.is_empty() {
-            emit_agent_progress(app, started, "sampling", "No active selected clip in this window; skipping.", window_index, total_windows);
+            emit_agent_progress(app, &session.id, started, "sampling", "No active selected clip in this window; skipping.", window_index, total_windows);
             script.push(AgentVideoScriptEntry {
                 window_index,
                 total_windows,
@@ -4205,6 +4762,7 @@ async fn build_agent_edit_segments(
         }
         emit_agent_progress(
             app,
+            &session.id,
             started,
             "sampling",
             &format!("Extracting frames for window {window_index}/{total_windows}..."),
@@ -4268,6 +4826,7 @@ async fn build_agent_edit_segments(
         if labels.is_empty() {
             emit_agent_progress(
                 app,
+                &session.id,
                 started,
                 "sampling",
                 &format!("Window {window_index}/{total_windows}: no readable frames; skipping."),
@@ -4300,6 +4859,7 @@ async fn build_agent_edit_segments(
         let image_count = images.len();
         emit_agent_progress(
             app,
+            &session.id,
             started,
             "vision",
             &format!("Analyzing frames and deciding edit for window {window_index}/{total_windows}..."),
@@ -4337,8 +4897,9 @@ async fn build_agent_edit_segments(
                     // let deterministic variety-cuts carry the rest of the edit.
                     vision_off = true;
                     emit_agent_progress(
-                        &app,
-                        &started,
+                        app,
+                        &session.id,
+                        started,
                         "vision",
                         "Video model can't analyze frames — switching to automatic time/beat-based cuts.",
                         window_index,
@@ -4689,6 +5250,7 @@ async fn build_agent_edit_segments(
             };
             emit_agent_progress(
                 app,
+                &session.id,
                 started,
                 "decision",
                 &message,

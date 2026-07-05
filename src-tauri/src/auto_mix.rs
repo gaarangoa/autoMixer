@@ -265,10 +265,27 @@ pub async fn run_stage(
         .map_err(|e| e.to_string())?
         .get_project(session_id)?;
 
+    if stage == AutoMixStage::RawSessionPrep {
+        return Ok(StageReport {
+            stage_id: stage.id().into(),
+            display_name: stage.display_name().into(),
+            status: "skipped".into(),
+            action_count: 0,
+            explanation: Some(format!(
+                "Session loaded with {} tracks. Raw session prep is informational in this build; mixing starts at Prep / intent or Static balance.",
+                project.session.tracks.len()
+            )),
+            warnings: Vec::new(),
+            error: None,
+            tokens: 0,
+            elapsed_ms: 0,
+        });
+    }
+
     let base_url = config.ollama_base_url.trim().trim_end_matches('/').to_string();
     let model = config.ollama_model.trim().to_string();
     if base_url.is_empty() || model.is_empty() {
-        return Err("Ollama URL or model not configured.".into());
+        return Err("Model server URL or model not configured.".into());
     }
 
     let accumulator = Arc::new(AccumulatingObserver::new(observer));
@@ -282,10 +299,14 @@ pub async fn run_stage(
         .enumerate()
         .map(|(i, t)| (format!("tk{i}"), t.id.clone()))
         .collect();
+    // Keep reasoning ON: the stage model reasons over each track's analysis to pick
+    // tailored EQ/comp/level params. `llm_generate` enforces both a full-call
+    // deadline and a per-read idle timeout.
     let aliased_prompt = substitute_quoted(&prompt, &track_aliases, true);
 
     let phase = stage.id();
-    let call = match llm_generate(&base_url, &model, &aliased_prompt, ACTION_TIMEOUT_MS, phase, observer.as_ref()).await {
+    // No token cap for production auto-mix: let the model reason and answer fully.
+    let call = match llm_generate(&base_url, &model, &aliased_prompt, ACTION_TIMEOUT_MS, phase, observer.as_ref(), None).await {
         Some(c) => c,
         None => {
             let cancelled = crate::assistant::agent_cancelled();
@@ -840,6 +861,7 @@ mod tests {
         MixSession {
             id: "session".into(),
             name: "Session".into(),
+            album_id: String::new(),
             sample_rate: 48_000,
             bpm: None,
             source_files: Vec::new(),
@@ -874,7 +896,9 @@ mod tests {
             track.ai_generated = true;
             source_files.push(crate::model::SourceFile {
                 id: source_id,
-                original_name: format!("{name}.wav"),
+                pristine_source_id: None,
+                pristine_source_id: None,
+            original_name: format!("{name}.wav"),
                 cache_path: String::new(),
                 peak_path: String::new(),
                 duration_samples: 48_000 * 120,
@@ -898,6 +922,7 @@ mod tests {
         MixSession {
             id: "offline-smoke".into(),
             name: "Offline smoke".into(),
+            album_id: String::new(),
             sample_rate: 48_000,
             bpm: Some(120.0),
             source_files,
@@ -1076,7 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local Ollama and intentionally calls the selected LLM"]
+    #[ignore = "requires a local model server and intentionally calls the selected LLM"]
     async fn ollama_gpt_oss_20b_all_auto_mix_stages_smoke() {
         let base_url = std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into());
         let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gpt-oss:20b".into());
@@ -1101,9 +1126,9 @@ mod tests {
         ] {
             let prompt = substitute_quoted(&build_stage_prompt(&session, stage), &track_aliases, true);
             let observer = TestObserver::new();
-            let call = llm_generate(&base_url, &model, &prompt, 600_000, stage.id(), &observer)
+            let call = llm_generate(&base_url, &model, &prompt, 600_000, stage.id(), &observer, Some(4000))
                 .await
-                .unwrap_or_else(|| panic!("{}: Ollama did not respond", stage.id()));
+                .unwrap_or_else(|| panic!("{}: model server did not respond", stage.id()));
             let raw_real = substitute_quoted(&call.response, &track_aliases, false);
             let extracted = extract_json_object(&raw_real).unwrap_or(raw_real);
             let env = parse_stage_envelope(&session, &extracted)

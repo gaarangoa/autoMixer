@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -24,6 +25,7 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("automixer")
 
 CONTROL_FILE = Path(os.environ.get("AUTOMIXER_CONTROL_FILE", str(Path.home() / ".automixer" / "control.json")))
+AUTO_MIX_HTTP_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 def _control() -> tuple[str, str]:
@@ -56,6 +58,10 @@ def _request(method: str, path: str, body: dict | None = None, timeout: float = 
         except Exception:
             detail = ""
         raise RuntimeError(f"{exc.code} {exc.reason}: {detail}" if detail else f"{exc.code} {exc.reason}") from None
+
+
+async def _request_async(method: str, path: str, body: dict | None = None, timeout: float = 30) -> Any:
+    return await asyncio.to_thread(_request, method, path, body, timeout)
 
 
 def _track_summary(project: dict) -> list[dict]:
@@ -272,14 +278,22 @@ def auto_crop(session_id: str, track_id: str, clip_id: str, instructions: str = 
 
 
 @mcp.tool()
-def auto_mix(session_id: str, stages: list[str] | None = None) -> dict:
-    """Run AutoMixer's auto-mix pipeline on this session and return a summary (stages
-    run + total actions applied). The full pipeline is 10 stages: raw_session_prep,
-    prep_intent, static_balance, cleanup_filters, subtractive_eq, dynamics,
-    tonal_enhancement, depth_space, section_automation, mix_bus_loudness. Pass a subset
-    via `stages` to run only those. Slow — each stage calls the mix model."""
+async def auto_mix(session_id: str, stages: list[str] | None = None) -> dict:
+    """Run AutoMixer auto-mix STAGES and return a report (actions applied + rationale).
+    Each stage is slow on local llama.cpp (~3-8 min, calls the mix model). ALWAYS call
+    this ONE STAGE AT A TIME (pass exactly one stage in `stages`) and report progress
+    to the user between calls. Do NOT call with no stages or many stages unless the
+    user explicitly asks for a single opaque background run; a full run can exceed
+    30 minutes. Stage order: prep_intent, static_balance, cleanup_filters,
+    subtractive_eq, dynamics, tonal_enhancement, depth_space, mix_bus_loudness
+    (raw_session_prep and section_automation are optional). See the auto-mix skill."""
     body = {"stages": stages} if stages else {}
-    return _request("POST", f"/control/session/{session_id}/auto-mix", body, timeout=1800)
+    return await _request_async(
+        "POST",
+        f"/control/session/{session_id}/auto-mix",
+        body,
+        timeout=AUTO_MIX_HTTP_TIMEOUT_SECONDS,
+    )
 
 
 if __name__ == "__main__":

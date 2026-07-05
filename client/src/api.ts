@@ -12,9 +12,10 @@ function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
 export type PlayheadEvent = { sample: number; running: boolean };
 export type MetersEvent = { masterPeak: number; trackPeaks: number[] };
 export type AudioProgressEvent = { stage: string; message: string; elapsedSeconds: number };
-export type AgentVideoProgressEvent = { stage: string; message: string; current: number; total: number; elapsedSeconds: number };
-export type LlmChunkEvent = { phase: string; text: string };
-export type LlmStatsEvent = { phase: string; promptTokens: number; responseTokens: number; elapsedMs: number };
+export type AgentVideoProgressEvent = { sessionId?: string; stage: string; message: string; current: number; total: number; elapsedSeconds: number };
+export type LlmChunkEvent = { sessionId?: string; phase: string; text: string };
+export type LlmStatsEvent = { sessionId?: string; phase: string; promptTokens: number; responseTokens: number; elapsedMs: number };
+export type LlmTurnEvent = { sessionId?: string; userText?: string };
 export type ExportAspect = "original" | "square" | "portrait916";
 // "fast" copies the preview cache or transcodes with -preset veryfast. "high" uses
 // -preset slow -crf 17 -b:a 320k. When a script is present, "high" also re-renders
@@ -56,6 +57,8 @@ export const api = {
     tauriInvoke<MixProject>("apply_mix_actions", { sessionId, actions, explanation }),
   undo: (sessionId: string) => tauriInvoke<MixProject>("undo_mix_action", { sessionId }),
   redo: (sessionId: string) => tauriInvoke<MixProject>("redo_mix_action", { sessionId }),
+  // Time-stretch the whole song (tempo change, pitch preserved). rate 0.75 = 25% slower.
+  stretchTempo: (sessionId: string, percent: number) => tauriInvoke<MixProject>("stretch_session_tempo", { sessionId, percent }),
   applyPatch: (sessionId: string, forwardPatch: JsonPatch[], inversePatch: JsonPatch[], explanation?: string) =>
     tauriInvoke<MixProject>("apply_recorded_patch", { sessionId, forwardPatch, inversePatch, explanation }),
   resetSession: (sessionId: string) => tauriInvoke<MixProject>("reset_session", { sessionId }),
@@ -88,6 +91,8 @@ export const api = {
     tauriInvoke<void>("start_auto_mix", { sessionId, options: { stages, ollamaBaseUrl, ollamaModel } }),
   onAutoMixEvent: (kind: "start" | "stage-start" | "stage-done" | "complete", cb: (payload: unknown) => void): Promise<UnlistenFn> =>
     listen(`auto-mix:${kind}`, (e) => cb(e.payload)),
+  onAutoMixHeartbeat: (cb: (payload: { sessionId?: string; phase: string; seconds: number }) => void): Promise<UnlistenFn> =>
+    listen("auto-mix:heartbeat", (e) => cb(e.payload as { sessionId?: string; phase: string; seconds: number })),
   onMenuDetectStructure: (cb: () => void): Promise<UnlistenFn> =>
     listen("menu:detect-structure", () => cb()),
   onMenuLevelSections: (cb: () => void): Promise<UnlistenFn> =>
@@ -97,6 +102,15 @@ export const api = {
     tauriInvoke<{ path: string }>("render_mix", { sessionId, outputPath, startSample, endSample, trackIds, format }),
   saveVideoRecording: (sessionId: string, trackId: string, fileName: string, mimeType: string, startSample: number, durationMs: number, dataBase64: string, createAudioTrack = false, sourceOffsetMs = 0) =>
     tauriInvoke<MixProject>("save_video_recording", { sessionId, trackId, fileName, mimeType, startSample, durationMs, dataBase64, createAudioTrack, sourceOffsetMs }),
+  // Native multicam capture: one ffmpeg process per camera (no webview media stack).
+  startCameraCaptures: (specs: { trackId: string; deviceLabel: string; includeAudio: boolean }[]) =>
+    tauriInvoke<void>("start_camera_captures", { specs }),
+  markCameraTransportStart: () => tauriInvoke<void>("mark_camera_transport_start"),
+  // Live MJPEG previews served by the Rust camera service (single camera owner).
+  getCameraPreviewInfo: () => tauriInvoke<{ port: number; token: string }>("get_camera_preview_info"),
+  stopCameraPreviews: (deviceLabels: string[] = []) => tauriInvoke<void>("stop_camera_previews", { deviceLabels }),
+  stopCameraCaptures: (sessionId: string, specs: { trackId: string; startSample: number; createAudioTrack: boolean }[], discard = false) =>
+    tauriInvoke<MixProject | null>("stop_camera_captures", { sessionId, specs, discard }),
   renderVideoMix: (sessionId: string, outputPath: string, startSample?: number, endSample?: number, trackIds?: string[], aspectRatio?: ExportAspect, quality?: ExportQuality) =>
     tauriInvoke<{ path: string }>("render_video_mix", { sessionId, outputPath, startSample, endSample, trackIds, aspectRatio, quality }),
   exportRenderedVideo: (sourcePath: string, outputPath: string, aspectRatio?: ExportAspect, quality?: ExportQuality) =>
@@ -131,10 +145,10 @@ export const api = {
     listen<LlmChunkEvent>("llm:chunk", e => cb(e.payload)),
   onLlmStats: (cb: (event: LlmStatsEvent) => void): Promise<UnlistenFn> =>
     listen<LlmStatsEvent>("llm:stats", e => cb(e.payload)),
-  onLlmTurnStart: (cb: () => void): Promise<UnlistenFn> =>
-    listen("llm:turn-start", () => cb()),
-  onLlmTurnEnd: (cb: () => void): Promise<UnlistenFn> =>
-    listen("llm:turn-end", () => cb()),
+  onLlmTurnStart: (cb: (event: LlmTurnEvent) => void): Promise<UnlistenFn> =>
+    listen<LlmTurnEvent>("llm:turn-start", e => cb(e.payload ?? {})),
+  onLlmTurnEnd: (cb: (event: LlmTurnEvent) => void): Promise<UnlistenFn> =>
+    listen<LlmTurnEvent>("llm:turn-end", e => cb(e.payload ?? {})),
   // Read / set the embedded Hermes agent's orchestration model (any
   // OpenAI-compatible endpoint). Setting it restarts the agent sidecar.
   getHermesModel: () => tauriInvoke<{ baseUrl: string; model: string; provider: string }>("get_hermes_model"),

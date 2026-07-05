@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertCircle, Aperture, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Download, FilePlus2, Focus, FolderOpen, GitCompareArrows, Info, Keyboard, Maximize2, MessageSquare, Mic, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, Repeat, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X } from "lucide-react";
+import { AlertCircle, Aperture, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Download, FilePlus2, Focus, FolderOpen, Gauge, GitCompareArrows, Info, Keyboard, Maximize2, MessageSquare, Mic, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, Repeat, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X } from "lucide-react";
 import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixAlbum, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -29,6 +29,38 @@ const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 const SHIFT_KEY = IS_MAC ? "⇧" : "Shift";
 
 type Toast = { id: number; kind: "success" | "error" | "info"; text: string };
+
+type AutoMixStageState = {
+  stageId: string;
+  displayName: string;
+  status: string;
+  actionCount: number;
+  warnings: string[];
+  error?: string;
+  tokens: number;
+  elapsedMs: number;
+  explanation?: string;
+};
+
+type AutoMixSessionState = {
+  stages: AutoMixStageState[];
+  running: boolean;
+  secondsByPhase: Record<string, number>;
+  lastBeatAt: number | null;
+};
+
+type ReasoningEntry = {
+  phase: string;
+  text: string;
+  tokens: { prompt: number; response: number; elapsedMs: number } | null;
+};
+
+const emptyAutoMixState = (): AutoMixSessionState => ({
+  stages: [],
+  running: false,
+  secondsByPhase: {},
+  lastBeatAt: null,
+});
 
 type ConfirmRequest = {
   title: string;
@@ -73,6 +105,10 @@ type CameraPreviewCanvasEvent = {
 type CameraPreviewPayload = {
   tracks: CameraPreviewTrack[];
   canvas: VideoCanvas;
+};
+
+type VideoMonitorCameraPayload = CameraPreviewPayload & {
+  sessionId: string;
 };
 
 type VideoEditorWindowPayload = {
@@ -130,10 +166,16 @@ export function App() {
   // When recording was started with a ruler region active, this is the region's right
   // edge (seconds) — playback tick stops the recording automatically on reaching it.
   const recordingPunchOutRef = useRef<number | undefined>(undefined);
+  // Where the playhead should land after a recording stops (the region/punch-in
+  // start), so a finished take is instantly ready for review or a retake.
+  const recordingReturnRef = useRef<number | undefined>(undefined);
   const playbackAnchorRef = useRef<number | undefined>(undefined);
   const togglePlayRef = useRef<() => void | Promise<void>>(() => undefined);
-  const videoRecordersRef = useRef<Record<string, { recorder: MediaRecorder; stream: MediaStream; previewElement: HTMLVideoElement; chunks: Blob[]; startSample: number; startedAt: number; mimeType: string; createAudioTrack: boolean; transportOffsetMs: number }>>({});
-  const cameraPreviewWindowRef = useRef<WebviewWindow | null>(null);
+  // Synchronous transport re-entrancy latch (see togglePlay).
+  const togglePlayBusyRef = useRef(false);
+  // Active native (ffmpeg) camera captures, keyed by video track id. The processes
+  // live in Rust; this holds what we need to register the clips on stop.
+  const nativeCapturesRef = useRef<Record<string, { startSample: number; createAudioTrack: boolean; deviceId: string }>>({});
   const videoEditorWindowRef = useRef<WebviewWindow | null>(null);
   const mixerWindowRef = useRef<WebviewWindow | null>(null);
   const trackLanesRef = useRef<HTMLDivElement>(null);
@@ -155,6 +197,7 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [startupError, setStartupError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [busySessionId, setBusySessionId] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
   const [recording, setRecording] = useState(false);
   const [recordingStarting, setRecordingStarting] = useState(false);
@@ -182,6 +225,9 @@ export function App() {
   const [armedVideoTrackIds, setArmedVideoTrackIds] = useState<string[]>([]);
   const [videoRecordingTrackIds, setVideoRecordingTrackIds] = useState<string[]>([]);
   const [videoRecordingStartSeconds, setVideoRecordingStartSeconds] = useState<number | undefined>();
+  // True while cameras are being opened/warmed for a take — the transport is held
+  // and the record strip shows "Starting cameras…" so the wait never looks frozen.
+  const [videoRecordingStarting, setVideoRecordingStarting] = useState(false);
   const [playhead, setPlayhead] = useState(0);
   const [bypass, setBypass] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -201,6 +247,9 @@ export function App() {
   const [albumNewDraft, setAlbumNewDraft] = useState<string | null>(null);
   const [albumRenameDraft, setAlbumRenameDraft] = useState<string | null>(null);
   const [fileMenuOpen, setFileMenuOpen] = useState(false);
+  // Tempo (time-stretch) overlay: percent speed, pitch preserved.
+  const [tempoOpen, setTempoOpen] = useState(false);
+  const [tempoPercent, setTempoPercent] = useState(100);
   const pendingAlbumDirRef = useRef<string | null>(null);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; message: string; elapsedSeconds: number } | null>(null);
   // Seconds the current agent turn has been running — shown so a slow (esp. first) turn
@@ -246,14 +295,16 @@ export function App() {
   const [scopedSection, setScopedSection] = useState<{ index: number; start: number; end: number; label: string } | null>(null);
   const [loopSection, setLoopSection] = useState<{ start: number; end: number } | null>(null);
   const [profilePresets, setProfilePresets] = useState<ProfilePreset[]>([]);
-  const [reasoning, setReasoning] = useState<{ phase: string; text: string; tokens: { prompt: number; response: number; elapsedMs: number } | null }[]>([]);
+  const [reasoning, setReasoning] = useState<ReasoningEntry[]>([]);
   const [streamingTurn, setStreamingTurn] = useState<{ phase: string; text: string } | null>(null);
   // Estimated agent token usage + how full the conversation is before the next
   // auto-compaction (turnsSinceCompaction / compactAfter). Resets on compaction.
   const [agentUsage, setAgentUsage] = useState<{ output: number; thought: number; turns: number; compactAfter: number } | null>(null);
   const [mode, setMode] = useState<"interactive" | "auto" | "video">("interactive");
-  const [autoMixStages, setAutoMixStages] = useState<{ stageId: string; displayName: string; status: string; actionCount: number; warnings: string[]; error?: string; tokens: number; elapsedMs: number; explanation?: string }[]>([]);
+  const [autoMixStages, setAutoMixStages] = useState<AutoMixStageState[]>([]);
   const [autoMixRunning, setAutoMixRunning] = useState(false);
+  const [stageSeconds, setStageSeconds] = useState<Record<string, number>>({});
+  const [autoMixLastBeatAt, setAutoMixLastBeatAt] = useState<number | null>(null);
   const [ollamaUrl, setOllamaUrl] = useState(() => initialOllamaUrlRef.current ?? DEFAULT_OLLAMA_URL);
   const [ollamaModel, setOllamaModel] = useState(() => initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
   const [geminiApiKey, setGeminiApiKey] = useState(() => initialGeminiKeyRef.current ?? "");
@@ -294,7 +345,51 @@ export function App() {
   useEffect(() => { busyRef.current = busy; }, [busy]);
 
   const session = project?.session;
+  const currentSessionIdRef = useRef<string | undefined>(undefined);
+  const messagesBySessionRef = useRef<Record<string, ChatMessage[]>>({});
+  const reasoningBySessionRef = useRef<Record<string, ReasoningEntry[]>>({});
+  const autoMixBySessionRef = useRef<Record<string, AutoMixSessionState>>({});
+  currentSessionIdRef.current = session?.id;
+  const visibleBusy = busy && (!busySessionId || busySessionId === session?.id);
   const chatLogRef = useRef<HTMLDivElement>(null);
+
+  function updateMessagesForSession(sessionId: string, updater: (items: ChatMessage[]) => ChatMessage[]) {
+    const next = updater(messagesBySessionRef.current[sessionId] ?? []);
+    messagesBySessionRef.current[sessionId] = next;
+    if (currentSessionIdRef.current === sessionId) {
+      setMessages(next);
+    }
+    return next;
+  }
+
+  function setAutoMixStateForSession(sessionId: string, updater: (state: AutoMixSessionState) => AutoMixSessionState) {
+    const next = updater(autoMixBySessionRef.current[sessionId] ?? emptyAutoMixState());
+    autoMixBySessionRef.current[sessionId] = next;
+    if (currentSessionIdRef.current === sessionId) {
+      setAutoMixStages(next.stages);
+      setAutoMixRunning(next.running);
+      setStageSeconds(next.secondsByPhase);
+      setAutoMixLastBeatAt(next.lastBeatAt);
+    }
+    return next;
+  }
+
+  function updateReasoningForSession(sessionId: string, updater: (items: ReasoningEntry[]) => ReasoningEntry[]) {
+    const next = updater(reasoningBySessionRef.current[sessionId] ?? []);
+    reasoningBySessionRef.current[sessionId] = next;
+    if (currentSessionIdRef.current === sessionId) {
+      setReasoning(next);
+    }
+    return next;
+  }
+
+  function showAutoMixStateForSession(sessionId: string) {
+    const state = autoMixBySessionRef.current[sessionId] ?? emptyAutoMixState();
+    setAutoMixStages(state.stages);
+    setAutoMixRunning(state.running);
+    setStageSeconds(state.secondsByPhase);
+    setAutoMixLastBeatAt(state.lastBeatAt);
+  }
 
   useEffect(() => {
     const node = chatLogRef.current;
@@ -303,7 +398,7 @@ export function App() {
     // near the bottom, so scrolling up to read isn't yanked back down.
     const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 120;
     if (nearBottom) node.scrollTop = node.scrollHeight;
-  }, [messages.length, busy, streamingTurn?.text, reasoning]);
+  }, [messages.length, visibleBusy, streamingTurn?.text, reasoning]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -348,6 +443,9 @@ export function App() {
       if (event.key === " " && !mod && !event.altKey && !event.shiftKey) {
         if (target?.closest("button, a, [role=\"menu\"]")) return;
         event.preventDefault();
+        // Key-repeat fires keydown continuously while Space is held — a repeat
+        // used to double-trigger the record start and spawn duplicate recorders.
+        if (event.repeat) return;
         void togglePlayRef.current();
         return;
       }
@@ -387,7 +485,12 @@ export function App() {
     if (lastLoadedSessionRef.current === session.id) return;
     lastLoadedSessionRef.current = session.id;
     const stored = (project?.chatMessages ?? []) as ChatMessage[];
+    messagesBySessionRef.current[session.id] = stored;
     setMessages(stored);
+    showAutoMixStateForSession(session.id);
+    setReasoning(reasoningBySessionRef.current[session.id] ?? []);
+    setStreamingTurn(null);
+    setAgentUsage(null);
     setArmedTrackId(undefined);
   }, [session?.id, project?.chatMessages]);
 
@@ -415,6 +518,7 @@ export function App() {
   useEffect(() => {
     if (!session) return;
     if (lastLoadedSessionRef.current !== session.id) return;
+    messagesBySessionRef.current[session.id] = messages;
     const handle = setTimeout(() => {
       void api.saveChatMessages(session.id, messages).catch(() => undefined);
     }, 600);
@@ -498,8 +602,8 @@ export function App() {
   }, [session?.id, project, mixerWindowOpen]);
 
   // Keep the backend (for the video-edit skill) and the monitor window in sync with
-  // the user's track selection — so the agent edits, and the monitor shows, only
-  // what's selected.
+  // the user's track selection. The monitor shows selected video tracks, or all video
+  // tracks when no video track is selected.
   useEffect(() => {
     if (!session) return;
     void api.setVideoSelection(session.id, selectedTrackIds).catch(() => undefined);
@@ -507,6 +611,7 @@ export function App() {
     // sessions leaves it showing the previous session's clips.
     void videoMonitorRef.current?.emit("video-monitor:session", { sessionId: session.id }).catch(() => undefined);
     void videoMonitorRef.current?.emit("video-monitor:selection", { trackIds: selectedTrackIds }).catch(() => undefined);
+    void updateVideoMonitorWindow(buildCameraPreviewTracks());
   }, [selectedTrackIds, session?.id]);
 
   useEffect(() => {
@@ -560,6 +665,7 @@ export function App() {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     void api.onAgentVideoProgress((event) => {
+      if (!event.sessionId || event.sessionId !== currentSessionIdRef.current) return;
       setAgentEditProgress(event);
       setAgentEditStatus(event.message);
       if (event.stage === "done" || event.stage === "error") {
@@ -584,22 +690,56 @@ export function App() {
     const reg = (p: Promise<() => void>) => {
       void p.then((fn) => { if (cancelled) fn(); else unlisteners.push(fn); });
     };
-    reg(api.onAutoMixEvent("start", () => {
-      setAutoMixRunning(true);
-      setAutoMixStages([]);
+    reg(api.onAutoMixEvent("start", (payload) => {
+      const p = payload as { sessionId?: string };
+      const sid = p.sessionId;
+      if (!sid) return;
+      setAutoMixStateForSession(sid, () => ({
+        stages: [],
+        running: true,
+        secondsByPhase: {},
+        lastBeatAt: Date.now(),
+      }));
+    }));
+    reg(api.onAutoMixHeartbeat((p) => {
+      const sid = p.sessionId;
+      if (!sid) return;
+      setAutoMixStateForSession(sid, (state) => ({
+        ...state,
+        secondsByPhase: { ...state.secondsByPhase, [p.phase]: p.seconds },
+        lastBeatAt: Date.now(),
+      }));
     }));
     reg(api.onAutoMixEvent("stage-start", (payload) => {
-      const p = payload as { stageId: string; displayName: string };
-      setAutoMixStages((cur) => [...cur, { stageId: p.stageId, displayName: p.displayName, status: "running", actionCount: 0, warnings: [], tokens: 0, elapsedMs: 0 }]);
+      const p = payload as { sessionId?: string; stageId: string; displayName: string };
+      const sid = p.sessionId;
+      if (!sid) return;
+      setAutoMixStateForSession(sid, (state) => ({
+        ...state,
+        running: true,
+        lastBeatAt: Date.now(),
+        stages: [...state.stages, { stageId: p.stageId, displayName: p.displayName, status: "running", actionCount: 0, warnings: [], tokens: 0, elapsedMs: 0 }],
+      }));
     }));
     reg(api.onAutoMixEvent("stage-done", (payload) => {
-      const p = payload as { stageId: string; displayName: string; status: string; actionCount: number; warnings?: string[]; error?: string; tokens: number; elapsedMs: number; explanation?: string };
-      setAutoMixStages((cur) => cur.map((s) => s.stageId === p.stageId ? { ...s, ...p, warnings: p.warnings ?? [] } : s));
+      const p = payload as { sessionId?: string; stageId: string; displayName: string; status: string; actionCount: number; warnings?: string[]; error?: string; tokens: number; elapsedMs: number; explanation?: string };
+      const sid = p.sessionId;
+      if (!sid) return;
+      setAutoMixStateForSession(sid, (state) => ({
+        ...state,
+        stages: state.stages.map((s) => s.stageId === p.stageId ? { ...s, ...p, warnings: p.warnings ?? [] } : s),
+      }));
     }));
     reg(api.onAutoMixEvent("complete", (payload) => {
-      setAutoMixRunning(false);
-      const p = payload as { project?: MixProject };
-      if (p?.project) setProject(p.project);
+      const p = payload as { sessionId?: string; project?: MixProject };
+      const sid = p.sessionId ?? p.project?.session.id;
+      if (sid) {
+        setAutoMixStateForSession(sid, (state) => ({ ...state, running: false, lastBeatAt: null }));
+      }
+      const updatedProject = p.project;
+      if (updatedProject) {
+        setProject((prev) => (prev && prev.session.id === updatedProject.session.id ? updatedProject : prev));
+      }
     }));
     // An external agent (the Hermes control surface) mutated a session. Refresh the
     // project only if it's the one currently open — compared via the functional
@@ -610,13 +750,15 @@ export function App() {
     // A video render finished: drop a result chip in the chat (click to open the
     // monitor). We don't auto-open — the monitor is a user-toggled window now.
     reg(api.onVideoRendered((event) => {
-      setMessages((items) => [...items, { role: "video", path: event.path, cuts: event.cuts, lookPreset: event.lookPreset }]);
+      const next = updateMessagesForSession(event.sessionId, (items) => [...items, { role: "video", path: event.path, cuts: event.cuts, lookPreset: event.lookPreset }]);
+      void api.saveChatMessages(event.sessionId, next).catch(() => undefined);
     }));
     // Spacebar pressed in a secondary window (mixer / monitor / video editor) — the
     // main window owns the transport, so toggle play here.
     reg(listen("transport:toggle", () => { void togglePlayRef.current(); }));
     // Live token/context usage from the agent (cumulative for the current session).
-    reg(listen<{ outputTokens: number; thoughtTokens: number; turnsSinceCompaction: number; compactAfter: number }>("agent:usage", (event) => {
+    reg(listen<{ sessionId?: string; outputTokens: number; thoughtTokens: number; turnsSinceCompaction: number; compactAfter: number }>("agent:usage", (event) => {
+      if (!event.payload.sessionId || event.payload.sessionId !== currentSessionIdRef.current) return;
       setAgentUsage({
         output: event.payload.outputTokens,
         thought: event.payload.thoughtTokens,
@@ -630,21 +772,32 @@ export function App() {
     }));
     // The agent set the selection (select_tracks tool) — mirror it in the UI.
     reg(listen<{ sessionId: string; trackIds: string[] }>("selection:set", (event) => {
+      if (event.payload.sessionId !== currentSessionIdRef.current) return;
       setSelectedTrackIds(event.payload.trackIds ?? []);
     }));
-    reg(api.onLlmTurnStart(() => {
-      setReasoning([]);
+    reg(api.onLlmTurnStart((event) => {
+      const sid = event.sessionId;
+      if (!sid) return;
+      updateReasoningForSession(sid, () => []);
+      if (sid === currentSessionIdRef.current) setStreamingTurn(null);
+    }));
+    reg(api.onLlmTurnEnd((event) => {
+      if (!event.sessionId || event.sessionId !== currentSessionIdRef.current) return;
       setStreamingTurn(null);
     }));
-    reg(api.onLlmTurnEnd(() => setStreamingTurn(null)));
     // The background video-edit job failed — clear the "rendering…" overlay and tell
     // the user (the job runs independently of the chat turn, so this is its closure).
     reg(listen<{ sessionId: string; error: string }>("video:edit-failed", (event) => {
-      setAgentEditProgress(null);
-      pushSystem(`Video edit failed: ${event.payload.error}`);
+      if (event.payload.sessionId === currentSessionIdRef.current) {
+        setAgentEditProgress(null);
+      }
+      const next = updateMessagesForSession(event.payload.sessionId, (items) => [...items, { role: "system", text: `Video edit failed: ${event.payload.error}` }]);
+      void api.saveChatMessages(event.payload.sessionId, next).catch(() => undefined);
     }));
     reg(api.onLlmChunk((event) => {
-      setReasoning((current) => {
+      const sid = event.sessionId;
+      if (!sid) return;
+      updateReasoningForSession(sid, (current) => {
         const last = current[current.length - 1];
         if (last && last.phase === event.phase && !last.tokens) {
           return [...current.slice(0, -1), { ...last, text: last.text + event.text }];
@@ -652,7 +805,7 @@ export function App() {
         return [...current, { phase: event.phase, text: event.text, tokens: null }];
       });
       // Stream to the in-flight chat bubble only for visible-to-user phases.
-      if (event.phase === "action" || event.phase === "critique") {
+      if (sid === currentSessionIdRef.current && (event.phase === "action" || event.phase === "critique")) {
         setStreamingTurn((current) => ({
           phase: event.phase,
           text: (current?.phase === event.phase ? current.text : "") + event.text,
@@ -660,7 +813,9 @@ export function App() {
       }
     }));
     reg(api.onLlmStats((event) => {
-      setReasoning((current) => {
+      const sid = event.sessionId;
+      if (!sid) return;
+      updateReasoningForSession(sid, (current) => {
         const i = [...current].reverse().findIndex((r) => r.phase === event.phase && !r.tokens);
         if (i === -1) return current;
         const idx = current.length - 1 - i;
@@ -674,14 +829,34 @@ export function App() {
     return () => { cancelled = true; unlisteners.forEach((fn) => fn()); };
   }, []);
 
+  useEffect(() => {
+    if (!autoMixRunning || autoMixLastBeatAt == null) return;
+    const id = window.setInterval(() => {
+      if (Date.now() - autoMixLastBeatAt < 45_000) return;
+      const sid = currentSessionIdRef.current;
+      if (!sid) return;
+      setAutoMixStateForSession(sid, (state) => ({
+        ...state,
+        stages: state.stages.map((stage) =>
+          stage.status === "running"
+            ? { ...stage, status: "error", error: "Auto-mix stopped responding. The model/tool bridge was disconnected." }
+            : stage,
+        ),
+        running: false,
+        lastBeatAt: null,
+      }));
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, [autoMixLastBeatAt, autoMixRunning]);
+
   // Tick an elapsed-seconds counter while the agent is working, so the activity card
   // always shows visible progress even during the long cold-start prompt prefill.
   useEffect(() => {
-    if (!busy && !autoMixRunning) { setTurnElapsed(0); return; }
+    if (!visibleBusy && !autoMixRunning) { setTurnElapsed(0); return; }
     setTurnElapsed(0);
     const t = setInterval(() => setTurnElapsed((s) => s + 1), 1000);
     return () => clearInterval(t);
-  }, [busy, autoMixRunning]);
+  }, [visibleBusy, autoMixRunning]);
 
   // Live reasoning (the agent's "thinking") and the tool calls it has made this
   // turn — surfaced inline in the chat so long operations never look frozen.
@@ -907,11 +1082,12 @@ export function App() {
     }
     return () => {
       mediaDevices?.removeEventListener?.("devicechange", handleDeviceChange);
-      Object.values(videoRecordersRef.current).forEach((active) => {
-        active.stream.getTracks().forEach((track) => track.stop());
-        active.previewElement.remove();
-        if (active.recorder.state !== "inactive") active.recorder.stop();
-      });
+      // Kill any native captures left running if the window unmounts mid-take.
+      // (Discard never touches the store, so the session id is irrelevant.)
+      if (Object.keys(nativeCapturesRef.current).length > 0) {
+        void api.stopCameraCaptures("", [], true).catch(() => undefined);
+        nativeCapturesRef.current = {};
+      }
     };
   }, []);
 
@@ -923,17 +1099,8 @@ export function App() {
 
   useEffect(() => {
     if (!session) return;
-    void updateCameraPreviewWindow(buildCameraPreviewTracks());
+    void updateVideoMonitorWindow(buildCameraPreviewTracks());
   }, [session, selectedTrackIds.join("|"), JSON.stringify(trackCameraDevices), cameraDevices.length, armedVideoTrackIds.join("|"), videoRecordingTrackIds.join("|"), playing, Math.round(playhead * 5)]);
-
-  // Arming a video track (R) pops up the live camera preview so you see the take.
-  const prevArmedVideoCountRef = useRef(0);
-  useEffect(() => {
-    if (armedVideoTrackIds.length > 0 && prevArmedVideoCountRef.current === 0) {
-      void openCameraPreviewWindow(buildCameraPreviewTracks(), true);
-    }
-    prevArmedVideoCountRef.current = armedVideoTrackIds.length;
-  }, [armedVideoTrackIds]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -1027,7 +1194,7 @@ export function App() {
         // Region-bounded recording: stop the moment we hit the region's right edge.
         if (
           recordingPunchOutRef.current !== undefined
-          && (recording || videoRecordingTrackIds.length > 0 || Object.keys(videoRecordersRef.current).length > 0)
+          && (recording || videoRecordingTrackIds.length > 0 || Object.keys(nativeCapturesRef.current).length > 0)
           && elapsed >= recordingPunchOutRef.current
         ) {
           recordingPunchOutRef.current = undefined;
@@ -1172,7 +1339,7 @@ export function App() {
   async function flushChat() {
     if (!session) return;
     try {
-      await api.saveChatMessages(session.id, messages);
+      await api.saveChatMessages(session.id, messagesBySessionRef.current[session.id] ?? messages);
     } catch {}
   }
 
@@ -1540,13 +1707,26 @@ export function App() {
     }
   }
 
+  function cameraDeviceForVideoTrack(track: Track, videoIndex: number) {
+    const configured = trackCameraDevices[track.id] ?? track.cameraDeviceId ?? "";
+    if (configured) return configured;
+    return cameraDevices[videoIndex]?.deviceId ?? "";
+  }
+
   function buildCameraPreviewTracks() {
     if (!session) return [];
+    const videoTracks = session.tracks.filter((track) => track.kind === "video");
+    const selectedVideoIds = new Set(
+      videoTracks
+        .filter((track) => selectedTrackIds.includes(track.id))
+        .map((track) => track.id),
+    );
     const videoSourceById = new Map((session.videoSourceFiles ?? []).map((source) => [source.id, source]));
-    return session.tracks
-      .filter((track) => track.kind === "video" && selectedTrackIds.includes(track.id))
-      .map((track, trackIndex) => {
-        const deviceId = trackCameraDevices[track.id] ?? track.cameraDeviceId ?? "";
+    return videoTracks
+      .filter((track) => selectedVideoIds.size === 0 || selectedVideoIds.has(track.id))
+      .map((track, visibleIndex) => {
+        const videoIndex = videoTracks.findIndex((item) => item.id === track.id);
+        const deviceId = cameraDeviceForVideoTrack(track, videoIndex);
         const device = cameraDevices.find((item) => item.deviceId === deviceId);
         const clips = (track.videoClips ?? []).flatMap((clip) => {
           const source = videoSourceById.get(clip.videoSourceFileId);
@@ -1558,7 +1738,7 @@ export function App() {
             startSeconds: clip.startSample / session.sampleRate,
             endSeconds: clip.endSample / session.sampleRate,
             localTime: Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000 + playhead - (clip.startSample / session.sampleRate)),
-            layout: normalizeVideoLayout(clip.layout, trackIndex),
+            layout: normalizeVideoLayout(clip.layout, visibleIndex),
           }];
         });
         const activeClip = clips.find((clip) => playhead >= clip.startSeconds && playhead <= clip.endSeconds);
@@ -1572,54 +1752,30 @@ export function App() {
           recording: videoRecordingTrackIds.includes(track.id),
           transportPlaying: playing,
           activeClip,
-          defaultLayout: defaultVideoLayout(trackIndex),
+          defaultLayout: defaultVideoLayout(visibleIndex),
         };
       });
   }
 
-  async function openCameraPreviewWindow(tracks: CameraPreviewTrack[], force = true) {
-    try {
-      let preview = await WebviewWindow.getByLabel("camera-preview");
-      if (!preview) {
-        preview = new WebviewWindow("camera-preview", {
-          url: "/?cameraPreview=1",
-          title: "AutoMixer Camera Preview",
-          width: 980,
-          height: 640,
-          minWidth: 520,
-          minHeight: 360,
-          resizable: true,
-          center: false,
-        });
-        cameraPreviewWindowRef.current = preview;
-        preview.once("tauri://created", () => {
-          void updateCameraPreviewWindow(tracks);
-          window.setTimeout(() => void updateCameraPreviewWindow(tracks), 150);
-        });
-        preview.once("tauri://error", (event) => {
-          pushSystem(`Could not open camera preview window: ${String(event.payload)}`);
-        });
-      } else {
-        cameraPreviewWindowRef.current = preview;
-        await updateCameraPreviewWindow(tracks);
-      }
-      if (force) {
-        await preview.show().catch(() => undefined);
-        await preview.setFocus().catch(() => undefined);
-      }
-    } catch (error) {
-      pushSystem(error);
-    }
+  async function closeCameraPreviewWindow() {
+    const preview = await WebviewWindow.getByLabel("camera-preview").catch(() => null);
+    if (!preview) return;
+    await preview.close().catch(() => {
+      void preview.hide().catch(() => undefined);
+    });
   }
 
-  async function updateCameraPreviewWindow(tracks: CameraPreviewTrack[]) {
-    const preview = await WebviewWindow.getByLabel("camera-preview");
-    if (!preview) return;
-    cameraPreviewWindowRef.current = preview;
-    await preview.emit("camera-preview:update", {
+
+  async function updateVideoMonitorWindow(tracks: CameraPreviewTrack[]) {
+    if (!session) return;
+    const monitor = await WebviewWindow.getByLabel("video-monitor").catch(() => null);
+    if (!monitor) return;
+    videoMonitorRef.current = monitor;
+    await monitor.emit("video-monitor:update", {
+      sessionId: session.id,
       tracks,
-      canvas: normalizeVideoCanvas(session?.videoCanvas),
-    } satisfies CameraPreviewPayload).catch(() => undefined);
+      canvas: normalizeVideoCanvas(session.videoCanvas),
+    } satisfies VideoMonitorCameraPayload).catch(() => undefined);
   }
 
   function videoEditorPayload(): VideoEditorWindowPayload | undefined {
@@ -1731,11 +1887,19 @@ export function App() {
   async function toggleVideoMonitor(forceShow = false) {
     if (!session) return;
     try {
+      await closeCameraPreviewWindow();
+      const cameraTracks = buildCameraPreviewTracks();
       const query = new URLSearchParams({ videoMonitor: "1", sessionId: session.id });
       let monitor = await WebviewWindow.getByLabel("video-monitor");
-      if (monitor && videoMonitorOpen && !forceShow) {
-        await monitor.hide().catch(() => undefined);
+      // The window's actual existence is the truth — never trust the state flag
+      // alone (it desyncs when the window is closed by hand), or the toggle stops
+      // closing the window.
+      if (monitor && !forceShow) {
+        await monitor.close().catch(() => undefined);
+        videoMonitorRef.current = null;
         setVideoMonitorOpen(false);
+        // No windows are watching anymore — release the cameras (LEDs off).
+        void api.stopCameraPreviews([]).catch(() => undefined);
         return;
       }
       if (!monitor) {
@@ -1754,14 +1918,29 @@ export function App() {
         created.once("tauri://created", () => {
           void created.emit("video-monitor:session", { sessionId: session.id });
           void created.emit("video-monitor:selection", { trackIds: selectedTrackIds });
+          void created.emit("video-monitor:update", {
+            sessionId: session.id,
+            tracks: cameraTracks,
+            canvas: normalizeVideoCanvas(session.videoCanvas),
+          } satisfies VideoMonitorCameraPayload);
         });
-        created.once("tauri://destroyed", () => { if (videoMonitorRef.current === created) videoMonitorRef.current = null; setVideoMonitorOpen(false); });
+        created.once("tauri://destroyed", () => {
+          if (videoMonitorRef.current === created) videoMonitorRef.current = null;
+          setVideoMonitorOpen(false);
+          // Window gone (closed by hand) — free the cameras.
+          void api.stopCameraPreviews([]).catch(() => undefined);
+        });
         created.once("tauri://error", (event) => { setVideoMonitorOpen(false); pushSystem(`Could not open video monitor: ${String(event.payload)}`); });
       } else {
         videoMonitorRef.current = monitor;
         setVideoMonitorOpen(true);
         await monitor.emit("video-monitor:session", { sessionId: session.id }).catch(() => undefined);
         await monitor.emit("video-monitor:selection", { trackIds: selectedTrackIds }).catch(() => undefined);
+        await monitor.emit("video-monitor:update", {
+          sessionId: session.id,
+          tracks: cameraTracks,
+          canvas: normalizeVideoCanvas(session.videoCanvas),
+        } satisfies VideoMonitorCameraPayload).catch(() => undefined);
       }
       await monitor.show().catch(() => undefined);
       await monitor.setFocus().catch(() => undefined);
@@ -1770,106 +1949,109 @@ export function App() {
     }
   }
 
+  /// Resolve one camera per armed video track, up front and uniquely. Explicit
+  /// per-track choices win; unconfigured tracks claim the next unclaimed camera.
+  /// Fails fast with a human-readable message instead of letting two tracks fight
+  /// over one device mid-take.
+  function assignRecordingCameras(tracks: Track[]): Map<string, string> | undefined {
+    const assignments = new Map<string, string>();
+    const claimed = new Map<string, string>(); // deviceId -> track name
+    for (const track of tracks) {
+      let deviceId = trackCameraDevices[track.id] ?? track.cameraDeviceId ?? "";
+      if (!deviceId) {
+        deviceId = cameraDevices.find((d) => d.deviceId && !claimed.has(d.deviceId))?.deviceId ?? "";
+      }
+      if (!deviceId) {
+        pushSystem(`Not enough cameras for ${tracks.length} armed video track${tracks.length === 1 ? "" : "s"} (${cameraDevices.length} available). Set a camera on "${track.name}" in the inspector, or disarm it.`);
+        return undefined;
+      }
+      const other = claimed.get(deviceId);
+      if (other) {
+        pushSystem(`"${other}" and "${track.name}" are both set to the same camera. Give each armed video track its own camera in the inspector.`);
+        return undefined;
+      }
+      claimed.set(deviceId, track.name);
+      assignments.set(track.id, deviceId);
+    }
+    return assignments;
+  }
+
+  /// Native multicam capture: each camera records in its OWN ffmpeg process
+  /// (hardware H.264 straight to disk). The old in-webview MediaRecorder path
+  /// stalled after a few frames and crashed the webview with 2-3 cameras —
+  /// WebKit's media process can't sustain multiple simultaneous captures.
   async function startVideoRecordingsAt(startSeconds: number) {
     if (!session) return true;
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      pushSystem("Camera recording is not available in this webview.");
-      return false;
-    }
     const tracks = armedVideoTrackIds
       .map((trackId) => session.tracks.find((track) => track.id === trackId))
       .filter((track): track is Track => !!track && track.kind === "video");
     if (tracks.length === 0) return true;
+    const assignments = assignRecordingCameras(tracks);
+    if (!assignments) return false;
     const startSample = Math.round(Math.max(0, startSeconds) * session.sampleRate);
-    const startedIds: string[] = [];
+    setVideoRecordingStarting(true);
     try {
-      await updateCameraPreviewWindow([]);
-      for (const track of tracks) {
-        const deviceId = trackCameraDevices[track.id] ?? track.cameraDeviceId ?? "";
-        const includeAudio = !armedTrackId && (trackCameraAudio[track.id] ?? !!track.recordCameraAudio);
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: cameraVideoConstraints(deviceId),
-          audio: includeAudio,
-        });
-        const actualDevice = stream.getVideoTracks()[0]?.getSettings().deviceId ?? "";
-        if (deviceId && actualDevice && actualDevice !== deviceId) {
-          throw new Error(`Camera mismatch for ${track.name}. Selected ${deviceId}, got ${actualDevice}.`);
+      const specs = tracks.map((track) => {
+        const deviceId = assignments.get(track.id)!;
+        const label = cameraDevices.find((d) => d.deviceId === deviceId)?.label ?? "";
+        if (!label) {
+          throw new Error(`No camera name available for "${track.name}" — open the inspector and pick its camera explicitly.`);
         }
-        const previewElement = await prepareVideoRecordingStream(stream);
-        const mimeType = pickVideoMimeType();
-        const recorderOptions: MediaRecorderOptions = {
-          videoBitsPerSecond: 8_000_000,
-          audioBitsPerSecond: 192_000,
-        };
-        const recorder = mimeType
-          ? new MediaRecorder(stream, { ...recorderOptions, mimeType })
-          : new MediaRecorder(stream, recorderOptions);
-        const chunks: Blob[] = [];
-        recorder.ondataavailable = (event) => {
-          if (event.data.size > 0) chunks.push(event.data);
-        };
-        videoRecordersRef.current[track.id] = {
-          recorder,
-          stream,
-          previewElement,
-          chunks,
-          startSample,
-          startedAt: performance.now(),
-          mimeType: recorder.mimeType || mimeType || "video/webm",
-          createAudioTrack: includeAudio,
-          transportOffsetMs: 0,
-        };
-        recorder.start(250);
-        startedIds.push(track.id);
-      }
-      setVideoRecordingTrackIds(startedIds);
+        const includeAudio = !armedTrackId && (trackCameraAudio[track.id] ?? !!track.recordCameraAudio);
+        return { trackId: track.id, deviceLabel: label, includeAudio };
+      });
+      // Rust owns previews AND recorders: it stops these devices' previews itself,
+      // spawns all recorder processes in parallel, and returns once every camera
+      // reports frames flowing (or errors naming the dead camera).
+      await api.startCameraCaptures(specs);
+      nativeCapturesRef.current = Object.fromEntries(specs.map((spec) => [spec.trackId, {
+        startSample,
+        createAudioTrack: spec.includeAudio,
+        deviceId: assignments.get(spec.trackId)!,
+      }]));
+      setVideoRecordingTrackIds(specs.map((spec) => spec.trackId));
       setVideoRecordingStartSeconds(Math.max(0, startSeconds));
       return true;
     } catch (error) {
-      await stopVideoRecordings();
+      await api.stopCameraCaptures(session.id, [], true).catch(() => undefined);
       pushSystem(error);
       return false;
+    } finally {
+      setVideoRecordingStarting(false);
     }
   }
 
-  async function stopVideoRecordings() {
+  async function stopVideoRecordings(options?: { discard?: boolean }) {
     if (!session) return;
-    const entries = Object.entries(videoRecordersRef.current);
+    const entries = Object.entries(nativeCapturesRef.current);
+    nativeCapturesRef.current = {};
     if (entries.length === 0) {
       setVideoRecordingTrackIds([]);
       setVideoRecordingStartSeconds(undefined);
       return;
     }
-    videoRecordersRef.current = {};
-    for (const [trackId, active] of entries) {
-      const blob = await stopMediaRecorder(active.recorder, active.stream, active.chunks, active.mimeType);
-      active.previewElement.remove();
-      if (blob.size === 0) continue;
-      const dataBase64 = await blobToDataUrl(blob);
-      const durationMs = Math.max(1, Math.round(performance.now() - active.startedAt));
-      const extension = active.mimeType.includes("mp4") ? "mp4" : "webm";
-      const updated = await api.saveVideoRecording(
-        session.id,
+    try {
+      const specs = entries.map(([trackId, info]) => ({
         trackId,
-        `video-${Date.now()}.${extension}`,
-        active.mimeType,
-        active.startSample,
-        durationMs,
-        dataBase64,
-        active.createAudioTrack,
-        active.transportOffsetMs
-      );
-      setProject(updated);
+        startSample: info.startSample,
+        createAudioTrack: info.createAudioTrack,
+      }));
+      const updated = await api.stopCameraCaptures(session.id, specs, options?.discard ?? false);
+      if (updated) setProject(updated);
+    } finally {
+      setVideoRecordingTrackIds([]);
+      setVideoRecordingStartSeconds(undefined);
+      // Previews resume lazily: the monitor tiles' <img> retry loop reconnects
+      // as soon as the recorder releases the devices.
     }
-    setVideoRecordingTrackIds([]);
-    setVideoRecordingStartSeconds(undefined);
   }
 
   function markVideoTransportStart() {
-    const now = performance.now();
-    Object.values(videoRecordersRef.current).forEach((active) => {
-      active.transportOffsetMs = Math.max(0, Math.round(now - active.startedAt));
-    });
+    // Native captures snapshot their media clock in Rust — that instant becomes
+    // each take's head-trim so it aligns exactly with the timeline start.
+    if (Object.keys(nativeCapturesRef.current).length > 0) {
+      void api.markCameraTransportStart().catch(() => undefined);
+    }
   }
 
   // Persist a track's input-latency offset (ms). Direct JSON patch — there's no mix
@@ -2411,19 +2593,23 @@ export function App() {
     if (!session) return;
     const userText = (overrideText ?? chatText).trim();
     if (!userText) return;
+    const launchSession = session;
+    const launchSessionId = launchSession.id;
     if (overrideText === undefined) setChatText("");
-    setMessages((items) => [...items, { role: "user", text: userText }]);
+    const withUser = updateMessagesForSession(launchSessionId, (items) => [...items, { role: "user", text: userText }]);
+    void api.saveChatMessages(launchSessionId, withUser).catch(() => undefined);
+    setBusySessionId(launchSessionId);
     setBusy(true);
     try {
-      const recentCritique = findLatestCritique(messages);
+      const recentCritique = findLatestCritique(messagesBySessionRef.current[launchSessionId] ?? messages);
       const selectedTimeRange = scopedSection
         ? {
-            startSample: Math.round(scopedSection.start * session.sampleRate),
-            endSample: Math.round(scopedSection.end * session.sampleRate)
+            startSample: Math.round(scopedSection.start * launchSession.sampleRate),
+            endSample: Math.round(scopedSection.end * launchSession.sampleRate)
           }
         : undefined;
       const response = await api.assistant({
-        sessionId: session.id,
+        sessionId: launchSessionId,
         userText: scopedSection ? `[scope: ${scopedSection.label} ${formatTime(scopedSection.start)}–${formatTime(scopedSection.end)}] ${userText}` : userText,
         selectedTrackIds,
         selectedRegionIds,
@@ -2432,22 +2618,25 @@ export function App() {
         ollamaModel,
         recentCritique
       });
-      handleAssistantResponse(response);
+      handleAssistantResponse(launchSessionId, response, reasoningBySessionRef.current[launchSessionId] ?? reasoningRef.current);
     } catch (error) {
-      pushSystem(error);
+      const text = error instanceof Error ? error.message : String(error);
+      const next = updateMessagesForSession(launchSessionId, (items) => [...items, { role: "system", text }]);
+      void api.saveChatMessages(launchSessionId, next).catch(() => undefined);
     } finally {
       setBusy(false);
+      setBusySessionId(null);
     }
   }
 
-  function handleAssistantResponse(response: AssistantResponse) {
+  function handleAssistantResponse(sessionId: string, response: AssistantResponse, turnSnapshot: ReasoningEntry[]) {
     if (response.status === "ok") {
-      setProject((current) => current ? { ...current, session: response.session, history: response.history } : current);
+      setProject((current) => current && current.session.id === sessionId ? { ...current, session: response.session, history: response.history } : current);
       const turnEntry = response.history[response.history.length - 1];
       // Snapshot this turn's full track — the agent's thinking and the tools it
       // called — so the activity feedback persists in the chat instead of
       // vanishing when the turn ends.
-      const snap = reasoningRef.current;
+      const snap = turnSnapshot;
       const turnReasoning = snap.filter((r) => r.phase === "think").map((r) => r.text).join("").trim();
       const turnTools = snap.filter((r) => r.phase === "tool").map((r) => r.text.trim()).filter(Boolean);
       const turnTokens = snap.reduce(
@@ -2458,36 +2647,40 @@ export function App() {
         }),
         { prompt: 0, response: 0, elapsedMs: 0 },
       );
-      setMessages((items) => [
-        ...items,
-        {
-          role: "assistant-turn",
-          explanation: response.explanation,
-          reasoning: turnReasoning,
-          tools: turnTools,
-          tokens: turnTokens,
-          skills: response.selectedSkills,
-          actions: response.actions,
-          warnings: response.warnings,
-          rationale: response.rationale,
-          perActionNotes: response.perActionNotes,
-          forwardPatch: turnEntry?.forwardPatch ?? [],
-          inversePatch: turnEntry?.inversePatch ?? [],
-          applied: true
-        }
-      ]);
+      const next = updateMessagesForSession(sessionId, (items) => [
+          ...items,
+          {
+            role: "assistant-turn",
+            explanation: response.explanation,
+            reasoning: turnReasoning,
+            tools: turnTools,
+            tokens: turnTokens,
+            skills: response.selectedSkills,
+            actions: response.actions,
+            warnings: response.warnings,
+            rationale: response.rationale,
+            perActionNotes: response.perActionNotes,
+            forwardPatch: turnEntry?.forwardPatch ?? [],
+            inversePatch: turnEntry?.inversePatch ?? [],
+            applied: true
+          }
+        ]);
+      void api.saveChatMessages(sessionId, next).catch(() => undefined);
     } else if (response.status === "clarification") {
-      setMessages((items) => [...items, { role: "assistant", text: response.question }]);
+      const next = updateMessagesForSession(sessionId, (items) => [...items, { role: "assistant", text: response.question }]);
+      void api.saveChatMessages(sessionId, next).catch(() => undefined);
     } else if (response.status === "critique") {
-      setMessages((items) => [
+      const next = updateMessagesForSession(sessionId, (items) => [
         ...items,
         { role: "critique", critique: response.critique, skills: response.selectedSkills }
       ]);
+      void api.saveChatMessages(sessionId, next).catch(() => undefined);
     } else {
       const text = response.rawModelOutput
         ? `${response.message}\n\nModel output:\n${response.rawModelOutput}`
         : response.message;
-      setMessages((items) => [...items, { role: "system", text }]);
+      const next = updateMessagesForSession(sessionId, (items) => [...items, { role: "system", text }]);
+      void api.saveChatMessages(sessionId, next).catch(() => undefined);
     }
   }
 
@@ -2508,15 +2701,24 @@ export function App() {
   // "cinema" look the user never asked for again).
   async function clearChat() {
     if (!session) return;
+    const sessionId = session.id;
     try {
-      await api.clearChat(session.id);
+      await api.clearChat(sessionId);
     } catch (error) {
       pushSystem(error);
     }
+    messagesBySessionRef.current[sessionId] = [];
+    autoMixBySessionRef.current[sessionId] = emptyAutoMixState();
     setMessages([]);
+    setAutoMixStages([]);
+    setAutoMixRunning(false);
+    setStageSeconds({});
+    setAutoMixLastBeatAt(null);
     setReasoning([]);
+    reasoningBySessionRef.current[sessionId] = [];
     setStreamingTurn(null);
     setAgentUsage(null);
+    void api.saveChatMessages(sessionId, []).catch(() => undefined);
     pushToast("info", "Chat cleared — the agent starts fresh.");
   }
 
@@ -2582,8 +2784,22 @@ export function App() {
 
   async function togglePlay() {
     if (!session) return;
-    if (playing || recording || Object.keys(videoRecordersRef.current).length > 0) {
-      if (recording || videoRecordingTrackIds.length > 0 || Object.keys(videoRecordersRef.current).length > 0) {
+    // SYNCHRONOUS re-entrancy guard (a ref, not state — state updates land too
+    // late to stop a Space key-repeat from running this twice concurrently).
+    if (togglePlayBusyRef.current) return;
+    togglePlayBusyRef.current = true;
+    try {
+      await togglePlayInner();
+    } finally {
+      togglePlayBusyRef.current = false;
+    }
+  }
+
+  async function togglePlayInner() {
+    if (!session) return;
+    if (videoRecordingStarting) return; // cameras are still opening — ignore double-taps
+    if (playing || recording || Object.keys(nativeCapturesRef.current).length > 0) {
+      if (recording || videoRecordingTrackIds.length > 0 || Object.keys(nativeCapturesRef.current).length > 0) {
         await stop();
         return;
       }
@@ -2601,6 +2817,9 @@ export function App() {
         ? regionLo!
         : (selectedPlaybackStartSeconds() ?? pausedAtRef.current);
       recordingPunchOutRef.current = useRegionForRecording ? regionHi! : undefined;
+      // After the take ends, land back on the punch-in point — not 0 — so the
+      // recording is immediately ready for review or a retake.
+      recordingReturnRef.current = armed ? start : undefined;
       pausedAtRef.current = Math.max(0, Math.min(duration, start));
       setPlayhead(pausedAtRef.current);
       await api.seek(Math.round(pausedAtRef.current * session.sampleRate)).catch(() => undefined);
@@ -2753,7 +2972,7 @@ export function App() {
   }
 
   async function stop() {
-    if (videoRecordingTrackIds.length > 0 || Object.keys(videoRecordersRef.current).length > 0) {
+    if (videoRecordingTrackIds.length > 0 || Object.keys(nativeCapturesRef.current).length > 0) {
       try {
         await stopVideoRecordings();
       } catch (error) {
@@ -2773,8 +2992,13 @@ export function App() {
     setRecordingStarting(false);
     setRecordingTrackId(undefined);
     setRecordingStartSeconds(undefined);
+    setVideoRecordingStarting(false); // escape hatch if a camera start wedged
     await api.stop();
-    const start = selectedPlaybackStartSeconds() ?? 0;
+    // A finished take parks the playhead back at its punch-in point; a plain
+    // stop keeps the old behavior (loop start, else 0).
+    const start = recordingReturnRef.current ?? selectedPlaybackStartSeconds() ?? 0;
+    recordingReturnRef.current = undefined;
+    recordingPunchOutRef.current = undefined;
     pausedAtRef.current = Math.max(0, Math.min(duration, start));
     setPlayhead(pausedAtRef.current);
     setPlaying(false);
@@ -3378,17 +3602,31 @@ export function App() {
     }
   }
 
-  function pushSystem(error: unknown) {
+  function systemText(error: unknown) {
     let text: string;
     if (error instanceof Error) text = error.message;
     else if (typeof error === "string") text = error;
     else if (error && typeof error === "object") {
       try { text = JSON.stringify(error); } catch { text = String(error); }
     } else text = String(error ?? "Unexpected error");
-    setMessages((items) => [...items, { role: "system", text }]);
+    return text;
+  }
+
+  function pushSystemForSession(sessionId: string | undefined, error: unknown) {
+    const text = systemText(error);
+    if (sessionId) {
+      const next = updateMessagesForSession(sessionId, (items) => [...items, { role: "system", text }]);
+      void api.saveChatMessages(sessionId, next).catch(() => undefined);
+    } else {
+      setMessages((items) => [...items, { role: "system", text }]);
+    }
     // A user-initiated stop is expected, not an error.
     if (/stopped by user/i.test(text)) pushToast("info", "Agent run stopped.");
     else pushToast("error", text);
+  }
+
+  function pushSystem(error: unknown) {
+    pushSystemForSession(currentSessionIdRef.current, error);
   }
 
   function pushToast(kind: Toast["kind"], text: string) {
@@ -3524,6 +3762,17 @@ export function App() {
               >
                 <Repeat size={15} />
               </button>
+              <button
+                className={Math.round(session.tempoPercent ?? 100) !== 100 ? "active" : ""}
+                onClick={() => { setTempoPercent(Math.round(session.tempoPercent ?? 100)); setTempoOpen(true); }}
+                disabled={busy}
+                title={Math.round(session.tempoPercent ?? 100) !== 100
+                  ? `Tempo: song is at ${Math.round(session.tempoPercent ?? 100)}% speed (pitch preserved)`
+                  : "Change tempo (speed) without changing pitch — e.g. slow the song down to practice"}
+                aria-haspopup="dialog"
+              >
+                <Gauge size={15} />
+              </button>
             </div>
             <span className="topbar-sep" aria-hidden="true" />
             <div className="topbar-group" role="group" aria-label="Monitoring">
@@ -3601,8 +3850,8 @@ export function App() {
                 </span>
               </div>
               <div className="video-editor-actions">
-                <button type="button" onClick={() => void openCameraPreviewWindow(buildCameraPreviewTracks(), true)} disabled={selectedVideoTracksForEditor.length === 0}>
-                  Show Canvas Preview
+                <button type="button" onClick={() => void toggleVideoMonitor(true)} disabled={selectedVideoTracksForEditor.length === 0}>
+                  Show Video Monitor
                 </button>
                 <select
                   className="aspect-select"
@@ -3871,6 +4120,40 @@ export function App() {
           </div>
         ) : null}
 
+        {(() => {
+          // Record status strip — a pro-desk style readout of the arm/record state.
+          const isRecordingNow = recording || videoRecordingTrackIds.length > 0;
+          const isArmed = armedVideoTrackIds.length > 0 || !!armedTrackId;
+          if (!isRecordingNow && !isArmed && !videoRecordingStarting) return null;
+          const camCount = isRecordingNow ? videoRecordingTrackIds.length : armedVideoTrackIds.length;
+          const audioName = armedTrackId ? session.tracks.find((t) => t.id === armedTrackId)?.name : undefined;
+          const parts: string[] = [];
+          if (camCount > 0) parts.push(`${camCount} cam${camCount === 1 ? "" : "s"}`);
+          if (audioName) parts.push(audioName);
+          const lo = selectedRange ? Math.min(selectedRange.start, selectedRange.end) : undefined;
+          const hi = selectedRange ? Math.max(selectedRange.start, selectedRange.end) : undefined;
+          const hasRegion = lo !== undefined && hi !== undefined && hi - lo > 0.02;
+          return (
+            <div className={`record-strip ${isRecordingNow ? "rec" : videoRecordingStarting ? "starting" : "armed"}`} role="status">
+              <span className="record-strip-dot" aria-hidden="true" />
+              {videoRecordingStarting ? (
+                <span className="record-strip-text">Starting {camCount} camera{camCount === 1 ? "" : "s"}…</span>
+              ) : isRecordingNow ? (
+                <span className="record-strip-text">
+                  REC {formatTime(playhead)}
+                  {recordingPunchOutRef.current !== undefined ? ` · auto-stop at ${formatTime(recordingPunchOutRef.current)}` : ""}
+                  {parts.length > 0 ? ` · ${parts.join(" + ")}` : ""}
+                </span>
+              ) : (
+                <span className="record-strip-text">
+                  ARMED · {parts.join(" + ") || "—"}
+                  {hasRegion ? ` · region ${formatTime(lo!)}–${formatTime(hi!)} (punch in/out)` : ""}
+                </span>
+              )}
+              <span className="record-strip-hint">{isRecordingNow ? "Space to stop" : "Space to record"}</span>
+            </div>
+          );
+        })()}
         <div className="timeline">
           <div className="daw-workspace">
             <TrackInspector
@@ -4229,7 +4512,7 @@ export function App() {
                 {agentUsage.turns}/{agentUsage.compactAfter} ctx · {(agentUsage.output + agentUsage.thought).toLocaleString()} tok
               </span>
             ) : null}
-            {busy || autoMixRunning ? (
+            {visibleBusy || autoMixRunning ? (
               <button
                 className="chat-stop"
                 onClick={() => void stopAgentRun()}
@@ -4259,7 +4542,12 @@ export function App() {
             running={autoMixRunning}
             disabled={busy || !session.tracks.length}
             onStart={(stageIds) => {
-              setAutoMixStages([]);
+              setAutoMixStateForSession(session.id, () => ({
+                stages: [],
+                running: true,
+                secondsByPhase: {},
+                lastBeatAt: Date.now(),
+              }));
               void api.startAutoMix(session.id, stageIds, ollamaUrl, ollamaModel);
             }}
             onStop={() => void stopAgentRun()}
@@ -4361,10 +4649,10 @@ export function App() {
                 <button
                   type="button"
                   className="icon-only"
-                  onClick={() => void openCameraPreviewWindow(buildCameraPreviewTracks(), true)}
+                  onClick={() => void toggleVideoMonitor(true)}
                   disabled={selectedVideoTracksForEditor.length === 0}
-                  title={selectedVideoTracksForEditor.length === 0 ? "Select video tracks first" : "Open the live multi-camera view"}
-                  aria-label="Open camera view"
+                  title={selectedVideoTracksForEditor.length === 0 ? "Select video tracks first" : "Open the video monitor"}
+                  aria-label="Open video monitor"
                 >
                   <Camera size={16} />
                 </button>
@@ -4531,7 +4819,7 @@ export function App() {
                   return <div key={index} className={`message ${message.role}`}>{message.text}</div>;
                 })
               )}
-              {busy ? (
+              {visibleBusy || autoMixRunning ? (
                 <div className="message activity">
                   <div className="activity-head">
                     <span className="activity-dot" />
@@ -4577,13 +4865,13 @@ export function App() {
                     </div>
                   ) : null}
 
-                  {autoMixStages.length > 0 ? <AutoMixStagesPanel stages={autoMixStages} /> : null}
+                  {autoMixStages.length > 0 ? <AutoMixStagesPanel stages={autoMixStages} secondsByPhase={stageSeconds} /> : null}
 
                 </div>
               ) : null}
               {/* Persist the auto-mix stage report after the run ends so the feedback
                   stays readable (the live activity panel above disappears when idle). */}
-              {!busy && autoMixStages.length > 0 ? (
+              {!visibleBusy && !autoMixRunning && autoMixStages.length > 0 ? (
                 <div className="message activity automix-report">
                   <AutoMixStagesPanel stages={autoMixStages} done />
                 </div>
@@ -4662,7 +4950,7 @@ export function App() {
                     if (!busy && chatText.trim()) void sendChat();
                   }
                 }}
-                placeholder={busy ? "Working…" : "Make a change or ask anything…"}
+                placeholder={busy ? (visibleBusy ? "Working…" : "Agent is running in another session…") : "Make a change or ask anything…"}
                 disabled={busy}
                 rows={1}
               />
@@ -4738,6 +5026,94 @@ export function App() {
           </div>
         </div>
       ) : null}
+      {tempoOpen && session ? (
+        <div className="settings-backdrop" onPointerDown={() => setTempoOpen(false)}>
+          <div className="settings-modal tempo-modal" role="dialog" aria-modal="true" aria-label="Change tempo" onPointerDown={(e) => e.stopPropagation()}>
+            <header className="settings-modal-head">
+              <h2>Tempo{Math.round(session.tempoPercent ?? 100) !== 100 ? <span className="tempo-current-badge">song at {Math.round(session.tempoPercent ?? 100)}%</span> : null}</h2>
+              <button className="icon-btn" onClick={() => setTempoOpen(false)} aria-label="Close"><X size={18} /></button>
+            </header>
+            <div className="settings-modal-body">
+              <section className="settings-group">
+                <p className="settings-group-desc">
+                  Change the song's speed <strong>without changing its pitch</strong> — slow it down to practice, keep the same key.
+                </p>
+                <div className="tempo-readout">
+                  <span className="tempo-value">{tempoPercent}%</span>
+                  {session.bpm ? (
+                    <span className="tempo-bpm">{Math.round(session.bpm)} → <strong>{Math.round(session.bpm * tempoPercent / Math.round(session.tempoPercent ?? 100))}</strong> BPM</span>
+                  ) : null}
+                </div>
+                <input
+                  type="range"
+                  className="tempo-slider"
+                  min={50}
+                  max={150}
+                  step={1}
+                  value={tempoPercent}
+                  onChange={(e) => setTempoPercent(Number(e.target.value))}
+                />
+                <div className="tempo-scale" aria-hidden="true">
+                  <span>50%</span><span>75%</span><span>100%</span><span>125%</span><span>150%</span>
+                </div>
+                <div className="tempo-presets">
+                  {[50, 65, 75, 85, 100].map((p) => (
+                    <button key={p} type="button" className={tempoPercent === p ? "active" : ""} onClick={() => setTempoPercent(p)}>{p}%</button>
+                  ))}
+                </div>
+                <p className="settings-group-desc tempo-note">
+                  Always re-rendered from the untouched originals — no quality loss when changing again. Video tracks are not stretched.
+                </p>
+              </section>
+              <div className="download-actions">
+                <button type="button" className="download-cancel" onClick={() => setTempoOpen(false)}>Cancel</button>
+                <button
+                  type="button"
+                  className="download-cancel tempo-revert"
+                  disabled={busy || Math.round(session.tempoPercent ?? 100) === 100}
+                  title="Restore the song to its original speed (exact — reuses the untouched original audio)"
+                  onClick={async () => {
+                    setBusy(true);
+                    try {
+                      const updated = await api.stretchTempo(session.id, 100);
+                      setProject(updated);
+                      setTempoOpen(false);
+                      pushSystem("Tempo restored to the original (100%).");
+                    } catch (error) {
+                      pushSystem(error);
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                >
+                  Revert to original
+                </button>
+                <button
+                  type="button"
+                  className="download-export"
+                  disabled={busy || tempoPercent === Math.round(session.tempoPercent ?? 100)}
+                  onClick={async () => {
+                    setBusy(true);
+                    try {
+                      const updated = await api.stretchTempo(session.id, tempoPercent);
+                      setProject(updated);
+                      setTempoOpen(false);
+                      pushSystem(`Tempo set to ${tempoPercent}% of the original — pitch preserved.`);
+                    } catch (error) {
+                      pushSystem(error);
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                >
+                  <Gauge size={15} />
+                  <span>{busy ? "Stretching…" : `Apply ${tempoPercent}%`}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {settingsOpen ? (
         <div className="settings-backdrop" onPointerDown={() => setSettingsOpen(false)}>
           <div className="settings-modal" role="dialog" aria-modal="true" aria-label="Settings" onPointerDown={(e) => e.stopPropagation()}>
@@ -4748,7 +5124,7 @@ export function App() {
             <div className="settings-modal-body">
               <section className="settings-group">
                 <div className="settings-group-title">Model</div>
-                <p className="settings-group-desc">One OpenAI-compatible endpoint (vLLM / llama.cpp / Ollama). This is the single source — Apply sets the model for <strong>chat, auto-mix, and vision</strong> all at once.</p>
+                <p className="settings-group-desc">One OpenAI-compatible endpoint (llama.cpp / vLLM / LM Studio). This is the single source — Apply sets the model for <strong>chat, auto-mix, and vision</strong> all at once.</p>
                 <label className="settings-field"><span>Endpoint URL</span>
                   <input value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://127.0.0.1:2260" />
                 </label>
@@ -4762,7 +5138,7 @@ export function App() {
                     setAgentStatus("Applying to all configs…");
                     try {
                       await api.setHermesModel(url, model);  // chat agent + auto-mix (read_hermes_model)
-                      await api.setConfig(url, model);        // settings.json ollama (fallback / headless web)
+                      await api.setConfig(url, model);        // settings.json model server (fallback / headless web)
                       await api.setVideoModel(url, model);    // vision / video-edit (same multimodal model)
                       // Mirror into the other Settings fields so the UI stays consistent.
                       setVideoUrl(url); setVideoModelName(model); setOllamaUrl(url); setOllamaModel(model);
@@ -5504,6 +5880,7 @@ function useSpaceToggleTransport() {
       const target = event.target as HTMLElement | null;
       if (target?.closest('input, textarea, select, [contenteditable="true"], button, a, [role="menu"]')) return;
       event.preventDefault();
+      if (event.repeat) return; // key-repeat must not double-toggle the transport
       void emit("transport:toggle").catch(() => undefined);
     };
     window.addEventListener("keydown", onKey);
@@ -5706,6 +6083,26 @@ function MonitorTile({ clip, grade, selected, registerVideo, onClick }: {
   );
 }
 
+function MonitorLiveTile({ track, selected, onClick }: {
+  track: CameraPreviewTrack;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  const state = track.recording ? "REC" : track.armed ? "ARM" : "LIVE";
+  return (
+    <div
+      className={`monitor-tile live ${selected ? "selected" : ""}`}
+      onClick={onClick}
+      title={`Click to select ${track.name}`}
+    >
+      <CameraLiveFeed track={track} />
+      <span className="monitor-tile-label">{track.name}</span>
+      <span className={`monitor-tile-state ${track.recording ? "rec" : track.armed ? "arm" : "live"}`}>{state}</span>
+      {track.deviceLabel ? <span className="monitor-tile-device">{track.deviceLabel}</span> : null}
+    </div>
+  );
+}
+
 export function VideoMonitorApp() {
   useSpaceToggleTransport();
   const initialSid = new URLSearchParams(window.location.search).get("sessionId") ?? "";
@@ -5713,6 +6110,15 @@ export function VideoMonitorApp() {
   const [project, setProject] = useState<MixProject>();
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const playRef = useRef<{ sample: number; running: boolean }>({ sample: 0, running: false });
+  const sessionIdRef = useRef(initialSid);
+  const playheadUiRef = useRef(0);
+  const [playheadSample, setPlayheadSample] = useState(0);
+  const [cameraPayload, setCameraPayload] = useState<VideoMonitorCameraPayload | null>(null);
+  const knownVideoClipIdsRef = useRef<Set<string>>(new Set());
+  // Sorted "id|id|…" of the video tracks in the local project copy — compared to
+  // each payload so track add/delete in the main window triggers a re-fetch.
+  const knownVideoTrackIdsRef = useRef<string>("");
+  const lastMonitorSessionRefreshRef = useRef(0);
   const videoEls = useRef<Map<string, HTMLVideoElement>>(new Map());
   // Export controls (shape + resolution + fit/fill).
   const [exportAspect, setExportAspect] = useState("original");
@@ -5732,6 +6138,11 @@ export function VideoMonitorApp() {
   const persistTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
+    sessionIdRef.current = sessionId;
+    setCameraPayload((payload) => (payload?.sessionId === sessionId ? payload : null));
+  }, [sessionId]);
+
+  useEffect(() => {
     if (!sessionId) return;
     let cancelled = false;
     void api.getSession(sessionId).then((p) => { if (!cancelled) setProject(p); }).catch(() => undefined);
@@ -5741,10 +6152,35 @@ export function VideoMonitorApp() {
 
   useEffect(() => {
     const unsubs: (() => void)[] = [];
-    void listen<{ sessionId: string }>("video-monitor:session", (e) => setSessionId(e.payload.sessionId)).then((fn) => unsubs.push(fn));
+    void listen<{ sessionId: string }>("video-monitor:session", (e) => {
+      sessionIdRef.current = e.payload.sessionId;
+      setSessionId(e.payload.sessionId);
+    }).then((fn) => unsubs.push(fn));
     void listen<{ trackIds: string[] }>("video-monitor:selection", (e) => setSelectedIds(e.payload.trackIds ?? [])).then((fn) => unsubs.push(fn));
+    void listen<VideoMonitorCameraPayload>("video-monitor:update", (e) => {
+      if (e.payload.sessionId !== sessionIdRef.current) return;
+      setCameraPayload(e.payload);
+      const hasUnknownActiveClip = e.payload.tracks.some((track) => track.activeClip && !knownVideoClipIdsRef.current.has(track.activeClip.id));
+      // Track set changed (added/deleted video tracks in the main window) — the
+      // local project copy is stale and must be re-fetched, or clips/tiles from
+      // deleted tracks linger.
+      const payloadIds = e.payload.tracks.map((t) => t.id).sort().join("|");
+      const trackSetChanged = payloadIds !== knownVideoTrackIdsRef.current;
+      const now = performance.now();
+      if ((hasUnknownActiveClip || trackSetChanged) && now - lastMonitorSessionRefreshRef.current > 1000) {
+        lastMonitorSessionRefreshRef.current = now;
+        void api.getSession(e.payload.sessionId).then(setProject).catch(() => undefined);
+      }
+    }).then((fn) => unsubs.push(fn));
     void api.onSessionExternallyUpdated((e) => setProject((prev) => (prev && prev.session.id === e.sessionId ? e.project : prev))).then((fn) => unsubs.push(fn));
-    void api.onPlayhead((e) => { playRef.current = { sample: e.sample, running: e.running }; }).then((fn) => unsubs.push(fn));
+    void api.onPlayhead((e) => {
+      playRef.current = { sample: e.sample, running: e.running };
+      const now = performance.now();
+      if (!e.running || now - playheadUiRef.current > 180) {
+        playheadUiRef.current = now;
+        setPlayheadSample(e.sample);
+      }
+    }).then((fn) => unsubs.push(fn));
     void listen<{ percent: number; stage: string }>("video-export:progress", (e) => {
       setExportProgress(e.payload.percent);
       setExportStage(e.payload.stage);
@@ -5777,6 +6213,72 @@ export function VideoMonitorApp() {
     return out;
   }, [project, sr]);
 
+  useEffect(() => {
+    knownVideoClipIdsRef.current = new Set(allClips.map((clip) => clip.id));
+  }, [allClips]);
+
+  useEffect(() => {
+    knownVideoTrackIdsRef.current = (project?.session.tracks ?? [])
+      .filter((track) => track.kind === "video")
+      .map((track) => track.id)
+      .sort()
+      .join("|");
+  }, [project]);
+
+  const monitorCameraTracks = useMemo(() => {
+    // A payload matching this session is AUTHORITATIVE about which video tracks
+    // exist (the main window re-emits on every session change). Only fall back to
+    // the monitor's own project when no payload has arrived yet — otherwise
+    // deleted tracks resurrect from the stale local copy.
+    const payloadFresh = cameraPayload?.sessionId === sessionId;
+    const payloadTracks = payloadFresh ? cameraPayload!.tracks : [];
+    const s = project?.session;
+    if (!s) return payloadTracks;
+    const payloadTrackIds = new Set(payloadTracks.map((track) => track.id));
+    const payloadByTrackId = new Map(payloadTracks.map((track) => [track.id, track]));
+    const selectedVideoIds = new Set(
+      s.tracks
+        .filter((track) => track.kind === "video" && selectedIds.includes(track.id))
+        .map((track) => track.id),
+    );
+    const videoSourceById = new Map((s.videoSourceFiles ?? []).map((source) => [source.id, source]));
+    const pos = playheadSample / sr;
+    return s.tracks
+      .filter((track) => (
+        track.kind === "video"
+        && (payloadFresh ? payloadTrackIds.has(track.id) : selectedVideoIds.size === 0 || selectedVideoIds.has(track.id))
+      ))
+      .map((track, trackIndex) => {
+        const payloadTrack = payloadByTrackId.get(track.id);
+        const clips = (track.videoClips ?? []).flatMap((clip) => {
+          const source = videoSourceById.get(clip.videoSourceFileId);
+          if (!source) return [];
+          return [{
+            id: clip.id,
+            name: clip.name ?? source.originalName,
+            src: source.path,
+            startSeconds: clip.startSample / s.sampleRate,
+            endSeconds: clip.endSample / s.sampleRate,
+            localTime: Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000 + pos - (clip.startSample / s.sampleRate)),
+            layout: normalizeVideoLayout(clip.layout, trackIndex),
+          }];
+        });
+        const activeClip = clips.find((clip) => pos >= clip.startSeconds && pos <= clip.endSeconds) ?? payloadTrack?.activeClip;
+        return {
+          id: track.id,
+          name: track.name,
+          color: track.color,
+          deviceId: payloadTrack?.deviceId ?? track.cameraDeviceId ?? "",
+          deviceLabel: payloadTrack?.deviceLabel ?? "Default camera",
+          armed: payloadTrack?.armed ?? false,
+          recording: payloadTrack?.recording ?? false,
+          transportPlaying: playRef.current.running,
+          activeClip,
+          defaultLayout: defaultVideoLayout(trackIndex),
+        };
+      });
+  }, [cameraPayload, sessionId, project, selectedIds, playheadSample, sr]);
+
   // Follow the main window's track selection: aim the Adjust panel at the
   // selected track's clip so sliders target what the user picked there. Keep a
   // manual in-monitor focus if it already belongs to a selected track (so
@@ -5793,10 +6295,42 @@ export function VideoMonitorApp() {
     }
   }, [selectedIds, allClips, focusedClipId]);
 
-  // Show only the selected video tracks. If nothing is selected, show nothing.
-  const clips = useMemo(
+  // Recorded clips for the selected video tracks. If no video track is selected,
+  // use all recorded video clips so export/focus still has a sensible target.
+  const selectedRecordedClips = useMemo(
     () => allClips.filter((c) => selectedIds.includes(c.trackId)),
     [allClips, selectedIds],
+  );
+  const exportCandidateClips = selectedRecordedClips.length > 0 ? selectedRecordedClips : allClips;
+  const displayedRecordedClips = useMemo(
+    () => monitorCameraTracks.flatMap((track, trackIndex) => {
+      if (!track.activeClip) return [];
+      const clip = allClips.find((item) => item.id === track.activeClip?.id);
+      if (clip) return [clip];
+      const layout = normalizeVideoLayout(track.activeClip.layout, trackIndex);
+      const pos = playheadSample / sr;
+      const timelineLocal = Math.max(0, pos - track.activeClip.startSeconds);
+      const offset = Math.max(0, track.activeClip.localTime - timelineLocal);
+      return [{
+        id: track.activeClip.id,
+        trackId: track.id,
+        trackName: track.name,
+        path: track.activeClip.src,
+        start: track.activeClip.startSeconds,
+        end: track.activeClip.endSeconds,
+        offset,
+        cl: layout.cropLeft / 100,
+        cr: layout.cropRight / 100,
+        ct: layout.cropTop / 100,
+        cb: layout.cropBottom / 100,
+        rot: layout.rotation,
+        op: layout.opacity,
+        layout,
+        ti: -1,
+        ci: -1,
+      }];
+    }),
+    [monitorCameraTracks, allClips, playheadSample, sr],
   );
 
   // Keep every tile's playback locked to the engine playhead.
@@ -5805,34 +6339,43 @@ export function VideoMonitorApp() {
     const tick = () => {
       const { sample, running } = playRef.current;
       const pos = sample / sr;
-      for (const c of clips) {
+      for (const c of displayedRecordedClips) {
         const el = videoEls.current.get(c.id);
         if (!el) continue;
         const active = pos >= c.start && pos <= c.end;
         const target = Math.max(0, pos - c.start + c.offset);
+        const canSeek = el.readyState >= HTMLMediaElement.HAVE_METADATA;
+        const seek = (threshold: number) => {
+          if (!canSeek || !Number.isFinite(target)) return;
+          try {
+            if (Math.abs(el.currentTime - target) > threshold) el.currentTime = target;
+          } catch {
+            // Some WebViews reject currentTime before duration is known. Try again next frame.
+          }
+        };
         if (active && running) {
-          if (Math.abs(el.currentTime - target) > 0.3) el.currentTime = target;
+          seek(0.3);
           if (el.paused) void el.play().catch(() => undefined);
         } else {
           if (!el.paused) el.pause();
-          if (active && Math.abs(el.currentTime - target) > 0.05) el.currentTime = target;
+          if (active) seek(0.05);
         }
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [clips, sr]);
+  }, [displayedRecordedClips, sr]);
 
-  const cols = Math.max(1, Math.ceil(Math.sqrt(clips.length || 1)));
+  const cols = Math.max(1, Math.ceil(Math.sqrt(monitorCameraTracks.length || 1)));
 
   // The clip to export: prefer the agent's rendered output, else the focused/only clip.
   const exportClip = useMemo(() => {
     const agent = allClips.find((c) => c.trackName === "Agent video edit" || c.trackName.startsWith("Agent Edit"));
     if (agent) return agent;
-    if (clips.length === 1) return clips[0];
-    return allClips.find((c) => selectedIds.includes(c.trackId)) ?? null;
-  }, [allClips, clips, selectedIds]);
+    if (exportCandidateClips.length === 1) return exportCandidateClips[0];
+    return exportCandidateClips.find((c) => selectedIds.includes(c.trackId)) ?? exportCandidateClips[0] ?? null;
+  }, [allClips, exportCandidateClips, selectedIds]);
 
   const ASPECTS: { id: string; label: string }[] = [
     { id: "original", label: "Original" },
@@ -5908,6 +6451,13 @@ export function VideoMonitorApp() {
     void emit("video-monitor:select", { trackId: c.trackId }).catch(() => undefined);
   }
 
+  function focusLiveTrack(track: CameraPreviewTrack) {
+    setFocusedClipId(null);
+    setDraftLayout(null);
+    setSelectedFilter("original");
+    void emit("video-monitor:select", { trackId: track.id }).catch(() => undefined);
+  }
+
   // Update the focused clip's grade: instant local preview + debounced persist
   // (via applyPatch) so the change survives reloads and downstream renders use it.
   function adjust(patch: Partial<VideoLayout>) {
@@ -5934,19 +6484,32 @@ export function VideoMonitorApp() {
     <div className="video-monitor-root">
     <div className="video-monitor-body">
     <main className="video-monitor-grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
-      {clips.length === 0 ? (
-        <div className="video-monitor-empty">No video in this session yet — record or import video, or ask the assistant to edit a clip.</div>
+      {monitorCameraTracks.length === 0 ? (
+        <div className="video-monitor-empty">No video tracks in this session yet — add a video track or select camera tracks in AutoMixer.</div>
       ) : (
-        clips.map((c) => (
-          <MonitorTile
-            key={c.id}
-            clip={c}
-            grade={c.id === focusedClipId && draftLayout ? draftLayout : c.layout}
-            selected={c.id === focusedClipId || selectedIds.includes(c.trackId)}
-            registerVideo={(id, el) => { if (el) videoEls.current.set(id, el); else videoEls.current.delete(id); }}
-            onClick={() => focusClip(c)}
-          />
-        ))
+        monitorCameraTracks.map((track) => {
+          const activeClip = track.activeClip ? allClips.find((clip) => clip.id === track.activeClip?.id) : undefined;
+          if (activeClip) {
+            return (
+              <MonitorTile
+                key={activeClip.id}
+                clip={activeClip}
+                grade={activeClip.id === focusedClipId && draftLayout ? draftLayout : activeClip.layout}
+                selected={activeClip.id === focusedClipId || selectedIds.includes(activeClip.trackId)}
+                registerVideo={(id, el) => { if (el) videoEls.current.set(id, el); else videoEls.current.delete(id); }}
+                onClick={() => focusClip(activeClip)}
+              />
+            );
+          }
+          return (
+            <MonitorLiveTile
+              key={`live-${track.id}`}
+              track={track}
+              selected={selectedIds.includes(track.id)}
+              onClick={() => focusLiveTrack(track)}
+            />
+          );
+        })
       )}
     </main>
     {focusGrade && focusedClip ? (
@@ -6389,7 +6952,7 @@ export function VideoEditorWindowApp() {
     if (!session) return [];
     const videoSourceById = new Map((session.videoSourceFiles ?? []).map((source) => [source.id, source]));
     return selectedVideoTracks().map((track, trackIndex) => {
-      const deviceId = track.cameraDeviceId ?? "";
+      const deviceId = track.cameraDeviceId ?? cameraDevices[trackIndex]?.deviceId ?? "";
       const device = cameraDevices.find((item) => item.deviceId === deviceId);
       const clips = (track.videoClips ?? []).flatMap((clip) => {
         const source = videoSourceById.get(clip.videoSourceFileId);
@@ -6420,31 +6983,47 @@ export function VideoEditorWindowApp() {
     });
   }
 
-  async function openCameraPreview() {
+  async function openVideoMonitorFromEditor() {
     if (!session) return;
     const tracks = buildPreviewTracks();
     try {
-      let preview = await WebviewWindow.getByLabel("camera-preview");
-      if (!preview) {
-        preview = new WebviewWindow("camera-preview", {
-          url: "/?cameraPreview=1",
-          title: "AutoMixer Camera Preview",
-          width: 980,
-          height: 640,
-          minWidth: 520,
-          minHeight: 360,
+      const legacyPreview = await WebviewWindow.getByLabel("camera-preview").catch(() => null);
+      await legacyPreview?.close().catch(() => {
+        void legacyPreview.hide().catch(() => undefined);
+      });
+      const query = new URLSearchParams({ videoMonitor: "1", sessionId: session.id });
+      let monitor = await WebviewWindow.getByLabel("video-monitor");
+      if (!monitor) {
+        monitor = new WebviewWindow("video-monitor", {
+          url: `/?${query.toString()}`,
+          title: "Video Monitor",
+          width: 880,
+          height: 560,
+          minWidth: 360,
+          minHeight: 240,
           resizable: true,
-          center: false,
         });
-        const createdPreview = preview;
-        createdPreview.once("tauri://created", () => {
-          void createdPreview.emit("camera-preview:update", { tracks, canvas: normalizeVideoCanvas(session.videoCanvas) } satisfies CameraPreviewPayload);
+        const createdMonitor = monitor;
+        createdMonitor.once("tauri://created", () => {
+          void createdMonitor.emit("video-monitor:session", { sessionId: session.id });
+          void createdMonitor.emit("video-monitor:selection", { trackIds: selectedTrackIds });
+          void createdMonitor.emit("video-monitor:update", {
+            sessionId: session.id,
+            tracks,
+            canvas: normalizeVideoCanvas(session.videoCanvas),
+          } satisfies VideoMonitorCameraPayload);
         });
       } else {
-        await preview.emit("camera-preview:update", { tracks, canvas: normalizeVideoCanvas(session.videoCanvas) } satisfies CameraPreviewPayload).catch(() => undefined);
+        await monitor.emit("video-monitor:session", { sessionId: session.id }).catch(() => undefined);
+        await monitor.emit("video-monitor:selection", { trackIds: selectedTrackIds }).catch(() => undefined);
+        await monitor.emit("video-monitor:update", {
+          sessionId: session.id,
+          tracks,
+          canvas: normalizeVideoCanvas(session.videoCanvas),
+        } satisfies VideoMonitorCameraPayload).catch(() => undefined);
       }
-      await preview.show().catch(() => undefined);
-      await preview.setFocus().catch(() => undefined);
+      await monitor.show().catch(() => undefined);
+      await monitor.setFocus().catch(() => undefined);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
@@ -6705,8 +7284,8 @@ export function VideoEditorWindowApp() {
             <button type="button" onClick={() => void bootstrapVideoEditor({ sessionId: session.id, trackIds: selectedTrackIds, range: selectedRange, playhead })}>
               Refresh
             </button>
-            <button type="button" onClick={() => void openCameraPreview()} disabled={selectedTracks.length === 0}>
-              Show Canvas Preview
+            <button type="button" onClick={() => void openVideoMonitorFromEditor()} disabled={selectedTracks.length === 0}>
+              Show Video Monitor
             </button>
             <select
               className="aspect-select"
@@ -7072,12 +7651,50 @@ export function VideoEditorWindowApp() {
   );
 }
 
-function cameraVideoConstraints(deviceId?: string): MediaTrackConstraints {
+type CameraMediaTrackConstraints = MediaTrackConstraints & {
+  resizeMode?: { ideal: "none" | "crop-and-scale" };
+};
+
+function cameraRecordingVideoConstraints(deviceId?: string): MediaTrackConstraints {
+  const constraints: CameraMediaTrackConstraints = {
+    ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+    width: { ideal: 3840 },
+    height: { ideal: 2160 },
+    frameRate: { ideal: 60, max: 60 },
+    resizeMode: { ideal: "none" },
+  };
+  return constraints;
+}
+
+function cameraPreviewVideoConstraints(deviceId?: string): MediaTrackConstraints {
   return {
     ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-    width: { ideal: 1920 },
-    height: { ideal: 1080 },
-    frameRate: { ideal: 30, max: 60 },
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    frameRate: { ideal: 30, max: 30 },
+  };
+}
+
+function cameraBaseBitrate(pixels: number) {
+  if (pixels >= 3840 * 2160) return 45_000_000;
+  if (pixels >= 2560 * 1440) return 28_000_000;
+  if (pixels >= 1920 * 1080) return 16_000_000;
+  return 8_000_000;
+}
+
+function cameraRecorderOptions(stream: MediaStream): MediaRecorderOptions {
+  const settings = stream.getVideoTracks()[0]?.getSettings();
+  const width = settings?.width ?? 1920;
+  const height = settings?.height ?? 1080;
+  const pixels = width * height;
+  const fps = settings?.frameRate ?? 30;
+  // Scale bitrate from the stream the camera actually delivered. This keeps
+  // 4K iPhone/Continuity Camera captures from being compressed like 1080p.
+  const baseBitrate = cameraBaseBitrate(pixels);
+  const fpsScale = fps > 45 ? 1.35 : 1;
+  return {
+    videoBitsPerSecond: Math.round(baseBitrate * fpsScale),
+    audioBitsPerSecond: 256_000,
   };
 }
 
@@ -7594,44 +8211,46 @@ function RecordedVideoFeed({ clip, playing, grade }: { clip: CameraPreviewClip; 
   );
 }
 
-function CameraLiveFeed({ track }: { track: CameraPreviewTrack }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const [error, setError] = useState<string | undefined>();
+/// Live camera preview as an MJPEG stream from the Rust camera service. The
+/// webview NEVER opens cameras itself (no getUserMedia): Rust owns every device,
+/// so previews can't fight recordings, and any number of windows can watch the
+/// same camera at once.
+function CameraLiveFeed({ track }: { track: CameraPreviewTrack; busy?: boolean }) {
+  const [info, setInfo] = useState<{ port: number; token: string } | undefined>();
+  const [attempt, setAttempt] = useState(0);
+  const retryTimerRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
-    let stopped = false;
-    let stream: MediaStream | undefined;
-    setError(undefined);
-    const start = async () => {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: cameraVideoConstraints(track.deviceId),
-          audio: false,
-        });
-        if (stopped) {
-          stream.getTracks().forEach((item) => item.stop());
-          return;
-        }
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play().catch(() => undefined);
-        }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      }
-    };
-    void start();
+    void api.getCameraPreviewInfo().then(setInfo).catch(() => undefined);
     return () => {
-      stopped = true;
-      stream?.getTracks().forEach((item) => item.stop());
+      if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
     };
-  }, [track.id, track.deviceId]);
+  }, []);
 
+  // Reset the retry counter the moment the track points at a different camera,
+  // so the tile switches to the new device instantly.
+  useEffect(() => {
+    setAttempt(0);
+  }, [track.deviceLabel]);
+
+  if (!info || !track.deviceLabel || track.deviceLabel === "Default camera") {
+    return <div className="camera-preview-error">{info ? "Pick a camera for this track in the inspector." : "Connecting…"}</div>;
+  }
+  const src = `http://127.0.0.1:${info.port}/camera/preview/${encodeURIComponent(track.deviceLabel)}?token=${encodeURIComponent(info.token)}&a=${attempt}`;
   return (
-    <>
-      <video ref={videoRef} autoPlay muted playsInline />
-      {error ? <div className="camera-preview-error">{error}</div> : null}
-    </>
+    <img
+      // key forces a full remount per camera — multipart streams don't always
+      // switch cleanly on a bare src change.
+      key={track.deviceLabel}
+      className="camera-live-mjpeg"
+      src={src}
+      alt={track.name}
+      onError={() => {
+        // Stream not up yet (or the recorder is swapping processes) — retry.
+        if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = window.setTimeout(() => setAttempt((n) => n + 1), 1500);
+      }}
+    />
   );
 }
 
@@ -8796,7 +9415,7 @@ type AutoMixStageInfo = { stageId: string; displayName: string; status: string; 
 
 /// Live + post-run breakdown of the auto-mix pipeline: each stage with its status,
 /// number of changes, timing, and the model's per-stage rationale (the "feedback").
-function AutoMixStagesPanel({ stages, done }: { stages: AutoMixStageInfo[]; done?: boolean }) {
+function AutoMixStagesPanel({ stages, done, secondsByPhase }: { stages: AutoMixStageInfo[]; done?: boolean; secondsByPhase?: Record<string, number> }) {
   const finished = stages.filter((s) => s.status !== "running").length;
   const totalChanges = stages.reduce((sum, s) => sum + (s.actionCount || 0), 0);
   const icon = (status: string) =>
@@ -8810,19 +9429,25 @@ function AutoMixStagesPanel({ stages, done }: { stages: AutoMixStageInfo[]; done
         </span>
       </div>
       <div className="automix-panel-list">
-        {stages.map((s) => (
-          <div key={s.stageId} className={`automix-stage ${s.status}`}>
-            <div className="automix-stage-row">
-              <span className="stage-icon">{icon(s.status)}</span>
-              <span className="stage-name">{s.displayName}</span>
-              {s.actionCount ? <span className="stage-count">{s.actionCount} {s.actionCount === 1 ? "change" : "changes"}</span> : null}
-              {s.elapsedMs ? <span className="stage-meta">{(s.elapsedMs / 1000).toFixed(1)}s</span> : null}
+        {stages.map((s) => {
+          const secs = secondsByPhase?.[s.stageId] ?? 0;
+          return (
+            <div key={s.stageId} className={`automix-stage ${s.status}`}>
+              <div className="automix-stage-row">
+                <span className="stage-icon">{icon(s.status)}</span>
+                <span className="stage-name">{s.displayName}</span>
+                {s.actionCount ? <span className="stage-count">{s.actionCount} {s.actionCount === 1 ? "change" : "changes"}</span> : null}
+                {s.elapsedMs ? <span className="stage-meta">{(s.elapsedMs / 1000).toFixed(1)}s</span> : null}
+              </div>
+              {s.status === "running" ? (
+                <div className="automix-stage-gen"><span className="amx-spin">⟳</span> working… {secs}s</div>
+              ) : null}
+              {s.explanation ? <div className="automix-stage-note">{s.explanation}</div> : null}
+              {s.warnings && s.warnings.length > 0 ? <div className="automix-stage-warn">⚠ {s.warnings.join("; ")}</div> : null}
+              {s.error ? <div className="automix-stage-err">✗ {s.error}</div> : null}
             </div>
-            {s.explanation ? <div className="automix-stage-note">{s.explanation}</div> : null}
-            {s.warnings && s.warnings.length > 0 ? <div className="automix-stage-warn">⚠ {s.warnings.join("; ")}</div> : null}
-            {s.error ? <div className="automix-stage-err">✗ {s.error}</div> : null}
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -9522,7 +10147,14 @@ function camelToWords(input: string) {
 }
 
 function pickVideoMimeType() {
+  // Quality-ordered: HEVC (Apple hardware encoder) → H.264 High → Main → Baseline.
+  // The old list led with Baseline (avc1.42E01E), the lowest-quality H.264 profile —
+  // no CABAC/B-frames — which wasted the high bitrate we request.
   const options = [
+    "video/mp4;codecs=hvc1.1.6.L123.B0,mp4a.40.2",
+    "video/mp4;codecs=hvc1,mp4a.40.2",
+    "video/mp4;codecs=avc1.64002A,mp4a.40.2",
+    "video/mp4;codecs=avc1.4D402A,mp4a.40.2",
     "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
     "video/mp4;codecs=h264,aac",
     "video/mp4",
@@ -9573,16 +10205,18 @@ async function prepareVideoRecordingStream(stream: MediaStream) {
     }
     window.setTimeout(finish, 700);
   });
-  await waitForNonBlackFrame(video);
   return video;
 }
 
-async function waitForNonBlackFrame(video: HTMLVideoElement) {
+/// Probe the warming camera for a real (non-black) frame. Returns false instead of
+/// throwing — a slow-waking Continuity camera shouldn't kill a whole multicam take;
+/// the caller warns the user and records anyway.
+async function waitForNonBlackFrame(video: HTMLVideoElement): Promise<boolean> {
   const canvas = document.createElement("canvas");
   canvas.width = 64;
   canvas.height = 36;
   const context = canvas.getContext("2d", { willReadFrequently: true });
-  if (!context) return;
+  if (!context) return true;
   for (let attempt = 0; attempt < 24; attempt++) {
     await sleep(80);
     if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth === 0 || video.videoHeight === 0) {
@@ -9600,9 +10234,9 @@ async function waitForNonBlackFrame(video: HTMLVideoElement) {
     }
     const mean = lumaSum / pixels;
     const variance = lumaSqSum / pixels - mean * mean;
-    if (mean > 3 || variance > 2) return;
+    if (mean > 3 || variance > 2) return true;
   }
-  throw new Error("Camera is delivering black frames. Close other camera apps/windows or select a different camera, then record again.");
+  return false;
 }
 
 function stopMediaRecorder(recorder: MediaRecorder, stream: MediaStream, chunks: Blob[], fallbackMimeType: string) {

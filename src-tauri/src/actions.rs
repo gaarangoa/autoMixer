@@ -457,6 +457,7 @@ mod tests {
         let mut s = MixSession {
             id: "s".into(),
             name: "test".into(),
+            album_id: String::new(),
             sample_rate: 48_000,
             bpm: None,
             source_files: Vec::new(),

@@ -22,6 +22,11 @@ pub struct TrackAnalysis {
 pub struct SourceFile {
     pub id: Id,
     pub original_name: String,
+    /// For tempo-stretched copies: the id of the untouched original source. Lets
+    /// "revert to original" and re-stretching always work from pristine audio
+    /// (no generational quality loss).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pristine_source_id: Option<Id>,
     pub cache_path: String,
     pub peak_path: String,
     pub duration_samples: u64,
@@ -216,6 +221,10 @@ pub struct VideoLayout {
 
 fn default_gamma() -> f32 {
     1.0
+}
+
+fn default_tempo_percent() -> f32 {
+    100.0
 }
 
 impl Default for VideoLayout {
@@ -432,6 +441,9 @@ pub struct MixSession {
     #[serde(default)]
     pub album_id: Id,
     pub sample_rate: u32,
+    /// Current tempo as a percentage of the original speed (100 = untouched).
+    #[serde(default = "default_tempo_percent")]
+    pub tempo_percent: f32,
     pub bpm: Option<f32>,
     pub source_files: Vec<SourceFile>,
     #[serde(default)]

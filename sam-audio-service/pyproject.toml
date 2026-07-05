@@ -1,0 +1,38 @@
+[project]
+name = "sam-audio-service"
+version = "0.1.0"
+description = "AutoMixer SAM-Audio source-isolation sidecar (lazy-loaded, background jobs)."
+requires-python = ">=3.11"
+dependencies = [
+    "sam_audio",
+    "torch",
+    "torchaudio",
+    "xformers; sys_platform == 'linux'",
+    # cu130 torch wheel doesn't bundle cuDNN — add it explicitly on the Spark.
+    "nvidia-cudnn-cu13; sys_platform == 'linux'",
+    "fastapi",
+    "uvicorn",
+    "soundfile",
+    "python-multipart",
+    "numpy",
+]
+
+[tool.uv.sources]
+sam_audio = { git = "https://github.com/facebookresearch/sam-audio.git" }
+# On the Spark (aarch64 Linux) pull CUDA torch from PyTorch's index; macOS uses
+# the default PyPI (CPU/MPS) build.
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv]
+# decord is only for the (unused) visual-prompting path, has no aarch64 wheel, and
+# needs ffmpeg to build — drop it everywhere; text prompting doesn't import it.
+# xformers has no aarch64 wheel, so build from source on the Spark (nvcc present).
+# It needs torch at build time, hence no build isolation.
+override-dependencies = ["decord; sys_platform == 'cygwin'"]
+no-build-isolation-package = ["xformers"]

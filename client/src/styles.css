@@ -8257,6 +8257,36 @@ button.primary:hover { filter: brightness(1.09); }
   font-weight: 600;
   pointer-events: none;
 }
+.monitor-tile-state,
+.monitor-tile-device {
+  position: absolute;
+  right: 6px;
+  pointer-events: none;
+}
+.monitor-tile-state {
+  top: 6px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(10, 132, 255, 0.82);
+  color: #fff;
+  font-size: var(--text-xs, 10px);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.monitor-tile-state.rec { background: rgba(255, 69, 58, 0.9); }
+.monitor-tile-state.arm { background: rgba(255, 159, 10, 0.88); }
+.monitor-tile-device {
+  bottom: 6px;
+  max-width: calc(100% - 92px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.48);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: var(--text-xs, 10px);
+}
 .monitor-tile { cursor: pointer; }
 .monitor-tile.selected { outline: 2px solid var(--accent-strong, #4a9eff); outline-offset: -2px; }
 
@@ -8499,3 +8529,110 @@ button.primary:hover { filter: brightness(1.09); }
 .automix-stage-warn { color: #e8b53a; margin: 2px 0 0 18px; }
 .automix-stage-err { color: #ff7676; margin: 2px 0 0 18px; }
 @keyframes amx-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* Live per-stage generation counter in the auto-mix panel */
+.automix-stage-gen {
+  margin: 3px 0 0 18px;
+  font-size: 10px;
+  color: #4aa3ff;
+  font-variant-numeric: tabular-nums;
+}
+.automix-stage-gen .amx-spin { display: inline-block; animation: amx-rot 1s linear infinite; }
+@keyframes amx-rot { to { transform: rotate(360deg); } }
+
+/* ===== Record status strip (pro arm/record readout) ===== */
+.record-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid #000;
+}
+.record-strip.armed { background: rgba(232, 181, 58, 0.10); color: #e8b53a; }
+.record-strip.starting { background: rgba(232, 181, 58, 0.16); color: #e8b53a; }
+.record-strip.rec { background: rgba(255, 61, 61, 0.14); color: #ff5d5d; }
+.record-strip-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.record-strip.rec .record-strip-dot { animation: rec-pulse 1s ease-in-out infinite; }
+.record-strip.starting .record-strip-dot { animation: rec-pulse 0.5s ease-in-out infinite; }
+@keyframes rec-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+.record-strip-hint { margin-left: auto; opacity: 0.65; font-weight: 500; }
+
+/* Live tile placeholder while the recorder owns the camera */
+.camera-live-busy {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: #0a0c0d;
+  color: #ff5d5d;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.camera-live-busy-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: currentColor;
+  animation: rec-pulse 1s ease-in-out infinite;
+}
+
+/* MJPEG live preview (Rust camera service) — fill the tile like the old <video>. */
+.camera-live-mjpeg { width: 100%; height: 100%; object-fit: cover; display: block; background: #0a0c0d; }
+
+/* ===== Tempo (time-stretch) overlay ===== */
+.tempo-modal { max-width: 430px; }
+.tempo-readout {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 10px 0 6px;
+}
+.tempo-value {
+  font-size: 30px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.tempo-bpm { color: var(--text-dim, #8b96a2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.tempo-bpm strong { color: var(--text, #e6edf3); }
+.tempo-slider { width: 100%; margin: 4px 0 2px; accent-color: #6fb7d8; }
+.tempo-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: var(--text-dim, #8b96a2);
+  margin-bottom: 10px;
+}
+.tempo-presets { display: flex; gap: 6px; }
+.tempo-presets button {
+  flex: 1 1 0;
+  height: 26px;
+  min-width: 0;
+  padding: 0 6px;
+  font-size: 11px;
+  border-radius: 6px;
+}
+.tempo-presets button.active {
+  border-color: rgba(111, 183, 216, 0.55);
+  background: var(--accent-soft, rgba(125, 184, 255, 0.12));
+}
+.tempo-note { margin-top: 10px; opacity: 0.75; }
+
+/* Tempo: current-state badge + revert */
+.tempo-current-badge {
+  margin-left: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #6fb7d8;
+  background: rgba(111, 183, 216, 0.12);
+  border-radius: 999px;
+  padding: 2px 8px;
+  vertical-align: middle;
+}
+.tempo-revert { margin-right: auto; }
+.tempo-revert:not(:disabled) { color: #6fb7d8; border-color: rgba(111, 183, 216, 0.4); }

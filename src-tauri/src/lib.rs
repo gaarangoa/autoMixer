@@ -4,6 +4,7 @@ pub mod assistant;
 pub mod audio;
 pub mod audio_service;
 pub mod auto_mix;
+pub mod camera_capture;
 pub mod capabilities;
 pub mod commands;
 pub mod config;
@@ -169,6 +170,16 @@ pub fn run() {
                 let _ = app.emit(event_name, serde_json::json!({}));
             });
             engine::telemetry::spawn_telemetry(app.handle().clone(), shared.clone());
+            // Reap camera processes orphaned by a previous hard-killed instance, and
+            // compile the Swift capture helper in the background so the first
+            // preview/record doesn't pay the compile cost.
+            camera_capture::cleanup_orphans();
+            camera_capture::spawn_preview_gc();
+            std::thread::spawn(|| {
+                if let Err(error) = camera_capture::ensure_helper() {
+                    eprintln!("[camera] helper compile failed: {error}");
+                }
+            });
             // In-process HTTP control surface that the Hermes agent sidecar drives
             // (loopback, ephemeral port, per-launch bearer token). Failing to bind it
             // is non-fatal — the rest of the app still runs.
@@ -228,6 +239,7 @@ pub fn run() {
             commands::undo_mix_action,
             commands::redo_mix_action,
             commands::apply_recorded_patch,
+            commands::stretch_session_tempo,
             commands::reset_session,
             commands::assistant_request,
             commands::transport_play,
@@ -256,6 +268,11 @@ pub fn run() {
             commands::judge_mix_ab,
             commands::render_mix,
             commands::save_video_recording,
+            commands::start_camera_captures,
+            commands::mark_camera_transport_start,
+            commands::stop_camera_captures,
+            commands::get_camera_preview_info,
+            commands::stop_camera_previews,
             commands::render_video_mix,
             commands::export_rendered_video,
             commands::export_video,

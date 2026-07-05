@@ -89,6 +89,7 @@ impl SessionStore {
             name,
             album_id: album_id.to_string(),
             sample_rate: 48000,
+            tempo_percent: 100.0,
             bpm: None,
             source_files: Vec::new(),
             video_source_files: Vec::new(),
@@ -404,6 +405,14 @@ impl SessionStore {
 
     pub fn add_source_file(&self, session_id: &str, source_path: &Path) -> Result<MixProject, String> {
         self.add_source_file_at(session_id, source_path, 0)
+    }
+
+    /// Import a wav into the cache (analysis + peaks) and return the SourceFile
+    /// WITHOUT touching any session — used by transforms (e.g. tempo stretch) that
+    /// register the file themselves.
+    pub fn import_source_standalone(&self, source_path: &Path, session_rate: u32) -> Result<SourceFile, String> {
+        let (source, _imported) = self.import_source(source_path, session_rate)?;
+        Ok(source)
     }
 
     pub fn add_source_file_at(&self, session_id: &str, source_path: &Path, start_sample: u64) -> Result<MixProject, String> {
@@ -1067,6 +1076,7 @@ impl SessionStore {
         let source = SourceFile {
             id: source_id.clone(),
             original_name: original_name.clone(),
+            pristine_source_id: None,
             cache_path: cache_path.to_string_lossy().to_string(),
             peak_path: peak_path.to_string_lossy().to_string(),
             duration_samples: imported.frames,
@@ -1247,6 +1257,7 @@ impl SessionStore {
         Ok(SourceFile {
             id: source_id,
             original_name: original_name.into(),
+            pristine_source_id: None,
             cache_path: cache_path.to_string_lossy().to_string(),
             peak_path: peak_path.to_string_lossy().to_string(),
             duration_samples: frames,

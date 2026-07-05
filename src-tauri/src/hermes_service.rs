@@ -20,6 +20,7 @@ use std::{
 use serde::Deserialize;
 
 const DEFAULT_PORT: u16 = 7322;
+const AUTOMIXER_LONG_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 
 /// One Server-Sent event emitted by the sidecar during a chat turn.
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +136,7 @@ impl HermesService {
                 // (isolated config + no shared skills). The sidecar forwards this to
                 // the `hermes acp` process it spawns.
                 .env("HERMES_HOME", bootstrap_hermes_home())
+                .env("AUTOMIXER_HERMES_BIN", hermes_bin_path())
                 .stdout(stdout_target)
                 .stderr(stderr_target)
                 .spawn()
@@ -176,6 +178,29 @@ impl HermesService {
             .await
             .map_err(|e| format!("hermes-service unreachable at {}: {e}", self.base_url))?;
         Ok(())
+    }
+
+    /// Verify the sidecar can create an ACP session and run a tiny prompt with
+    /// the currently configured model. `/health` only proves the process is up;
+    /// a bad model/provider can still fail when Hermes creates the first session.
+    pub async fn probe(&self) -> Result<(), String> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/probe", self.base_url))
+            .timeout(Duration::from_secs(180))
+            .send()
+            .await
+            .map_err(|e| format!("hermes-service unreachable at {}: {e}", self.base_url))?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("detail").and_then(|detail| detail.as_str()).map(str::to_string))
+            .unwrap_or(body);
+        Err(format!("hermes-service model probe failed ({status}): {detail}"))
     }
 
     /// Forget the agent's conversation for a session (Clear chat). The next chat turn
@@ -234,8 +259,14 @@ impl HermesService {
     {
         use futures_util::StreamExt;
 
+        // No total timeout: a chat turn can legitimately run long when the agent
+        // calls a slow tool (e.g. auto_mix runs many LLM stages, streaming nothing
+        // on this SSE for minutes). A 600s total cap aborted those mid-run with
+        // "error decoding response body". Use a very generous per-read timeout so
+        // a full local llama.cpp auto-mix can exceed 30 minutes without the app
+        // dropping the Hermes stream first.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .read_timeout(Duration::from_secs(AUTOMIXER_LONG_TIMEOUT_SECS))
             .build()
             .map_err(|e| e.to_string())?;
         let resp = client
@@ -254,6 +285,7 @@ impl HermesService {
         // carrying one `data: {json}` line.
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
+        let mut stream_error: Option<String> = None;
         while let Some(chunk) = stream.next().await {
             if is_cancelled() {
                 // Drop the stream (and thus the HTTP connection) so the sidecar
@@ -267,12 +299,20 @@ impl HermesService {
                 for line in block.lines() {
                     if let Some(data) = line.strip_prefix("data: ") {
                         match serde_json::from_str::<ChatEvent>(data) {
-                            Ok(event) => on_event(event),
+                            Ok(event) => {
+                                if let ChatEvent::Error { message } = &event {
+                                    stream_error.get_or_insert_with(|| message.clone());
+                                }
+                                on_event(event);
+                            }
                             Err(error) => eprintln!("[hermes-service] bad event {data}: {error}"),
                         }
                     }
                 }
             }
+        }
+        if let Some(error) = stream_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -311,6 +351,30 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// Hermes executable used by AutoMixer's embedded ACP bridge. Prefer an
+/// AutoMixer-managed install when present; fall back to the user's global Hermes
+/// install so existing development machines keep working until the managed
+/// runtime has been bootstrapped.
+pub fn hermes_bin_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUTOMIXER_HERMES_BIN") {
+        return PathBuf::from(p);
+    }
+    for candidate in [
+        dirs_home().map(|h| h.join(".automixer/hermes-agent/venv/bin/hermes")),
+        dirs_home().map(|h| h.join(".automixer/hermes-agent/.venv/bin/hermes")),
+        dirs_home().map(|h| h.join(".hermes/hermes-agent/venv/bin/hermes")),
+        Some(PathBuf::from("hermes")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if candidate == PathBuf::from("hermes") || candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("hermes")
+}
+
 /// AutoMixer's DEDICATED Hermes home — its own config + memory + EMPTY skill dirs,
 /// kept under `~/.automixer/` so the agent (a) doesn't inherit the user's global
 /// `~/.hermes` skills catalog (which bloats the prompt and slows every turn) and
@@ -347,7 +411,89 @@ pub fn bootstrap_hermes_home() -> PathBuf {
             }
         }
     }
+    repair_hermes_config(&cfg);
     home
+}
+
+fn repair_hermes_config(cfg: &PathBuf) {
+    let Ok(text) = std::fs::read_to_string(cfg) else {
+        return;
+    };
+    let mut changed = false;
+    let mut in_agent = false;
+    let mut in_auxiliary = false;
+    let mut in_title_generation = false;
+    let mut title_generation_has_enabled = false;
+    let mut in_mcp_servers = false;
+    let mut in_automixer = false;
+    let mut out = Vec::with_capacity(text.lines().count());
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len().saturating_sub(trimmed.len());
+
+        if in_title_generation && indent <= 2 && !trimmed.is_empty() {
+            if !title_generation_has_enabled {
+                out.push("    enabled: false".to_string());
+                changed = true;
+            }
+            in_title_generation = false;
+            title_generation_has_enabled = false;
+        }
+
+        if indent == 0 {
+            in_agent = trimmed == "agent:";
+            in_auxiliary = trimmed == "auxiliary:";
+            in_mcp_servers = trimmed == "mcp_servers:";
+            in_title_generation = false;
+            in_automixer = false;
+        } else if in_auxiliary && indent == 2 && trimmed.ends_with(':') {
+            in_title_generation = trimmed == "title_generation:";
+            title_generation_has_enabled = false;
+        } else if in_mcp_servers && indent == 2 && trimmed.ends_with(':') {
+            in_automixer = trimmed == "automixer:";
+        }
+
+        let replacement = if in_agent && indent == 2 && trimmed.starts_with("gateway_timeout:") {
+            Some(format!("  gateway_timeout: {AUTOMIXER_LONG_TIMEOUT_SECS}"))
+        } else if in_agent && indent == 2 && trimmed.starts_with("gateway_timeout_warning:") {
+            Some(format!("  gateway_timeout_warning: {}", AUTOMIXER_LONG_TIMEOUT_SECS / 2))
+        } else if in_title_generation && indent == 4 && trimmed.starts_with("enabled:") {
+            title_generation_has_enabled = true;
+            Some("    enabled: false".to_string())
+        } else if in_title_generation && indent == 4 && trimmed.starts_with("provider:") {
+            Some("    provider: disabled".to_string())
+        } else if in_title_generation && indent == 4 && trimmed.starts_with("timeout:") {
+            Some("    timeout: 1".to_string())
+        } else if in_mcp_servers && in_automixer && indent == 4 && trimmed.starts_with("timeout:") {
+            Some(format!("    timeout: {AUTOMIXER_LONG_TIMEOUT_SECS}"))
+        } else {
+            None
+        };
+
+        if in_title_generation && indent == 4 && trimmed.starts_with("enabled:") {
+            title_generation_has_enabled = true;
+        }
+
+        if let Some(replacement) = replacement {
+            if replacement != line {
+                changed = true;
+            }
+            out.push(replacement);
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if in_title_generation && !title_generation_has_enabled {
+        out.push("    enabled: false".to_string());
+        changed = true;
+    }
+
+    if changed {
+        if let Err(error) = std::fs::write(cfg, format!("{}\n", out.join("\n"))) {
+            eprintln!("[hermes-service] could not update Hermes config: {error}");
+        }
+    }
 }
 
 fn log_path() -> Option<PathBuf> {

@@ -13,6 +13,16 @@ const SKILL_TIMEOUT_MS: u64 = 600_000;
 const ACTION_TIMEOUT_MS: u64 = 600_000;
 const REPAIR_TIMEOUT_MS: u64 = 600_000;
 
+#[cfg(test)]
+fn stream_idle_timeout() -> Duration {
+    Duration::from_millis(100)
+}
+
+#[cfg(not(test))]
+fn stream_idle_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
 /// Message returned by every agent path when the user cancels a run. The frontend
 /// matches on this text to show a neutral "stopped" notice instead of an error.
 pub const CANCELLED_MESSAGE: &str = "Stopped by user.";
@@ -34,9 +44,9 @@ pub fn agent_cancelled() -> bool {
     AGENT_CANCELLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Which protocol a model server speaks. Ollama exposes its native API
-/// (`/api/generate`, `/api/chat`, `/api/tags`); vLLM, llama.cpp (`llama-server`),
-/// LM Studio and friends expose the OpenAI-compatible API (`/v1/*`).
+/// Which protocol a model server speaks. llama.cpp (`llama-server`), vLLM,
+/// LM Studio and friends expose the OpenAI-compatible API (`/v1/*`); Ollama's
+/// native API is kept as a compatibility fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmProvider {
     Ollama,
@@ -62,9 +72,9 @@ fn provider_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Strin
     PROVIDER_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Detect the protocol of the server at `base_url`. Ollama is probed first via
-/// `/api/tags` (vLLM and llama.cpp do not serve it); anything that answers
-/// `/v1/models` is treated as OpenAI-compatible.
+/// Detect the protocol of the server at `base_url`. Prefer the
+/// OpenAI-compatible path used by llama.cpp and vLLM; fall back to Ollama's
+/// native API only for legacy configurations.
 pub async fn detect_provider(base_url: &str) -> Result<LlmProvider, String> {
     let key = base_url.trim().trim_end_matches('/').to_string();
     if key.is_empty() {
@@ -74,14 +84,6 @@ pub async fn detect_provider(base_url: &str) -> Result<LlmProvider, String> {
         return Ok(provider);
     }
     let client = reqwest::Client::new();
-    if let Ok(Ok(response)) = timeout(Duration::from_millis(2500), client.get(format!("{key}/api/tags")).send()).await {
-        if response.status().is_success() {
-            if let Ok(mut cache) = provider_cache().lock() {
-                cache.insert(key, LlmProvider::Ollama);
-            }
-            return Ok(LlmProvider::Ollama);
-        }
-    }
     if let Ok(Ok(response)) = timeout(Duration::from_millis(2500), client.get(format!("{key}/v1/models")).send()).await {
         if response.status().is_success() {
             if let Ok(mut cache) = provider_cache().lock() {
@@ -90,8 +92,16 @@ pub async fn detect_provider(base_url: &str) -> Result<LlmProvider, String> {
             return Ok(LlmProvider::OpenAiCompat);
         }
     }
+    if let Ok(Ok(response)) = timeout(Duration::from_millis(2500), client.get(format!("{key}/api/tags")).send()).await {
+        if response.status().is_success() {
+            if let Ok(mut cache) = provider_cache().lock() {
+                cache.insert(key, LlmProvider::Ollama);
+            }
+            return Ok(LlmProvider::Ollama);
+        }
+    }
     Err(format!(
-        "No model server found at {key} — tried Ollama (/api/tags) and OpenAI-compatible vLLM/llama.cpp (/v1/models)."
+        "No model server found at {key} — tried OpenAI-compatible llama.cpp/vLLM (/v1/models) and legacy Ollama (/api/tags)."
     ))
 }
 
@@ -110,7 +120,7 @@ pub async fn handle_assistant(
         return Ok((
             AssistantResponse::Err {
                 kind: "AgentNotReady".into(),
-                message: "Set a model server URL (Ollama, vLLM, or llama.cpp) and a model in Settings before chatting with the assistant.".into(),
+                message: "Set a model server URL (llama.cpp, vLLM, or LM Studio) and a model in Settings before chatting with the assistant.".into(),
                 raw_model_output: None,
             },
             project,
@@ -124,7 +134,7 @@ pub async fn handle_assistant(
                 AssistantResponse::Err {
                     kind: "AgentNotReady".into(),
                     message: format!(
-                        "Could not reach the model at {base_url} ({model}) to choose skills. Check that your model server (Ollama, vLLM, or llama.cpp) is running and the model name matches."
+                        "Could not reach the model at {base_url} ({model}) to choose skills. Check that your model server is running and the model name matches."
                     ),
                     raw_model_output: None,
                 },
@@ -321,6 +331,8 @@ struct GenerateRequest<'a> {
     model: &'a str,
     prompt: &'a str,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -340,6 +352,10 @@ pub struct LlmCall {
 pub trait LlmObserver: Send + Sync {
     fn chunk(&self, phase: &str, text: &str);
     fn stats(&self, phase: &str, stats: &LlmCallStats);
+    /// Reasoning ("thinking") tokens, which some models (e.g. Qwen on llama.cpp)
+    /// stream in a separate `reasoning_content` field. Default no-op; observers that
+    /// want to count or show thinking can override. NOT added to the parsed response.
+    fn reasoning(&self, _phase: &str, _text: &str) {}
 }
 
 pub struct NoopObserver;
@@ -367,6 +383,9 @@ impl AccumulatingObserver {
 impl LlmObserver for AccumulatingObserver {
     fn chunk(&self, phase: &str, text: &str) {
         self.inner.chunk(phase, text);
+    }
+    fn reasoning(&self, phase: &str, text: &str) {
+        self.inner.reasoning(phase, text);
     }
     fn stats(&self, phase: &str, stats: &LlmCallStats) {
         if let Ok(mut t) = self.totals.lock() {
@@ -434,10 +453,10 @@ pub fn extract_json_object(raw: &str) -> Option<String> {
     None
 }
 
-/// Stream one prompt through whichever model server lives at `base_url` —
-/// Ollama native or OpenAI-compatible (vLLM, llama.cpp) — and return the full
-/// response with token stats. Returns None on connection failure, non-success
-/// status, or user cancellation.
+/// Stream one prompt through whichever model server lives at `base_url` and
+/// return the full response with token stats. `timeout_ms` bounds the entire
+/// request/stream; provider-specific loops also have a short idle timeout so a
+/// server that finishes but never sends a terminal frame cannot park the future.
 pub async fn llm_generate(
     base_url: &str,
     model: &str,
@@ -445,15 +464,28 @@ pub async fn llm_generate(
     timeout_ms: u64,
     phase: &str,
     observer: &dyn LlmObserver,
+    max_tokens: Option<u32>,
 ) -> Option<LlmCall> {
     if base_url.is_empty() || model.is_empty() || agent_cancelled() {
         return None;
     }
-    match detect_provider(base_url).await {
-        Ok(LlmProvider::Ollama) => ollama_generate(base_url, model, prompt, timeout_ms, phase, observer).await,
-        Ok(LlmProvider::OpenAiCompat) => openai_generate(base_url, model, prompt, timeout_ms, phase, observer).await,
+    let provider = match detect_provider(base_url).await {
+        Ok(provider) => provider,
         Err(error) => {
             eprintln!("[llm] {error}");
+            return None;
+        }
+    };
+    let generated = async {
+        match provider {
+            LlmProvider::Ollama => ollama_generate(base_url, model, prompt, phase, observer, max_tokens).await,
+            LlmProvider::OpenAiCompat => openai_generate(base_url, model, prompt, phase, observer, max_tokens).await,
+        }
+    };
+    match timeout(Duration::from_millis(timeout_ms), generated).await {
+        Ok(call) => call,
+        Err(_) => {
+            eprintln!("[llm] phase '{phase}' timed out after {:.1}s", timeout_ms as f64 / 1000.0);
             None
         }
     }
@@ -463,22 +495,23 @@ async fn ollama_generate(
     base_url: &str,
     model: &str,
     prompt: &str,
-    timeout_ms: u64,
     phase: &str,
     observer: &dyn LlmObserver,
+    max_tokens: Option<u32>,
 ) -> Option<LlmCall> {
     use futures_util::StreamExt;
     let started = std::time::Instant::now();
     let client = reqwest::Client::new();
-    let resp = timeout(
-        Duration::from_millis(timeout_ms),
-        client
-            .post(format!("{base_url}/api/generate"))
-            .json(&GenerateRequest { model, prompt, stream: true })
-            .send(),
-    )
+    let resp = client
+        .post(format!("{base_url}/api/generate"))
+        .json(&GenerateRequest {
+            model,
+            prompt,
+            stream: true,
+            options: max_tokens.map(|n| json!({ "num_predict": n })),
+        })
+        .send()
     .await
-    .ok()?
     .ok()?;
     if !resp.status().is_success() {
         return None;
@@ -487,7 +520,15 @@ async fn ollama_generate(
     let mut buffer = String::new();
     let mut accumulated = String::new();
     let mut stats = LlmCallStats::default();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = match timeout(stream_idle_timeout(), stream.next()).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(_) => {
+                eprintln!("[llm] phase '{phase}' stream idle; treating response as complete");
+                break;
+            }
+        };
         // Dropping the stream aborts the HTTP request; Ollama stops generating.
         if agent_cancelled() {
             return None;
@@ -541,6 +582,8 @@ struct OpenAiStreamChoice {
 struct OpenAiDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -558,26 +601,28 @@ async fn openai_generate(
     base_url: &str,
     model: &str,
     prompt: &str,
-    timeout_ms: u64,
     phase: &str,
     observer: &dyn LlmObserver,
+    max_tokens: Option<u32>,
 ) -> Option<LlmCall> {
     use futures_util::StreamExt;
     let started = std::time::Instant::now();
     let client = reqwest::Client::new();
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": [{ "role": "user", "content": prompt }],
         "stream": true,
         // vLLM and llama.cpp report token usage on the final chunk with this set.
         "stream_options": { "include_usage": true },
     });
-    let resp = timeout(
-        Duration::from_millis(timeout_ms),
-        client.post(format!("{base_url}/v1/chat/completions")).json(&body).send(),
-    )
+    if let Some(n) = max_tokens {
+        body["max_tokens"] = json!(n);
+    }
+    let resp = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&body)
+        .send()
     .await
-    .ok()?
     .ok()?;
     if !resp.status().is_success() {
         eprintln!("[llm] OpenAI-compatible server returned {} for model {model}", resp.status());
@@ -587,7 +632,19 @@ async fn openai_generate(
     let mut buffer = String::new();
     let mut accumulated = String::new();
     let mut stats = LlmCallStats::default();
-    while let Some(chunk) = stream.next().await {
+    'stream: loop {
+        // If the server finishes generating but never sends [DONE] / closes the
+        // socket, `stream.next()` would otherwise park this future. A read-idle
+        // timeout treats the accumulated response as complete; the outer timeout
+        // still bounds a slow trickle or runaway stream.
+        let chunk = match timeout(stream_idle_timeout(), stream.next()).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break 'stream,
+            Err(_) => {
+                eprintln!("[llm] phase '{phase}' stream idle; treating response as complete");
+                break 'stream;
+            }
+        };
         // Dropping the stream aborts the HTTP request; the server stops generating.
         if agent_cancelled() {
             return None;
@@ -600,11 +657,26 @@ async fn openai_generate(
             buffer.drain(..=newline);
             let trimmed = line.trim();
             let Some(data) = trimmed.strip_prefix("data:").map(str::trim) else { continue };
-            if data.is_empty() || data == "[DONE]" {
+            // Stop as soon as the server signals completion. Previously this was
+            // `continue`, so if the server kept the socket open after `[DONE]` the loop
+            // awaited a chunk that never came and the whole stage wedged.
+            if data == "[DONE]" {
+                break 'stream;
+            }
+            if data.is_empty() {
                 continue;
             }
             if let Ok(part) = serde_json::from_str::<OpenAiStreamChunk>(data) {
-                if let Some(delta) = part.choices.first().and_then(|choice| choice.delta.content.as_deref()) {
+                let choice0 = part.choices.first();
+                // Reasoning tokens (separate field on thinking models) — surface to the
+                // observer (so progress counters tick) but DON'T add to the response we
+                // parse, so the extracted JSON stays clean.
+                if let Some(rc) = choice0.and_then(|c| c.delta.reasoning_content.as_deref()) {
+                    if !rc.is_empty() {
+                        observer.reasoning(phase, rc);
+                    }
+                }
+                if let Some(delta) = choice0.and_then(|choice| choice.delta.content.as_deref()) {
                     if !delta.is_empty() {
                         observer.chunk(phase, delta);
                         accumulated.push_str(delta);
@@ -654,7 +726,7 @@ async fn model_select_skills(
         request.selected_region_ids,
         request.user_text
     );
-    let call = llm_generate(base_url, model, &prompt, SKILL_TIMEOUT_MS, "skill", observer).await?;
+    let call = llm_generate(base_url, model, &prompt, SKILL_TIMEOUT_MS, "skill", observer, None).await?;
     eprintln!("[assistant] skill raw response:\n{}", call.response);
     let extracted = extract_json_object(&call.response)?;
     #[derive(Deserialize)]
@@ -854,8 +926,8 @@ async fn try_model_actions(
         sections_block(&session.sections, session.bpm)
     );
 
-    let Some(call) = llm_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS, "action", observer).await else {
-        return ModelAttempt { turn: None, raw: None, parse_error: Some("Ollama did not respond within the timeout.".into()) };
+    let Some(call) = llm_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS, "action", observer, None).await else {
+        return ModelAttempt { turn: None, raw: None, parse_error: Some("Model server did not respond within the timeout.".into()) };
     };
     let raw_aliased = call.response;
     eprintln!("[assistant] action raw response:\n{raw_aliased}");
@@ -894,7 +966,7 @@ async fn try_model_actions(
          Do not include any other text. Original output to repair:\n{}",
         raw_aliased
     );
-    let Some(repair_call) = llm_generate(base_url, model, &repair_prompt, REPAIR_TIMEOUT_MS, "repair", observer).await else {
+    let Some(repair_call) = llm_generate(base_url, model, &repair_prompt, REPAIR_TIMEOUT_MS, "repair", observer, None).await else {
         return ModelAttempt {
             turn: None,
             raw: Some(raw_real),
@@ -1044,9 +1116,9 @@ async fn try_model_critique(
 
     let prompt = substitute_quoted(&prompt, &track_aliases, true);
     let _ = selected_skills; // currently unused but kept for future skill-scoped critique
-    let crit_call = llm_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS, "critique", observer)
+    let crit_call = llm_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS, "critique", observer, None)
         .await
-        .ok_or_else(|| CritiqueError { message: "Ollama did not respond within the timeout.".into(), raw: None })?;
+        .ok_or_else(|| CritiqueError { message: "Model server did not respond within the timeout.".into(), raw: None })?;
     let raw_aliased = crit_call.response;
     eprintln!("[assistant] critique raw response:\n{raw_aliased}");
 
@@ -1821,6 +1893,42 @@ mod provider_tests {
         port
     }
 
+    fn spawn_openai_server_without_done() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut buf = [0u8; 16384];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let first_line = request.lines().next().unwrap_or("");
+                if first_line.contains("/v1/models") {
+                    let json = r#"{"object":"list","data":[{"id":"test-model","object":"model"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        json.len(),
+                        json
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                } else if first_line.contains("/v1/chat/completions") {
+                    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"complete json\"}}]}\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n{:X}\r\n{}\r\n",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                }
+            }
+        });
+        port
+    }
+
     #[tokio::test]
     async fn detects_and_streams_openai_compatible_server() {
         let port = spawn_mock_openai_server();
@@ -1830,11 +1938,23 @@ mod provider_tests {
         assert_eq!(provider, LlmProvider::OpenAiCompat);
         assert_eq!(models, vec!["test-model".to_string()]);
 
-        let call = llm_generate(&base_url, "test-model", "hi", 10_000, "test", &NoopObserver)
+        let call = llm_generate(&base_url, "test-model", "hi", 10_000, "test", &NoopObserver, None)
             .await
             .expect("generate against mock server");
         assert_eq!(call.response, "Hello world");
         assert_eq!(call.stats.prompt_tokens, 5);
         assert_eq!(call.stats.response_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn openai_stream_idle_timeout_returns_accumulated_content_without_done() {
+        let port = spawn_openai_server_without_done();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let call = llm_generate(&base_url, "test-model", "hi", 10_000, "test", &NoopObserver, None)
+            .await
+            .expect("generate should finish after idle timeout");
+
+        assert_eq!(call.response, "complete json");
     }
 }

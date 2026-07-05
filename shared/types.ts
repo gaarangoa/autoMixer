@@ -261,6 +261,8 @@ export type MixSession = {
   name: string;
   albumId?: Id;
   sampleRate: number;
+  /** Current speed vs the original audio (100 = untouched). */
+  tempoPercent?: number;
   bpm?: number;
   sourceFiles: SourceFile[];
   videoSourceFiles?: VideoSourceFile[];

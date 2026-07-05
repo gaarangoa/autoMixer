@@ -36,13 +36,22 @@ from acp.schema import (
     RequestPermissionResponse,
 )
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-HERMES = os.environ.get(
-    "AUTOMIXER_HERMES_BIN",
-    str(Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes"),
-)
+def _default_hermes_bin() -> str:
+    for candidate in (
+        Path.home() / ".automixer" / "hermes-agent" / "venv" / "bin" / "hermes",
+        Path.home() / ".automixer" / "hermes-agent" / ".venv" / "bin" / "hermes",
+        Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes",
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return "hermes"
+
+
+HERMES = os.environ.get("AUTOMIXER_HERMES_BIN", _default_hermes_bin())
 UV = os.environ.get("AUTOMIXER_UV", str(Path.home() / ".local" / "bin" / "uv"))
 MCP_DIR = os.environ.get("AUTOMIXER_MCP_DIR", str(Path(__file__).parent / "automixer-mcp"))
 
@@ -259,6 +268,28 @@ class Bridge:
         self.acp_for_mix[mix_session_id] = new.session_id
         return new.session_id
 
+    async def probe(self) -> None:
+        """Create a throwaway ACP session and run one tiny prompt.
+
+        `/health` only proves uvicorn + `hermes acp` are alive. After a model
+        switch, Hermes can still fail later while creating the first ACP session
+        for that model/provider. Probe that path explicitly so Settings can reject
+        a bad model instead of leaving the app with a broken chat stream.
+        """
+        sid = "__probe__"
+        async with self.turn_lock:
+            try:
+                await self.compact(sid)
+                acp_sid = await self.acp_session_for(sid)
+                await self.conn.prompt(
+                    prompt=[acp.text_block("Reply with just: ready")],
+                    session_id=acp_sid,
+                )
+            finally:
+                await self.compact(sid)
+                self.turn_count.pop(sid, None)
+                self.recent_user.pop(sid, None)
+
 
 bridge = Bridge()
 
@@ -332,6 +363,18 @@ async def warmup():
     return {"ok": True}
 
 
+@app.post("/probe")
+async def probe():
+    try:
+        await bridge.probe()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Hermes could not initialize an ACP session with the configured model: {exc}",
+        ) from exc
+    return {"ok": True}
+
+
 class ChatBody(BaseModel):
     sessionId: str
     userText: str
@@ -340,65 +383,68 @@ class ChatBody(BaseModel):
 @app.post("/chat")
 async def chat(body: ChatBody):
     async def gen():
-        # Serialize turns — the chat UI runs one conversation at a time.
-        async with bridge.turn_lock:
-            # Auto-compact before the turn if the conversation has grown too long.
-            recap = ""
-            if bridge.should_compact(body.sessionId):
-                recap = bridge.recap_text(body.sessionId)
-                await bridge.compact(body.sessionId)
-            acp_sid = await bridge.acp_session_for(body.sessionId)
-            bridge.note_turn(body.sessionId, body.userText)
-            queue: asyncio.Queue = asyncio.Queue()
-            bridge.queues[acp_sid] = queue
+        try:
+            # Serialize turns — the chat UI runs one conversation at a time.
+            async with bridge.turn_lock:
+                # Auto-compact before the turn if the conversation has grown too long.
+                recap = ""
+                if bridge.should_compact(body.sessionId):
+                    recap = bridge.recap_text(body.sessionId)
+                    await bridge.compact(body.sessionId)
+                acp_sid = await bridge.acp_session_for(body.sessionId)
+                bridge.note_turn(body.sessionId, body.userText)
+                queue: asyncio.Queue = asyncio.Queue()
+                bridge.queues[acp_sid] = queue
 
-            async def run_prompt():
+                async def run_prompt():
+                    try:
+                        prompt = (
+                            f"{recap}"
+                            f"The current AutoMixer session id is {body.sessionId}. "
+                            f"Use the automixer tools to inspect and adjust this session "
+                            f"(call get_session first to see the tracks). "
+                            f"User request: {body.userText}"
+                        )
+                        resp = await bridge.conn.prompt(prompt=[acp.text_block(prompt)], session_id=acp_sid)
+                        # Estimated usage + how full the conversation is before the next
+                        # auto-compaction — surfaced in the chat UI.
+                        await queue.put({
+                            "type": "usage",
+                            "outputTokens": bridge.out_chars.get(acp_sid, 0) // 4,
+                            "thoughtTokens": bridge.think_chars.get(acp_sid, 0) // 4,
+                            "turnsSinceCompaction": bridge.turn_count.get(body.sessionId, 0),
+                            "compactAfter": bridge.COMPACT_AFTER_TURNS,
+                        })
+                        await queue.put({"type": "done", "stopReason": getattr(resp, "stop_reason", "end_turn")})
+                    except Exception as exc:  # noqa: BLE001
+                        await queue.put({"type": "error", "message": str(exc)})
+                    finally:
+                        await queue.put(None)
+
+                task = asyncio.create_task(run_prompt())
                 try:
-                    prompt = (
-                        f"{recap}"
-                        f"The current AutoMixer session id is {body.sessionId}. "
-                        f"Use the automixer tools to inspect and adjust this session "
-                        f"(call get_session first to see the tracks). "
-                        f"User request: {body.userText}"
-                    )
-                    resp = await bridge.conn.prompt(prompt=[acp.text_block(prompt)], session_id=acp_sid)
-                    # Estimated usage + how full the conversation is before the next
-                    # auto-compaction — surfaced in the chat UI.
-                    await queue.put({
-                        "type": "usage",
-                        "outputTokens": bridge.out_chars.get(acp_sid, 0) // 4,
-                        "thoughtTokens": bridge.think_chars.get(acp_sid, 0) // 4,
-                        "turnsSinceCompaction": bridge.turn_count.get(body.sessionId, 0),
-                        "compactAfter": bridge.COMPACT_AFTER_TURNS,
-                    })
-                    await queue.put({"type": "done", "stopReason": getattr(resp, "stop_reason", "end_turn")})
-                except Exception as exc:  # noqa: BLE001
-                    await queue.put({"type": "error", "message": str(exc)})
+                    while True:
+                        event = await queue.get()
+                        if event is None:
+                            break
+                        yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.CancelledError:
+                    # The Rust client dropped the connection (user pressed Stop) —
+                    # cancel the in-flight ACP turn so the agent actually stops.
+                    try:
+                        await bridge.conn.cancel(session_id=acp_sid)
+                    except Exception:
+                        pass
+                    raise
                 finally:
-                    await queue.put(None)
-
-            task = asyncio.create_task(run_prompt())
-            try:
-                while True:
-                    event = await queue.get()
-                    if event is None:
-                        break
-                    yield f"data: {json.dumps(event)}\n\n"
-            except asyncio.CancelledError:
-                # The Rust client dropped the connection (user pressed Stop) —
-                # cancel the in-flight ACP turn so the agent actually stops.
-                try:
-                    await bridge.conn.cancel(session_id=acp_sid)
-                except Exception:
-                    pass
-                raise
-            finally:
-                bridge.queues.pop(acp_sid, None)
-                if not task.done():
-                    task.cancel()
-                try:
-                    await task
-                except Exception:
-                    pass
+                    bridge.queues.pop(acp_sid, None)
+                    if not task.done():
+                        task.cancel()
+                    try:
+                        await task
+                    except Exception:
+                        pass
+        except Exception as exc:  # noqa: BLE001
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Hermes could not start this turn: {exc}'})}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")

@@ -15,8 +15,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use axum::{
-    extract::{Path as AxumPath, State as AxumState},
+    body::Body,
+    extract::{Path as AxumPath, Query, State as AxumState},
     http::{HeaderMap, StatusCode},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -138,6 +140,9 @@ pub fn spawn(app: AppHandle) -> Result<&'static ControlInfo, String> {
         .route("/control/session/{session_id}/clip-layout", post(post_clip_layout))
         .route("/control/session/{session_id}/clip-effects", post(post_clip_effects))
         .route("/control/session/{session_id}/auto-crop", post(post_auto_crop))
+        // Live MJPEG camera previews (single-owner camera service). Token comes as a
+        // query param because <img> tags can't set Authorization headers.
+        .route("/camera/preview/{device_label}", get(get_camera_preview))
         .with_state(state);
 
     tauri::async_runtime::spawn(async move {
@@ -501,7 +506,7 @@ async fn post_auto_mix(
         .and_then(|store| store.get_project(&session_id).map_err(|e| (StatusCode::BAD_REQUEST, e)))
     {
         emit_updated(&app, &session_id, &project);
-        let _ = app.emit("auto-mix:complete", serde_json::json!({ "project": project }));
+        let _ = app.emit("auto-mix:complete", serde_json::json!({ "sessionId": session_id, "project": project }));
     }
     Ok(Json(summary))
 }
@@ -688,4 +693,43 @@ fn emit_updated(app: &AppHandle, session_id: &str, project: &MixProject) {
         "session:externally-updated",
         serde_json::json!({ "sessionId": session_id, "project": project }),
     );
+}
+
+/// Stream a camera's live MJPEG preview (multipart/x-mixed-replace). The preview
+/// process is owned by camera_capture — starting one here can never fight a
+/// recording (subscribe_preview refuses while that device records).
+async fn get_camera_preview(
+    AxumState(state): AxumState<ControlState>,
+    AxumPath(device_label): AxumPath<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if query.get("token").map(|t| t == &state.token) != Some(true) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::from("missing or invalid token"))
+            .unwrap();
+    }
+    let rx = match crate::camera_capture::subscribe_preview(&device_label) {
+        Ok(rx) => rx,
+        Err(message) => {
+            let status = if message == "recording" { StatusCode::CONFLICT } else { StatusCode::NOT_FOUND };
+            return Response::builder().status(status).body(Body::from(message)).unwrap();
+        }
+    };
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(chunk) => return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)), rx)),
+                // Lagged: this client fell behind the broadcast — skip ahead.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "multipart/x-mixed-replace;boundary=ffmpeg")
+        .header("cache-control", "no-store")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
