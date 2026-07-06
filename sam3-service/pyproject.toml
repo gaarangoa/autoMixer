@@ -1,0 +1,43 @@
+[project]
+name = "sam3-service"
+version = "0.1.0"
+description = "SAM 3 video-segmentation sidecar (text-prompted, lazy-loaded, background jobs)."
+requires-python = ">=3.11"
+dependencies = [
+    "sam3",
+    "torch",
+    "torchvision",
+    "xformers; sys_platform == 'linux'",
+    # cu130 torch wheel doesn't bundle cuDNN — add it explicitly on the Spark.
+    "nvidia-cudnn-cu13; sys_platform == 'linux'",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "numpy",
+    "pycocotools",
+    # sam3 imports these but does not declare them:
+    "einops",
+    "iopath",
+    "pillow",
+    "tqdm",
+    "psutil",
+    "opencv-python-headless",
+]
+
+[tool.uv.sources]
+sam3 = { git = "https://github.com/facebookresearch/sam3.git" }
+# On the Spark (aarch64 Linux) pull CUDA torch from PyTorch's index (matches the
+# system CUDA 13.0 toolkit so source-built extensions compile).
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv]
+# decord has no aarch64 wheel (unused paths only); xformers builds from source on
+# the Spark (nvcc present) and needs torch at build time.
+override-dependencies = ["decord; sys_platform == 'cygwin'"]
+no-build-isolation-package = ["xformers"]
