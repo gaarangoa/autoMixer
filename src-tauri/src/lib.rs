@@ -5,6 +5,7 @@ pub mod audio;
 pub mod audio_service;
 pub mod auto_mix;
 pub mod camera_capture;
+pub mod clip_transfer;
 pub mod capabilities;
 pub mod commands;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod engine;
 pub mod hermes_service;
 pub mod model;
 pub mod recorder;
+pub mod sam_audio;
 pub mod store;
 pub mod web;
 
@@ -111,11 +113,14 @@ pub fn build_and_set_menu(
     let sync_tracks = MenuItemBuilder::with_id("edit_sync_tracks", "Sync Tracks to Reference…")
         .accelerator("CmdOrCtrl+Shift+Y")
         .build(app)?;
+    let split_track = MenuItemBuilder::with_id("edit_split_track", "Split Track…")
+        .build(app)?;
     if let Some(edit) = find_submenu("Edit") {
         edit.append(&PredefinedMenuItem::separator(app)?)?;
         edit.append(&detect)?;
         edit.append(&level)?;
         edit.append(&sync_tracks)?;
+        edit.append(&split_track)?;
     } else {
         // No "Edit" found (unexpected) — expose the tools in their own submenu so
         // they're never unreachable.
@@ -124,6 +129,7 @@ pub fn build_and_set_menu(
             .item(&detect)
             .item(&level)
             .item(&sync_tracks)
+            .item(&split_track)
             .build()?;
         menu.append(&tracks_menu)?;
     }
@@ -179,6 +185,7 @@ pub fn run() {
                     "edit_detect_structure" => "menu:detect-structure",
                     "edit_level_sections" => "menu:level-sections",
                     "edit_sync_tracks" => "menu:sync-tracks",
+                    "edit_split_track" => "menu:split-track",
                     "file_new_album" => "menu:new-album",
                     "file_open_album" => "menu:open-album",
                     "file_new_song" => "menu:new-song",
@@ -255,6 +262,14 @@ pub fn run() {
             commands::clear_chat,
             commands::get_video_model,
             commands::set_video_model,
+            sam_audio::get_sam_audio_config,
+            sam_audio::set_sam_audio_config,
+            sam_audio::test_sam_audio_connection,
+            sam_audio::prepare_track_split,
+            sam_audio::run_track_split,
+            sam_audio::cancel_track_split,
+            sam_audio::discard_track_split,
+            sam_audio::apply_track_split,
             commands::set_config,
             commands::set_video_selection,
             commands::get_video_selection,
@@ -278,6 +293,7 @@ pub fn run() {
             commands::stop_input_monitor,
             commands::delete_clip,
             commands::delete_clip_range,
+            clip_transfer::transfer_clip,
             commands::set_master_bypass,
             commands::set_master_gain,
             commands::list_mixer_profiles,

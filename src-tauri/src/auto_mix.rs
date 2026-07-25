@@ -863,6 +863,8 @@ mod tests {
             name: "Session".into(),
             album_id: String::new(),
             sample_rate: 48_000,
+            minimum_timeline_seconds: None,
+            tempo_percent: 100.0,
             bpm: None,
             source_files: Vec::new(),
             video_source_files: Vec::new(),
@@ -897,8 +899,7 @@ mod tests {
             source_files.push(crate::model::SourceFile {
                 id: source_id,
                 pristine_source_id: None,
-                pristine_source_id: None,
-            original_name: format!("{name}.wav"),
+                original_name: format!("{name}.wav"),
                 cache_path: String::new(),
                 peak_path: String::new(),
                 duration_samples: 48_000 * 120,
@@ -924,6 +925,8 @@ mod tests {
             name: "Offline smoke".into(),
             album_id: String::new(),
             sample_rate: 48_000,
+            minimum_timeline_seconds: None,
+            tempo_percent: 100.0,
             bpm: Some(120.0),
             source_files,
             video_source_files: Vec::new(),
@@ -1071,6 +1074,7 @@ mod tests {
         session.tracks[0].ai_generated = true;
         session.source_files.push(crate::model::SourceFile {
             id: "source".into(),
+            pristine_source_id: None,
             original_name: "Lead Vocal.wav".into(),
             cache_path: String::new(),
             peak_path: String::new(),

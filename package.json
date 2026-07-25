@@ -8,6 +8,7 @@
     "dev": "tauri dev",
     "dev:web": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc --noEmit && vite build",
+    "test:timeline": "node --experimental-strip-types --test tests/timeline.test.ts",
     "tauri": "tauri"
   },
   "dependencies": {

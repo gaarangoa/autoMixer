@@ -64,6 +64,7 @@ pub fn make_track(source_file_id: String, name: String, index: usize) -> Track {
         chain: default_chain(),
         sends: Sends { reverb_db: -60.0, delay_db: -60.0 },
         automation: Vec::new(),
+        clips_materialized: false,
         clips: Vec::new(),
         video_clips: Vec::new(),
         camera_device_id: None,

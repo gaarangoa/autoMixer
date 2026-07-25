@@ -216,6 +216,7 @@ export type Track = {
   chain: TrackChain;
   sends: Sends;
   automation: AutomationLane[];
+  clipsMaterialized?: boolean;
   clips: ClipRegion[];
   videoClips?: VideoClipRegion[];
   cameraDeviceId?: string;
@@ -261,6 +262,8 @@ export type MixSession = {
   name: string;
   albumId?: Id;
   sampleRate: number;
+  /** Minimum timeline canvas for scratch recording sessions. */
+  minimumTimelineSeconds?: number;
   /** Current speed vs the original audio (100 = untouched). */
   tempoPercent?: number;
   bpm?: number;

@@ -17,9 +17,9 @@ This directory is the **canonical source** — deploy copies it to the Spark.
 
 ## Files
 - `app.py` — FastAPI service: `/health`, `POST /isolate` (multipart: file, description, residual, reranking) → `{job_id}`, `GET /jobs/{id}`, `GET /jobs/{id}/target.wav`, `/residual.wav`. Async jobs.
-- `sam_infer.py` — SAM-Audio wrapper: lazy-load on first use, keep warm, **unload after idle** (`SAM_IDLE_UNLOAD_S`, default 600s) so the ~15 GB model doesn't sit pinned.
-- `Dockerfile` — `FROM nvcr.io/nvidia/pytorch` + sam-audio + service deps.
-- `deploy_to_spark.sh` — rsync → docker build → run on the Spark.
+- `sam_infer.py` — SAM-Audio wrapper: lazy-load on first use, serialize inference jobs, split long inputs into overlapping chunks, and **unload after idle** (`SAM_IDLE_UNLOAD_S`, default 600s) so the model doesn't sit pinned.
+- `deploy_to_spark.sh` — sync the source, prepare the CUDA `uv` environment, and restart the Spark service.
+- `run_service.sh` — start or restart the remote service independently of the SSH session.
 - `pyproject.toml` / `test_isolate.py` — local dev/reference (the Mac can't actually run the model).
 
 ## Deploy
@@ -28,5 +28,11 @@ This directory is the **canonical source** — deploy copies it to the Spark.
 ```
 Then point AutoMixer's SAM endpoint at `http://spark-6a22.local:7330`.
 
-The model weights (gated, ~15 GB) download on first `/isolate` into the mounted
-`/weights/hf` volume on the Spark (persists across container restarts).
+Long inputs default to 20-second chunks with a 2-second crossfade. Override with
+`SAM_CHUNK_SECONDS` and `SAM_CHUNK_OVERLAP_SECONDS`. Span prediction is disabled
+by default to keep memory bounded; set `SAM_PREDICT_SPANS=true` to enable it.
+Completed, failed, and cancelled jobs are removed after `SAM_JOB_TTL_S` (one hour
+by default). Clients may cancel a job or delete its artifacts immediately.
+
+The gated model weights download into the Spark user's Hugging Face cache on the
+first `/isolate` request and persist across service restarts.

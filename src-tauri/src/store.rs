@@ -12,6 +12,8 @@ use crate::{
     model::{ClipRegion, HistorySource, JsonPatchOp, MixAlbum, MixProject, MixSession, SourceFile, TrackAnalysis, TrackKind, VideoClipRegion, VideoLayout, VideoSourceFile},
 };
 
+pub(crate) const SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS: f64 = 180.0;
+
 /// A recently opened/created album: its id, display name, and on-disk folder.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecentAlbum {
@@ -89,6 +91,7 @@ impl SessionStore {
             name,
             album_id: album_id.to_string(),
             sample_rate: 48000,
+            minimum_timeline_seconds: Some(SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS),
             tempo_percent: 100.0,
             bpm: None,
             source_files: Vec::new(),
@@ -424,6 +427,7 @@ impl SessionStore {
         let track_name = strip_extension(&source.original_name);
         let mut track = make_track(source_id, track_name, project.session.tracks.len());
         track.start_sample = start_sample;
+        project.session.minimum_timeline_seconds = None;
         project.session.source_files.push(source);
         project.session.tracks.push(track);
         self.save(&project)?;
@@ -432,6 +436,13 @@ impl SessionStore {
 
     pub fn create_recording_track(&self, session_id: &str, channels: u16) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
+        if project.session.minimum_timeline_seconds.is_none()
+            && project.session.tracks.is_empty()
+            && project.session.source_files.is_empty()
+            && project.session.video_source_files.is_empty()
+        {
+            project.session.minimum_timeline_seconds = Some(SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
+        }
         let source = self.create_silent_source(project.session.sample_rate, "Recording", channels)?;
         let source_id = source.id.clone();
         let track_index = project.session.tracks.len();
@@ -445,6 +456,13 @@ impl SessionStore {
 
     pub fn create_video_track(&self, session_id: &str) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
+        if project.session.minimum_timeline_seconds.is_none()
+            && project.session.tracks.is_empty()
+            && project.session.source_files.is_empty()
+            && project.session.video_source_files.is_empty()
+        {
+            project.session.minimum_timeline_seconds = Some(SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
+        }
         let source = self.create_silent_source(project.session.sample_rate, "Video Placeholder", 1)?;
         let source_id = source.id.clone();
         let mut track = make_track(source_id, format!("Video {}", project.session.tracks.len() + 1), project.session.tracks.len());
@@ -770,7 +788,7 @@ impl SessionStore {
         } else {
             start_sample.saturating_add((-offset_samples) as u64)
         };
-        if track.clips.is_empty() {
+        if track.clips.is_empty() && !track.clips_materialized {
             if let Some(existing) = existing_source.as_ref().filter(|source| source.original_name != "Recording") {
                 track.clips.push(ClipRegion {
                     id: Uuid::new_v4().to_string(),
@@ -792,6 +810,7 @@ impl SessionStore {
             source_offset_sample: 0,
             gain_db: 0.0,
         });
+        track.clips_materialized = true;
         project.session.source_files.push(source);
         self.save(&project)?;
         Ok(project)
@@ -866,25 +885,42 @@ impl SessionStore {
             .ok_or_else(|| format!("Unknown track {track_id}"))?;
         let track = &mut project.session.tracks[track_index];
         let before_clips = track.clips.clone();
+        let before_materialized = track.clips_materialized;
         let before = track.clips.len();
         track.clips.retain(|clip| clip.id != clip_id);
         if track.clips.len() == before {
             return Err(format!("Unknown clip {clip_id}"));
         }
+        track.clips_materialized = true;
         let after_clips = track.clips.clone();
         project.session.tracks[track_index].clips = before_clips.clone();
+        project.session.tracks[track_index].clips_materialized = before_materialized;
         record_patch(
             &mut project,
-            vec![JsonPatchOp {
-                op: "replace".into(),
-                path: format!("/tracks/{track_index}/clips"),
-                value: Some(serde_json::json!(after_clips)),
-            }],
-            vec![JsonPatchOp {
-                op: "replace".into(),
-                path: format!("/tracks/{track_index}/clips"),
-                value: Some(serde_json::json!(before_clips)),
-            }],
+            vec![
+                JsonPatchOp {
+                    op: "replace".into(),
+                    path: format!("/tracks/{track_index}/clips"),
+                    value: Some(serde_json::json!(after_clips)),
+                },
+                JsonPatchOp {
+                    op: "replace".into(),
+                    path: format!("/tracks/{track_index}/clipsMaterialized"),
+                    value: Some(serde_json::json!(true)),
+                },
+            ],
+            vec![
+                JsonPatchOp {
+                    op: "replace".into(),
+                    path: format!("/tracks/{track_index}/clips"),
+                    value: Some(serde_json::json!(before_clips)),
+                },
+                JsonPatchOp {
+                    op: "replace".into(),
+                    path: format!("/tracks/{track_index}/clipsMaterialized"),
+                    value: Some(serde_json::json!(before_materialized)),
+                },
+            ],
             HistorySource::User,
             Some("Deleted recording clip".into()),
         )?;
@@ -912,7 +948,9 @@ impl SessionStore {
         if project.session.tracks[track_index].kind == crate::model::TrackKind::Video {
             return self.delete_video_clip_range(session_id, track_id, start_sample, end_sample);
         }
-        if project.session.tracks[track_index].clips.is_empty() {
+        let before_materialized = project.session.tracks[track_index].clips_materialized;
+        let before_clips = project.session.tracks[track_index].clips.clone();
+        if project.session.tracks[track_index].clips.is_empty() && !before_materialized {
             let source_id = project.session.tracks[track_index].source_file_id.clone();
             let source = project
                 .session
@@ -932,7 +970,7 @@ impl SessionStore {
             });
         }
         let track = &mut project.session.tracks[track_index];
-        let before_clips = track.clips.clone();
+        track.clips_materialized = true;
         let mut changed = false;
         let mut next = Vec::with_capacity(track.clips.len());
         for clip in track.clips.drain(..) {
@@ -965,18 +1003,33 @@ impl SessionStore {
         track.clips = next;
         let after_clips = track.clips.clone();
         project.session.tracks[track_index].clips = before_clips.clone();
+        project.session.tracks[track_index].clips_materialized = before_materialized;
         record_patch(
             &mut project,
-            vec![JsonPatchOp {
-                op: "replace".into(),
-                path: format!("/tracks/{track_index}/clips"),
-                value: Some(serde_json::json!(after_clips)),
-            }],
-            vec![JsonPatchOp {
-                op: "replace".into(),
-                path: format!("/tracks/{track_index}/clips"),
-                value: Some(serde_json::json!(before_clips)),
-            }],
+            vec![
+                JsonPatchOp {
+                    op: "replace".into(),
+                    path: format!("/tracks/{track_index}/clips"),
+                    value: Some(serde_json::json!(after_clips)),
+                },
+                JsonPatchOp {
+                    op: "replace".into(),
+                    path: format!("/tracks/{track_index}/clipsMaterialized"),
+                    value: Some(serde_json::json!(true)),
+                },
+            ],
+            vec![
+                JsonPatchOp {
+                    op: "replace".into(),
+                    path: format!("/tracks/{track_index}/clips"),
+                    value: Some(serde_json::json!(before_clips)),
+                },
+                JsonPatchOp {
+                    op: "replace".into(),
+                    path: format!("/tracks/{track_index}/clipsMaterialized"),
+                    value: Some(serde_json::json!(before_materialized)),
+                },
+            ],
             HistorySource::User,
             Some("Deleted selected track range".into()),
         )?;

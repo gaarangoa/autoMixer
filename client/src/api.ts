@@ -13,6 +13,23 @@ export type PlayheadEvent = { sample: number; running: boolean };
 export type MetersEvent = { masterPeak: number; trackPeaks: number[] };
 export type AudioProgressEvent = { stage: string; message: string; elapsedSeconds: number };
 export type AgentVideoProgressEvent = { sessionId?: string; stage: string; message: string; current: number; total: number; elapsedSeconds: number };
+export type SamSplitProgressEvent = { previewId: string; sessionId: string; phase: string; message: string; progress: number; chunk?: number; chunks?: number; elapsedSeconds: number };
+export type SplitTrackPreview = {
+  previewId: string;
+  sessionId: string;
+  trackId: string;
+  trackName: string;
+  startSample: number;
+  endSample: number;
+  sampleRate: number;
+  originalPath: string;
+  originalPeaks: number[];
+  targetPath?: string;
+  residualPath?: string;
+  targetPeaks: number[];
+  residualPeaks: number[];
+  prompt?: string;
+};
 export type LlmChunkEvent = { sessionId?: string; phase: string; text: string };
 export type LlmStatsEvent = { sessionId?: string; phase: string; promptTokens: number; responseTokens: number; elapsedMs: number };
 export type LlmTurnEvent = { sessionId?: string; userText?: string };
@@ -83,6 +100,8 @@ export const api = {
     tauriInvoke<MixProject>("delete_clip", { sessionId, trackId, clipId }),
   deleteClipRange: (sessionId: string, trackId: string, startSample: number, endSample: number) =>
     tauriInvoke<MixProject>("delete_clip_range", { sessionId, trackId, startSample, endSample }),
+  transferClip: (sessionId: string, sourceTrackId: string, destinationTrackId: string, clipId: string, startSample: number, copy: boolean) =>
+    tauriInvoke<{ project: MixProject; trackId: string; clipId: string }>("transfer_clip", { sessionId, sourceTrackId, destinationTrackId, clipId, startSample, copy }),
   setMasterBypass: (enabled: boolean) => tauriInvoke<void>("set_master_bypass", { enabled }),
   setMasterGain: (sessionId: string, gainDb: number) => tauriInvoke<MixProject>("set_master_gain", { sessionId, gainDb }),
   renameSession: (sessionId: string, name: string) => tauriInvoke<MixProject>("rename_session", { sessionId, name }),
@@ -163,6 +182,19 @@ export const api = {
   // Read / set the video-edit skill's vision-model endpoint (e.g. Qwen3-VL on the Spark).
   getVideoModel: () => tauriInvoke<{ baseUrl: string; model: string }>("get_video_model"),
   setVideoModel: (baseUrl: string, model: string) => tauriInvoke<void>("set_video_model", { baseUrl, model }),
+  getSamAudioConfig: () => tauriInvoke<{ baseUrl: string }>("get_sam_audio_config"),
+  setSamAudioConfig: (baseUrl: string) => tauriInvoke<void>("set_sam_audio_config", { baseUrl }),
+  testSamAudioConnection: () => tauriInvoke<{ baseUrl: string; status: string; loaded: boolean; loading: boolean; busy: boolean; device?: string }>("test_sam_audio_connection"),
+  prepareTrackSplit: (sessionId: string, trackId: string, startSample: number, endSample: number) =>
+    tauriInvoke<SplitTrackPreview>("prepare_track_split", { sessionId, trackId, startSample, endSample }),
+  runTrackSplit: (previewId: string, prompt: string) =>
+    tauriInvoke<SplitTrackPreview>("run_track_split", { previewId, prompt }),
+  cancelTrackSplit: (previewId: string) => tauriInvoke<void>("cancel_track_split", { previewId }),
+  discardTrackSplit: (previewId: string) => tauriInvoke<void>("discard_track_split", { previewId }),
+  applyTrackSplit: (previewId: string) =>
+    tauriInvoke<{ project: MixProject; extractedTrackId: string }>("apply_track_split", { previewId }),
+  onSamSplitProgress: (cb: (event: SamSplitProgressEvent) => void): Promise<UnlistenFn> =>
+    listen<SamSplitProgressEvent>("sam-split:progress", event => cb(event.payload)),
   setConfig: (ollamaBaseUrl: string, ollamaModel: string) => tauriInvoke<void>("set_config", { ollamaBaseUrl, ollamaModel }),
   // Push the user's track selection so the video skill edits only selected tracks.
   setVideoSelection: (sessionId: string, trackIds: string[]) => tauriInvoke<void>("set_video_selection", { sessionId, trackIds }),

@@ -22,7 +22,14 @@ sleep 1
 # setsid + </dev/null: survives the ssh session ending.
 setsid nohup .venv/bin/uvicorn app:app --host 0.0.0.0 --port "$PORT" \
   > server.log 2>&1 < /dev/null &
-sleep 5
-curl -fsS --max-time 5 "http://127.0.0.1:$PORT/health" && echo " OK" || {
-  echo "-- no health yet; log tail:"; tail -5 server.log; exit 1
-}
+for _ in {1..15}; do
+  if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health"; then
+    echo " OK"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "-- service did not become healthy; log tail:"
+tail -10 server.log
+exit 1

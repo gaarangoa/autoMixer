@@ -119,7 +119,7 @@ impl AudioEngine {
                 break;
             }
             let mut clips = Vec::new();
-            if track.clips.is_empty() {
+            if track.clips.is_empty() && !track.clips_materialized {
                 if let Some(src) = by_id.get(track.source_file_id.as_str()) {
                     let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
                     clips.push(TrackClipSource {

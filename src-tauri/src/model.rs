@@ -337,6 +337,10 @@ pub struct Track {
     pub chain: TrackChain,
     pub sends: Sends,
     pub automation: Vec<AutomationLane>,
+    /// False means a clip-less legacy track should play its whole source file.
+    /// Once clips have been explicitly edited, true allows an empty track to stay silent.
+    #[serde(default)]
+    pub clips_materialized: bool,
     pub clips: Vec<ClipRegion>,
     #[serde(default)]
     pub video_clips: Vec<VideoClipRegion>,
@@ -441,6 +445,10 @@ pub struct MixSession {
     #[serde(default)]
     pub album_id: Id,
     pub sample_rate: u32,
+    /// Optional empty-canvas length for scratch recording sessions. Imported media
+    /// clears this so stem-based sessions follow their real source duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_timeline_seconds: Option<f64>,
     /// Current tempo as a percentage of the original speed (100 = untouched).
     #[serde(default = "default_tempo_percent")]
     pub tempo_percent: f32,

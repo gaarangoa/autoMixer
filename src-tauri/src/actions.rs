@@ -459,6 +459,8 @@ mod tests {
             name: "test".into(),
             album_id: String::new(),
             sample_rate: 48_000,
+            minimum_timeline_seconds: None,
+            tempo_percent: 100.0,
             bpm: None,
             source_files: Vec::new(),
             video_source_files: Vec::new(),

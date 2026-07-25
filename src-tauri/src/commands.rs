@@ -623,6 +623,7 @@ pub fn reset_session(state: State<'_, AppState>, session_id: String) -> Result<M
     let mut project = store.get_project(&session_id)?;
     project.session.tracks.clear();
     project.session.source_files.clear();
+    project.session.minimum_timeline_seconds = Some(crate::store::SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
     project.session.regions.clear();
     project.session.markers.clear();
     project.history.clear();
@@ -2446,7 +2447,7 @@ fn track_onset_envelope(
     let by_id: std::collections::HashMap<&str, &crate::model::SourceFile> =
         session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
     // Synthetic clip list for clip-less tracks.
-    let clips: Vec<(String, u64, u64, u64)> = if track.clips.is_empty() {
+    let clips: Vec<(String, u64, u64, u64)> = if track.clips.is_empty() && !track.clips_materialized {
         let Some(src) = by_id.get(track.source_file_id.as_str()) else { return Err(format!("Track {} has no audio source", track.name)) };
         vec![(src.id.clone(), track.start_sample, track.start_sample + src.duration_samples, 0)]
     } else {
@@ -2594,7 +2595,7 @@ pub async fn sync_tracks_to_reference(
     let mut tracks = old_tracks.clone();
     let ms_per_sample = 1000.0 / session_rate as f64;
     for track in tracks.iter_mut().filter(|t| move_ids.contains(&t.id)) {
-        if track.clips.is_empty() && !matches!(track.kind, crate::model::TrackKind::Video) {
+        if track.clips.is_empty() && !track.clips_materialized && !matches!(track.kind, crate::model::TrackKind::Video) {
             let new_start = track.start_sample as i64 + delta_samples;
             if new_start >= 0 {
                 track.start_sample = new_start as u64;
@@ -2616,6 +2617,7 @@ pub async fn sync_tracks_to_reference(
                         source_offset_sample: cut,
                         gain_db: 0.0,
                     });
+                    track.clips_materialized = true;
                     track.start_sample = 0;
                 }
             }
@@ -3980,9 +3982,14 @@ fn extract_video_audio(video_path: &Path, audio_path: &Path, sample_rate: u32, s
 fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, selected_track_ids: &HashSet<String>) -> Vec<VideoRenderClip> {
     let by_id: std::collections::HashMap<&str, &crate::model::VideoSourceFile> =
         session.video_source_files.iter().map(|source| (source.id.as_str(), source)).collect();
+    let any_solo = session.tracks.iter().any(|track| {
+        track.kind == crate::model::TrackKind::Video
+            && selected_track_ids.contains(&track.id)
+            && track.solo
+    });
     let mut clips = Vec::new();
     for (track_index, track) in session.tracks.iter().enumerate() {
-        if track.kind != crate::model::TrackKind::Video || track.muted || !selected_track_ids.contains(&track.id) {
+        if !video_track_is_enabled(track, selected_track_ids, any_solo) {
             continue;
         }
         for clip in &track.video_clips {
@@ -4015,6 +4022,13 @@ fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, 
             .then_with(|| a.start_sample.cmp(&b.start_sample))
     });
     clips
+}
+
+fn video_track_is_enabled(track: &crate::model::Track, selected_track_ids: &HashSet<String>, any_solo: bool) -> bool {
+    track.kind == crate::model::TrackKind::Video
+        && selected_track_ids.contains(&track.id)
+        && !track.muted
+        && (!any_solo || track.solo)
 }
 
 fn default_video_layout(index: usize) -> VideoLayout {
@@ -6130,7 +6144,7 @@ fn session_duration_samples(session: &MixSession) -> u64 {
     let by_id: std::collections::HashMap<&str, &crate::model::SourceFile> =
         session.source_files.iter().map(|source| (source.id.as_str(), source)).collect();
     session.tracks.iter().map(|track| {
-        if track.clips.is_empty() {
+        if track.clips.is_empty() && !track.clips_materialized {
             by_id
                 .get(track.source_file_id.as_str())
                 .map(|source| track.start_sample + source.duration_samples)
@@ -6171,8 +6185,14 @@ fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAc
                 }
             }
             MixAction::SoloTrack { track_id, solo } => {
-                if let Some(slot) = track_slot(session, track_id) {
-                    audio.send(EngineCommand::SetTrackSolo { slot, solo: *solo });
+                if let (Some(slot), Some(track)) = (
+                    track_slot(session, track_id),
+                    session.tracks.iter().find(|track| &track.id == track_id),
+                ) {
+                    audio.send(EngineCommand::SetTrackSolo {
+                        slot,
+                        solo: *solo && track.kind != crate::model::TrackKind::Video,
+                    });
                 }
             }
             MixAction::SetHighPass { track_id, frequency_hz, slope_db_oct } => {
@@ -6258,7 +6278,10 @@ pub fn sync_session_to_engine(audio: &mut crate::engine::AudioEngine, session: &
         audio.send(EngineCommand::SetTrackGainDb { slot, db: track.gain_db });
         audio.send(EngineCommand::SetTrackPan { slot, pan: track.pan });
         audio.send(EngineCommand::SetTrackMuted { slot, muted: track.muted });
-        audio.send(EngineCommand::SetTrackSolo { slot, solo: track.solo });
+        audio.send(EngineCommand::SetTrackSolo {
+            slot,
+            solo: track.solo && track.kind != crate::model::TrackKind::Video,
+        });
         audio.send(EngineCommand::SetTrackReverbSendDb { slot, db: track.sends.reverb_db });
         audio.send(EngineCommand::SetTrackDelaySendDb { slot, db: track.sends.delay_db });
         audio.send(EngineCommand::SetTrackHighPass {
@@ -6296,5 +6319,42 @@ pub fn sync_session_to_engine(audio: &mut crate::engine::AudioEngine, session: &
     }
     for slot in (session.tracks.len() as u32)..(crate::engine::mixer::MAX_TRACKS as u32) {
         audio.send(EngineCommand::SetTrackActive { slot, active: false });
+    }
+}
+
+#[cfg(test)]
+mod video_solo_tests {
+    use std::collections::HashSet;
+
+    use super::video_track_is_enabled;
+    use crate::{defaults::make_track, model::TrackKind};
+
+    fn video_track(id: &str) -> crate::model::Track {
+        let mut track = make_track(format!("source-{id}"), id.into(), 0);
+        track.id = id.into();
+        track.kind = TrackKind::Video;
+        track
+    }
+
+    #[test]
+    fn selected_video_solo_hides_other_selected_video_tracks() {
+        let selected = HashSet::from(["one".to_string(), "two".to_string()]);
+        let mut one = video_track("one");
+        one.solo = true;
+        let two = video_track("two");
+        assert!(video_track_is_enabled(&one, &selected, true));
+        assert!(!video_track_is_enabled(&two, &selected, true));
+    }
+
+    #[test]
+    fn muted_or_unselected_video_tracks_stay_hidden() {
+        let selected = HashSet::from(["one".to_string()]);
+        let mut one = video_track("one");
+        one.solo = true;
+        one.muted = true;
+        let mut two = video_track("two");
+        two.solo = true;
+        assert!(!video_track_is_enabled(&one, &selected, true));
+        assert!(!video_track_is_enabled(&two, &selected, true));
     }
 }

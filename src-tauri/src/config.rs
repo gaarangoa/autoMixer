@@ -14,6 +14,9 @@ pub struct Config {
     pub video_base_url: String,
     #[serde(default = "default_video_model")]
     pub video_model: String,
+    /// Promptable source-separation service (SAM-Audio).
+    #[serde(default = "default_sam_audio_base_url")]
+    pub sam_audio_base_url: String,
     #[serde(default)]
     pub audio: AudioConfig,
     #[serde(default)]
@@ -26,6 +29,10 @@ fn default_video_base_url() -> String {
 
 fn default_video_model() -> String {
     "qwen3.6-35b-a3b".to_string()
+}
+
+fn default_sam_audio_base_url() -> String {
+    "http://spark-6a22.local:7330".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +106,7 @@ impl Default for Config {
             ollama_model: "qwen3.6-35b-a3b".to_string(),
             video_base_url: default_video_base_url(),
             video_model: default_video_model(),
+            sam_audio_base_url: default_sam_audio_base_url(),
             audio: AudioConfig::default(),
             web: WebConfig::default(),
         }

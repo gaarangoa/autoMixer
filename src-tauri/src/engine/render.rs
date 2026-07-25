@@ -107,7 +107,7 @@ fn build_render_mixer(session: &MixSession, master_bypass: bool) -> Result<(Mixe
             break;
         }
         let mut clips = Vec::new();
-        if track.clips.is_empty() {
+        if track.clips.is_empty() && !track.clips_materialized {
             if let Some(src) = by_id.get(track.source_file_id.as_str()) {
                 let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
                 let end = track.start_sample + header.frames;
@@ -173,7 +173,10 @@ fn build_render_mixer(session: &MixSession, master_bypass: bool) -> Result<(Mixe
         let _ = producer.push(EngineCommand::SetTrackGainDb { slot, db: track.gain_db });
         let _ = producer.push(EngineCommand::SetTrackPan { slot, pan: track.pan });
         let _ = producer.push(EngineCommand::SetTrackMuted { slot, muted: track.muted });
-        let _ = producer.push(EngineCommand::SetTrackSolo { slot, solo: track.solo });
+        let _ = producer.push(EngineCommand::SetTrackSolo {
+            slot,
+            solo: track.solo && track.kind != crate::model::TrackKind::Video,
+        });
         let _ = producer.push(EngineCommand::SetTrackReverbSendDb {
             slot,
             db: track.sends.reverb_db,
