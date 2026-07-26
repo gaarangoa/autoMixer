@@ -88,8 +88,14 @@ impl From<&PendingSplit> for SplitTrackPreview {
             sample_rate: value.sample_rate,
             original_path: value.original_path.to_string_lossy().to_string(),
             original_peaks: value.original_peaks.clone(),
-            target_path: value.target_path.as_ref().map(|p| p.to_string_lossy().to_string()),
-            residual_path: value.residual_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            target_path: value
+                .target_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            residual_path: value
+                .residual_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             target_peaks: value.target_peaks.clone(),
             residual_peaks: value.residual_peaks.clone(),
             prompt: value.prompt.clone(),
@@ -184,7 +190,10 @@ pub fn set_sam_audio_config(base_url: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn test_sam_audio_connection() -> Result<SamAudioHealthResponse, String> {
-    let base_url = Config::load().sam_audio_base_url.trim_end_matches('/').to_string();
+    let base_url = Config::load()
+        .sam_audio_base_url
+        .trim_end_matches('/')
+        .to_string();
     let health = reqwest::Client::new()
         .get(format!("{base_url}/health"))
         .timeout(Duration::from_secs(8))
@@ -234,7 +243,8 @@ pub fn prepare_track_split(
 
     let id = Uuid::new_v4().to_string();
     let dir = state.config.data_dir.join("sam-previews");
-    fs::create_dir_all(&dir).map_err(|error| format!("Could not create split preview directory: {error}"))?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Could not create split preview directory: {error}"))?;
     let original_path = dir.join(format!("{id}-original.wav"));
     let original_peaks = render_raw_track_region(
         &project.session,
@@ -263,7 +273,10 @@ pub fn prepare_track_split(
         cancelled: Arc::new(AtomicBool::new(false)),
     };
     let response = SplitTrackPreview::from(&pending);
-    previews().lock().map_err(|error| error.to_string())?.insert(id, pending);
+    previews()
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(id, pending);
     Ok(response)
 }
 
@@ -285,9 +298,21 @@ pub async fn run_track_split(
         .ok_or_else(|| "This split preview expired. Open Split Track again.".to_string())?;
     pending.cancelled.store(false, Ordering::Relaxed);
     let started = Instant::now();
-    emit_progress(&app, &pending, "uploading", "Uploading selected audio to SAM-Audio…", 0.02, None, None, started);
+    emit_progress(
+        &app,
+        &pending,
+        "uploading",
+        "Uploading selected audio to SAM-Audio…",
+        0.02,
+        None,
+        None,
+        started,
+    );
 
-    let base_url = Config::load().sam_audio_base_url.trim_end_matches('/').to_string();
+    let base_url = Config::load()
+        .sam_audio_base_url
+        .trim_end_matches('/')
+        .to_string();
     let bytes = fs::read(&pending.original_path)
         .map_err(|error| format!("Could not read the selected audio preview: {error}"))?;
     let part = Part::bytes(bytes)
@@ -327,19 +352,51 @@ pub async fn run_track_split(
 
     let status = poll_job(&app, &client, &base_url, &created.job_id, &pending, started).await?;
     if status.status != "done" {
-        return Err(format!("SAM-Audio ended in unexpected state `{}`.", status.status));
+        return Err(format!(
+            "SAM-Audio ended in unexpected state `{}`.",
+            status.status
+        ));
     }
     if pending.cancelled.load(Ordering::Relaxed) {
         return Err("Track split cancelled.".into());
     }
 
-    emit_progress(&app, &pending, "downloading", "Downloading separated audio…", 0.96, status.chunk, status.chunks, started);
-    let dir = pending.original_path.parent().ok_or("Invalid preview directory")?;
+    emit_progress(
+        &app,
+        &pending,
+        "downloading",
+        "Downloading separated audio…",
+        0.96,
+        status.chunk,
+        status.chunks,
+        started,
+    );
+    let dir = pending
+        .original_path
+        .parent()
+        .ok_or("Invalid preview directory")?;
     let target_path = dir.join(format!("{preview_id}-target.wav"));
     let residual_path = dir.join(format!("{preview_id}-residual.wav"));
-    download_artifact(&client, &base_url, &created.job_id, "target.wav", &target_path).await?;
-    download_artifact(&client, &base_url, &created.job_id, "residual.wav", &residual_path).await?;
-    let _ = client.delete(format!("{base_url}/jobs/{}", created.job_id)).send().await;
+    download_artifact(
+        &client,
+        &base_url,
+        &created.job_id,
+        "target.wav",
+        &target_path,
+    )
+    .await?;
+    download_artifact(
+        &client,
+        &base_url,
+        &created.job_id,
+        "residual.wav",
+        &residual_path,
+    )
+    .await?;
+    let _ = client
+        .delete(format!("{base_url}/jobs/{}", created.job_id))
+        .send()
+        .await;
 
     let target_peaks = peaks_from_audio_file(&target_path)?;
     let residual_peaks = peaks_from_audio_file(&residual_path)?;
@@ -358,7 +415,16 @@ pub async fn run_track_split(
         current.remote_job_id = None;
         SplitTrackPreview::from(&*current)
     };
-    emit_progress(&app, &pending, "ready", "Separated audio is ready to review.", 1.0, status.chunk, status.chunks, started);
+    emit_progress(
+        &app,
+        &pending,
+        "ready",
+        "Separated audio is ready to review.",
+        1.0,
+        status.chunk,
+        status.chunks,
+        started,
+    );
     Ok(response)
 }
 
@@ -374,7 +440,10 @@ pub fn cancel_track_split(preview_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn discard_track_split(preview_id: String) -> Result<(), String> {
-    let pending = previews().lock().map_err(|error| error.to_string())?.remove(&preview_id);
+    let pending = previews()
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&preview_id);
     if let Some(pending) = pending {
         pending.cancelled.store(true, Ordering::Relaxed);
         cleanup_preview_files(&pending);
@@ -393,9 +462,18 @@ pub fn apply_track_split(
         .get(&preview_id)
         .cloned()
         .ok_or_else(|| "This split preview expired.".to_string())?;
-    let target_path = pending.target_path.as_ref().ok_or("Extracted audio is not ready.")?;
-    let residual_path = pending.residual_path.as_ref().ok_or("Background audio is not ready.")?;
-    let prompt = pending.prompt.as_deref().ok_or("Extraction prompt is missing.")?;
+    let target_path = pending
+        .target_path
+        .as_ref()
+        .ok_or("Extracted audio is not ready.")?;
+    let residual_path = pending
+        .residual_path
+        .as_ref()
+        .ok_or("Background audio is not ready.")?;
+    let prompt = pending
+        .prompt
+        .as_deref()
+        .ok_or("Extraction prompt is missing.")?;
 
     let store = state.store.lock().map_err(|error| error.to_string())?;
     let mut project = store.get_project(&pending.session_id)?;
@@ -405,12 +483,22 @@ pub fn apply_track_split(
         .iter()
         .position(|track| track.id == pending.track_id)
         .ok_or_else(|| "The source track was deleted while SAM-Audio was running.".to_string())?;
-    if arrangement_fingerprint(&project.session.tracks[track_index])? != pending.arrangement_fingerprint {
+    if arrangement_fingerprint(&project.session.tracks[track_index])?
+        != pending.arrangement_fingerprint
+    {
         return Err("The source track changed while SAM-Audio was running. Discard this preview and run Split Track again.".into());
     }
 
-    let target_source = store.import_source_standalone(target_path, project.session.sample_rate)?;
-    let residual_source = store.import_source_standalone(residual_path, project.session.sample_rate)?;
+    let target_source = store.import_source_standalone(
+        &pending.session_id,
+        target_path,
+        project.session.sample_rate,
+    )?;
+    let residual_source = store.import_source_standalone(
+        &pending.session_id,
+        residual_path,
+        project.session.sample_rate,
+    )?;
     let before_tracks = project.session.tracks.clone();
     let before_sources = project.session.source_files.clone();
     let mut after_tracks = before_tracks.clone();
@@ -468,12 +556,28 @@ pub fn apply_track_split(
     record_patch(
         &mut project,
         vec![
-            JsonPatchOp { op: "replace".into(), path: "/sourceFiles".into(), value: Some(serde_json::json!(after_sources)) },
-            JsonPatchOp { op: "replace".into(), path: "/tracks".into(), value: Some(serde_json::json!(after_tracks)) },
+            JsonPatchOp {
+                op: "replace".into(),
+                path: "/sourceFiles".into(),
+                value: Some(serde_json::json!(after_sources)),
+            },
+            JsonPatchOp {
+                op: "replace".into(),
+                path: "/tracks".into(),
+                value: Some(serde_json::json!(after_tracks)),
+            },
         ],
         vec![
-            JsonPatchOp { op: "replace".into(), path: "/sourceFiles".into(), value: Some(serde_json::json!(before_sources)) },
-            JsonPatchOp { op: "replace".into(), path: "/tracks".into(), value: Some(serde_json::json!(before_tracks)) },
+            JsonPatchOp {
+                op: "replace".into(),
+                path: "/sourceFiles".into(),
+                value: Some(serde_json::json!(before_sources)),
+            },
+            JsonPatchOp {
+                op: "replace".into(),
+                path: "/tracks".into(),
+                value: Some(serde_json::json!(before_tracks)),
+            },
         ],
         HistorySource::User,
         Some(format!("Split track: {prompt}")),
@@ -489,7 +593,10 @@ pub fn apply_track_split(
         guard.remove(&preview_id);
     }
     cleanup_preview_files(&pending);
-    Ok(ApplySplitResponse { project, extracted_track_id })
+    Ok(ApplySplitResponse {
+        project,
+        extracted_track_id,
+    })
 }
 
 async fn poll_job(
@@ -502,11 +609,17 @@ async fn poll_job(
 ) -> Result<RemoteJobStatus, String> {
     loop {
         if pending.cancelled.load(Ordering::Relaxed) {
-            let _ = client.post(format!("{base_url}/jobs/{job_id}/cancel")).send().await;
+            let _ = client
+                .post(format!("{base_url}/jobs/{job_id}/cancel"))
+                .send()
+                .await;
             return Err("Track split cancelled.".into());
         }
         if started.elapsed() > JOB_TIMEOUT {
-            let _ = client.post(format!("{base_url}/jobs/{job_id}/cancel")).send().await;
+            let _ = client
+                .post(format!("{base_url}/jobs/{job_id}/cancel"))
+                .send()
+                .await;
             return Err("SAM-Audio did not finish within 30 minutes.".into());
         }
         let response = client
@@ -516,13 +629,20 @@ async fn poll_job(
             .await
             .map_err(|error| format!("Could not read SAM-Audio job status: {error}"))?;
         if !response.status().is_success() {
-            return Err(format!("SAM-Audio job status failed with {}.", response.status()));
+            return Err(format!(
+                "SAM-Audio job status failed with {}.",
+                response.status()
+            ));
         }
         let status = response
             .json::<RemoteJobStatus>()
             .await
             .map_err(|error| format!("SAM-Audio returned malformed job status: {error}"))?;
-        let phase = if status.phase.is_empty() { status.status.as_str() } else { status.phase.as_str() };
+        let phase = if status.phase.is_empty() {
+            status.status.as_str()
+        } else {
+            status.phase.as_str()
+        };
         let message = match phase {
             "waiting" | "queued" => "Waiting for the SAM-Audio worker…".to_string(),
             "loading" => "Loading the SAM-Audio model…".to_string(),
@@ -533,10 +653,23 @@ async fn poll_job(
             "writing" => "Writing separated audio…".to_string(),
             _ => "Processing selected audio…".to_string(),
         };
-        emit_progress(app, pending, phase, &message, status.progress.clamp(0.0, 1.0), status.chunk, status.chunks, started);
+        emit_progress(
+            app,
+            pending,
+            phase,
+            &message,
+            status.progress.clamp(0.0, 1.0),
+            status.chunk,
+            status.chunks,
+            started,
+        );
         match status.status.as_str() {
             "done" => return Ok(status),
-            "error" => return Err(status.error.unwrap_or_else(|| "SAM-Audio separation failed.".into())),
+            "error" => {
+                return Err(status
+                    .error
+                    .unwrap_or_else(|| "SAM-Audio separation failed.".into()))
+            }
             "cancelled" => return Err("Track split cancelled.".into()),
             _ => tokio::time::sleep(POLL_INTERVAL).await,
         }
@@ -557,7 +690,10 @@ async fn download_artifact(
         .await
         .map_err(|error| format!("Could not download {artifact}: {error}"))?;
     if !response.status().is_success() {
-        return Err(format!("SAM-Audio {artifact} download failed with {}.", response.status()));
+        return Err(format!(
+            "SAM-Audio {artifact} download failed with {}.",
+            response.status()
+        ));
     }
     let bytes = response.bytes().await.map_err(|error| error.to_string())?;
     fs::write(output, bytes).map_err(|error| format!("Could not save {artifact}: {error}"))
@@ -637,13 +773,19 @@ fn render_raw_track_region(
         if overlap_end <= overlap_start {
             continue;
         }
-        let source_id = clip.source_file_id.as_deref().unwrap_or(track.source_file_id.as_str());
+        let source_id = clip
+            .source_file_id
+            .as_deref()
+            .unwrap_or(track.source_file_id.as_str());
         let source = sources
             .get(source_id)
             .ok_or_else(|| format!("Audio source {source_id} is missing."))?;
         let (header, samples) = read_cache_all(Path::new(&source.cache_path))?;
         if header.sample_rate != session.sample_rate {
-            return Err(format!("Source `{}` has an unexpected sample rate.", source.original_name));
+            return Err(format!(
+                "Source `{}` has an unexpected sample rate.",
+                source.original_name
+            ));
         }
         let source_start = clip
             .source_offset_sample
@@ -678,7 +820,9 @@ fn render_raw_track_region(
     };
     let mut writer = WavWriter::create(output_path, spec).map_err(|error| error.to_string())?;
     for sample in &output {
-        writer.write_sample(sample.clamp(-1.0, 1.0)).map_err(|error| error.to_string())?;
+        writer
+            .write_sample(sample.clamp(-1.0, 1.0))
+            .map_err(|error| error.to_string())?;
     }
     writer.finalize().map_err(|error| error.to_string())?;
     Ok(build_peaks(&output))
@@ -702,7 +846,12 @@ fn build_peaks(samples: &[f32]) -> Vec<f32> {
     let width = samples.len().div_ceil(BINS).max(1);
     samples
         .chunks(width)
-        .map(|chunk| chunk.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs())).min(1.0))
+        .map(|chunk| {
+            chunk
+                .iter()
+                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()))
+                .min(1.0)
+        })
         .collect()
 }
 
@@ -747,11 +896,17 @@ fn extracted_track_name(prompt: &str) -> String {
         .find_map(|prefix| lower.strip_prefix(prefix).map(|_| &trimmed[prefix.len()..]))
         .unwrap_or(trimmed)
         .trim();
-    if subject.is_empty() { "Extracted audio".into() } else { format!("Extracted - {subject}") }
+    if subject.is_empty() {
+        "Extracted audio".into()
+    } else {
+        format!("Extracted - {subject}")
+    }
 }
 
 fn split_track_color(index: usize) -> String {
-    const COLORS: &[&str] = &["#e6be63", "#62c98a", "#d47ac7", "#68b7d4", "#d9826b", "#8ea7e8"];
+    const COLORS: &[&str] = &[
+        "#e6be63", "#62c98a", "#d47ac7", "#68b7d4", "#d9826b", "#8ea7e8",
+    ];
     COLORS[index % COLORS.len()].to_string()
 }
 
@@ -811,7 +966,10 @@ mod tests {
 
     #[test]
     fn extracted_name_removes_command_prefix() {
-        assert_eq!(extracted_track_name("extract solo guitar"), "Extracted - solo guitar");
+        assert_eq!(
+            extracted_track_name("extract solo guitar"),
+            "Extracted - solo guitar"
+        );
         assert_eq!(extracted_track_name("vocals"), "Extracted - vocals");
     }
 
@@ -832,15 +990,34 @@ mod tests {
             }]),
         );
         let replacement = ClipRegion {
-            id: "replacement".into(), source_file_id: Some("residual".into()),
-            name: None, start_sample: 30, end_sample: 70,
-            source_offset_sample: 0, gain_db: 0.0,
+            id: "replacement".into(),
+            source_file_id: Some("residual".into()),
+            name: None,
+            start_sample: 30,
+            end_sample: 70,
+            source_offset_sample: 0,
+            gain_db: 0.0,
         };
-        let clips = replace_range_with_clip(&session, &session.tracks[0], 30, 70, replacement).unwrap();
+        let clips =
+            replace_range_with_clip(&session, &session.tracks[0], 30, 70, replacement).unwrap();
         assert_eq!(clips.len(), 3);
-        assert_eq!((clips[0].start_sample, clips[0].end_sample, clips[0].source_offset_sample), (0, 30, 10));
+        assert_eq!(
+            (
+                clips[0].start_sample,
+                clips[0].end_sample,
+                clips[0].source_offset_sample
+            ),
+            (0, 30, 10)
+        );
         assert_eq!((clips[1].start_sample, clips[1].end_sample), (30, 70));
-        assert_eq!((clips[2].start_sample, clips[2].end_sample, clips[2].source_offset_sample), (70, 100, 80));
+        assert_eq!(
+            (
+                clips[2].start_sample,
+                clips[2].end_sample,
+                clips[2].source_offset_sample
+            ),
+            (70, 100, 80)
+        );
     }
 
     #[test]
@@ -851,9 +1028,14 @@ mod tests {
         let samples = vec![0.5_f32; 100];
         crate::engine::source::cache::write_cache(
             &cache,
-            &crate::engine::source::cache::CacheHeader { channels: 1, sample_rate: 48000, frames: 100 },
+            &crate::engine::source::cache::CacheHeader {
+                channels: 1,
+                sample_rate: 48000,
+                frames: 100,
+            },
             &samples,
-        ).unwrap();
+        )
+        .unwrap();
         let session = test_session(
             &cache,
             serde_json::json!([{
@@ -864,9 +1046,13 @@ mod tests {
         let peaks = render_raw_track_region(&session, &session.tracks[0], 0, 100, &wav).unwrap();
         let decoded = decode_file(&wav).unwrap();
         assert_eq!(decoded.samples.len(), 100);
-        assert!(decoded.samples[..20].iter().all(|sample| sample.abs() < 1e-6));
+        assert!(decoded.samples[..20]
+            .iter()
+            .all(|sample| sample.abs() < 1e-6));
         assert!((decoded.samples[30] - 0.25).abs() < 0.002);
-        assert!(decoded.samples[80..].iter().all(|sample| sample.abs() < 1e-6));
+        assert!(decoded.samples[80..]
+            .iter()
+            .all(|sample| sample.abs() < 1e-6));
         assert!(!peaks.is_empty());
         let _ = fs::remove_file(cache);
         let _ = fs::remove_file(wav);

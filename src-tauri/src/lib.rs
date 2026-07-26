@@ -1,12 +1,12 @@
-pub mod actions;
 pub mod ab_judge;
+pub mod actions;
 pub mod assistant;
 pub mod audio;
 pub mod audio_service;
 pub mod auto_mix;
 pub mod camera_capture;
-pub mod clip_transfer;
 pub mod capabilities;
+pub mod clip_transfer;
 pub mod commands;
 pub mod config;
 pub mod control;
@@ -22,9 +22,9 @@ pub mod web;
 use std::sync::{Arc, Mutex};
 
 use audio_service::AudioService;
-use hermes_service::HermesService;
 use config::Config;
 use engine::AudioEngine;
+use hermes_service::HermesService;
 use store::SessionStore;
 use tauri::{
     menu::{Menu, MenuItemBuilder, MenuItemKind, PredefinedMenuItem},
@@ -41,27 +41,18 @@ pub struct AppState {
     pub input_monitor: Mutex<Option<recorder::InputMonitorHandle>>,
 }
 
-/// Build the full app menu (default + Edit extras + a dynamic File submenu with
-/// album/song switching) and set it. Called at setup and whenever the frontend's
-/// album/song list changes via the `set_file_menu` command. macOS menu mutation
+/// Build the full app menu (default + Edit extras + the open album's songs) and
+/// set it. Called at setup and whenever the frontend's document state changes.
+/// macOS menu mutation
 /// must happen on the main thread.
 pub fn build_and_set_menu(
     app: &tauri::AppHandle,
-    albums: &[commands::MenuEntry],
+    _albums: &[commands::MenuEntry],
     sessions: &[commands::MenuEntry],
-    current_album: &str,
+    _current_album: &str,
     current_session: &str,
 ) -> tauri::Result<()> {
     use tauri::menu::{CheckMenuItemBuilder, SubmenuBuilder};
-
-    let mut albums_b = SubmenuBuilder::new(app, "Recent Albums");
-    for a in albums {
-        let item = CheckMenuItemBuilder::with_id(format!("album::{}", a.id), a.name.as_str())
-            .checked(a.id == current_album)
-            .build(app)?;
-        albums_b = albums_b.item(&item);
-    }
-    let albums_sub = albums_b.build()?;
 
     let mut songs_b = SubmenuBuilder::new(app, "Songs");
     for s in sessions {
@@ -75,15 +66,14 @@ pub fn build_and_set_menu(
     let file = SubmenuBuilder::new(app, "Project")
         .text("file_new_album", "New Album…")
         .text("file_open_album", "Open Album…")
-        .text("file_new_song", "New Song")
+        .text("file_close_album", "Close Album")
         .separator()
-        .item(&albums_sub)
+        .text("file_new_song", "New Song")
         .item(&songs_sub)
         .separator()
         .text("file_rename_album", "Rename Album")
         .text("file_rename_song", "Rename Song")
         .separator()
-        .text("file_delete_album", "Delete Album")
         .text("file_delete_song", "Delete Song")
         .separator()
         .text("file_save_bundle", "Save Project Bundle…")
@@ -96,7 +86,9 @@ pub fn build_and_set_menu(
     // their visible TEXT instead.
     let find_submenu = |title: &str| -> Option<tauri::menu::Submenu<tauri::Wry>> {
         menu.items().ok()?.into_iter().find_map(|item| match item {
-            MenuItemKind::Submenu(sub) if sub.text().map(|t| t == title).unwrap_or(false) => Some(sub),
+            MenuItemKind::Submenu(sub) if sub.text().map(|t| t == title).unwrap_or(false) => {
+                Some(sub)
+            }
             _ => None,
         })
     };
@@ -113,8 +105,7 @@ pub fn build_and_set_menu(
     let sync_tracks = MenuItemBuilder::with_id("edit_sync_tracks", "Sync Tracks to Reference…")
         .accelerator("CmdOrCtrl+Shift+Y")
         .build(app)?;
-    let split_track = MenuItemBuilder::with_id("edit_split_track", "Split Track…")
-        .build(app)?;
+    let split_track = MenuItemBuilder::with_id("edit_split_track", "Split Track…").build(app)?;
     if let Some(edit) = find_submenu("Edit") {
         edit.append(&PredefinedMenuItem::separator(app)?)?;
         edit.append(&detect)?;
@@ -173,10 +164,6 @@ pub fn run() {
             build_and_set_menu(&handle, &[], &[], "", "")?;
             app.on_menu_event(|app, event| {
                 let id = event.id().as_ref();
-                if let Some(album_id) = id.strip_prefix("album::") {
-                    let _ = app.emit("menu:open-album", serde_json::json!({ "id": album_id }));
-                    return;
-                }
                 if let Some(song_id) = id.strip_prefix("song::") {
                     let _ = app.emit("menu:open-song", serde_json::json!({ "id": song_id }));
                     return;
@@ -188,10 +175,10 @@ pub fn run() {
                     "edit_split_track" => "menu:split-track",
                     "file_new_album" => "menu:new-album",
                     "file_open_album" => "menu:open-album",
+                    "file_close_album" => "menu:close-album",
                     "file_new_song" => "menu:new-song",
                     "file_rename_album" => "menu:rename-album",
                     "file_rename_song" => "menu:rename-song",
-                    "file_delete_album" => "menu:delete-album",
                     "file_delete_song" => "menu:delete-song",
                     "file_save_bundle" => "menu:save-bundle",
                     "file_open_bundle" => "menu:open-bundle",
@@ -238,13 +225,11 @@ pub fn run() {
             commands::list_sessions,
             commands::create_session,
             commands::list_albums,
-            commands::list_recents,
             commands::create_album,
             commands::open_album,
-            commands::create_default_session,
             commands::get_album,
             commands::rename_album,
-            commands::delete_album,
+            commands::close_album,
             commands::set_file_menu,
             commands::get_project,
             commands::import_audio_files,

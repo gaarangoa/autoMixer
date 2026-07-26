@@ -30,14 +30,18 @@ pub fn write_cache(path: &Path, header: &CacheHeader, samples: &[f32]) -> Result
     }
     let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     let mut w = BufWriter::new(file);
-    w.write_all(&MAGIC.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&VERSION.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&header.channels.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&header.sample_rate.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&header.frames.to_le_bytes()).map_err(|e| e.to_string())?;
-    let bytes = unsafe {
-        std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 4)
-    };
+    w.write_all(&MAGIC.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    w.write_all(&VERSION.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    w.write_all(&header.channels.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    w.write_all(&header.sample_rate.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    w.write_all(&header.frames.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    let bytes =
+        unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 4) };
     w.write_all(bytes).map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())?;
     Ok(())
@@ -68,10 +72,16 @@ pub fn read_cache_all(path: &Path) -> Result<(CacheHeader, Vec<f32>), String> {
 
     let total = (frames as usize) * channels as usize;
     let mut samples = vec![0.0f32; total];
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(samples.as_mut_ptr() as *mut u8, total * 4)
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(samples.as_mut_ptr() as *mut u8, total * 4) };
     r.read_exact(bytes).map_err(|e| e.to_string())?;
 
-    Ok((CacheHeader { channels, sample_rate, frames }, samples))
+    Ok((
+        CacheHeader {
+            channels,
+            sample_rate,
+            frames,
+        },
+        samples,
+    ))
 }

@@ -24,7 +24,7 @@ pub struct Config {
 }
 
 fn default_video_base_url() -> String {
-    "http://127.0.0.1:2256".to_string()
+    "http://127.0.0.1:2261".to_string()
 }
 
 fn default_video_model() -> String {
@@ -51,13 +51,19 @@ pub struct WebConfig {
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { block_size: 512, output_device: None }
+        Self {
+            block_size: 512,
+            output_device: None,
+        }
     }
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".to_string(), port: 5178 }
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 5178,
+        }
     }
 }
 
@@ -102,7 +108,7 @@ impl Default for Config {
             data_dir: dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("automixer"),
-            ollama_base_url: "http://127.0.0.1:2256".to_string(),
+            ollama_base_url: "http://127.0.0.1:2261".to_string(),
             ollama_model: "qwen3.6-35b-a3b".to_string(),
             video_base_url: default_video_base_url(),
             video_model: default_video_model(),

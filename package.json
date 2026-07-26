@@ -9,6 +9,10 @@
     "dev:web": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc --noEmit && vite build",
     "test:timeline": "node --experimental-strip-types --test tests/timeline.test.ts",
+    "models:start": "bash model-service/start.sh",
+    "models:stop": "bash model-service/stop.sh",
+    "models:status": "bash model-service/status.sh",
+    "models:install": "bash model-service/launchd.sh install",
     "tauri": "tauri"
   },
   "dependencies": {

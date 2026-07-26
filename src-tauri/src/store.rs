@@ -9,30 +9,41 @@ use crate::{
     actions::record_patch,
     defaults::{default_master, make_track},
     engine::source::{import_to_session_rate, write_to_cache, ImportedAudio},
-    model::{ClipRegion, HistorySource, JsonPatchOp, MixAlbum, MixProject, MixSession, SourceFile, TrackAnalysis, TrackKind, VideoClipRegion, VideoLayout, VideoSourceFile},
+    model::{
+        ClipRegion, HistorySource, JsonPatchOp, MixAlbum, MixProject, MixSession, SourceFile,
+        TrackAnalysis, TrackKind, VideoClipRegion, VideoLayout, VideoSourceFile,
+    },
 };
 
 pub(crate) const SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS: f64 = 180.0;
-
-/// A recently opened/created album: its id, display name, and on-disk folder.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RecentAlbum {
-    pub id: String,
-    pub name: String,
-    pub path: String,
-}
+const ALBUM_MANIFEST: &str = "album.json";
+const SONG_MANIFEST: &str = "song.json";
+const AUDIO_DIR: &str = "Audio";
+const PEAKS_DIR: &str = "Peaks";
+const RECORDINGS_DIR: &str = "Recordings";
+const VIDEO_DIR: &str = "Video";
+const RENDERS_DIR: &str = "Renders";
 
 fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let trimmed = cleaned.trim();
-    if trimmed.is_empty() { "Untitled Album".to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        "Untitled".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
-/// A non-colliding album folder named after `name` inside `parent`.
-fn unique_album_dir(parent: &Path, name: &str) -> PathBuf {
+fn unique_named_dir(parent: &Path, name: &str) -> PathBuf {
     let base = sanitize_name(name);
     let mut candidate = parent.join(&base);
     let mut n = 2;
@@ -43,16 +54,20 @@ fn unique_album_dir(parent: &Path, name: &str) -> PathBuf {
     candidate
 }
 
-/// Given an album folder, its songs/ dir, or a song file inside it, return the
-/// album folder (the dir containing album.json).
+/// Given an album folder, a song folder, or a manifest inside either one,
+/// return the directory containing album.json.
 fn resolve_album_dir(path: &Path) -> Option<PathBuf> {
-    let mut dir = if path.is_file() { path.parent()?.to_path_buf() } else { path.to_path_buf() };
+    let mut dir = if path.is_file() {
+        path.parent()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
     for _ in 0..3 {
-        if dir.join("album.json").is_file() {
+        if dir.join(ALBUM_MANIFEST).is_file() {
             return Some(dir);
         }
         match dir.parent() {
-            Some(p) => dir = p.to_path_buf(),
+            Some(parent) => dir = parent.to_path_buf(),
             None => break,
         }
     }
@@ -61,31 +76,45 @@ fn resolve_album_dir(path: &Path) -> Option<PathBuf> {
 
 pub struct SessionStore {
     data_dir: PathBuf,
-    /// album id -> on-disk album folder (user-chosen, document model).
+    /// Zero or one explicitly opened album. This is intentionally not persisted:
+    /// AutoMixer starts without a library and waits for the user to open a folder.
     album_index: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
 }
 
 impl SessionStore {
     pub fn new(data_dir: PathBuf) -> Self {
-        let store = Self { data_dir, album_index: std::sync::Mutex::new(std::collections::HashMap::new()) };
+        let store = Self {
+            data_dir,
+            album_index: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
         let _ = store.init();
-        store.index_recent_albums();
-        let _ = store.migrate_legacy_albums();
-        let _ = store.migrate_legacy_sessions();
         store
     }
 
     pub fn init(&self) -> Result<(), String> {
-        fs::create_dir_all(self.albums_dir()).map_err(|error| error.to_string())?;
-        fs::create_dir_all(self.sources_dir()).map_err(|error| error.to_string())?;
-        fs::create_dir_all(self.peaks_dir()).map_err(|error| error.to_string())?;
-        fs::create_dir_all(self.videos_dir()).map_err(|error| error.to_string())?;
-        fs::create_dir_all(self.renders_dir()).map_err(|error| error.to_string())?;
-        Ok(())
+        fs::create_dir_all(&self.data_dir).map_err(|error| error.to_string())
+    }
+
+    /// Create a task-safe store handle that knows only about the album currently
+    /// open in this process. This is deliberately ephemeral and never persisted.
+    pub fn clone_open_handle(&self) -> Result<Self, String> {
+        let album_index = self
+            .album_index
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
+        Ok(Self {
+            data_dir: self.data_dir.clone(),
+            album_index: std::sync::Mutex::new(album_index),
+        })
     }
 
     pub fn create_session(&self, album_id: &str, name: String) -> Result<MixProject, String> {
-        self.init()?;
+        let album_dir = self
+            .album_dir(album_id)
+            .ok_or_else(|| "Open or create an album before creating a song.".to_string())?;
+        let song_dir = unique_named_dir(&album_dir, &name);
+        self.create_song_layout(&song_dir)?;
         let session = MixSession {
             id: Uuid::new_v4().to_string(),
             name,
@@ -105,53 +134,46 @@ impl SessionStore {
             mixer_profile: crate::model::MixerProfile::default(),
             video_canvas: crate::model::VideoCanvas::default(),
         };
-        let project = MixProject { session, history: Vec::new(), redo_stack: Vec::new(), chat_messages: Vec::new() };
-        self.save(&project)?;
+        let project = MixProject {
+            session,
+            history: Vec::new(),
+            redo_stack: Vec::new(),
+            chat_messages: Vec::new(),
+        };
+        fs::write(
+            song_dir.join(SONG_MANIFEST),
+            serde_json::to_string_pretty(&project).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
         self.add_song_to_album(album_id, &project.session.id)?;
         Ok(project)
     }
 
-    /// Every song across all albums (used by the headless web/agent surface).
     pub fn list_all_sessions(&self) -> Result<Vec<MixSession>, String> {
-        self.init()?;
-        let mut out = Vec::new();
-        for album in self.list_albums()? {
-            out.extend(self.list_sessions(&album.id)?);
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        let Some(album) = self.list_albums()?.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        self.list_sessions(&album.id)
     }
 
-    /// Create a song in the default album (for callers without an album context).
-    pub fn create_session_default(&self, name: String) -> Result<MixProject, String> {
-        let album_id = self.default_album_id()?;
-        self.create_session(&album_id, name)
-    }
-
-    /// List the songs (sessions) in one album, in the album's stored order.
     pub fn list_sessions(&self, album_id: &str) -> Result<Vec<MixSession>, String> {
-        self.init()?;
         let album = self.get_album(album_id)?;
-        let songs_dir = self.album_dir(album_id).ok_or_else(|| format!("Album {album_id} not open"))?.join("songs");
-        let mut by_id: std::collections::HashMap<String, MixSession> = std::collections::HashMap::new();
-        if songs_dir.is_dir() {
-            for entry in fs::read_dir(&songs_dir).map_err(|error| error.to_string())? {
-                let path = entry.map_err(|error| error.to_string())?.path();
-                if path.extension().and_then(|item| item.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(raw) = fs::read_to_string(&path) {
-                    if let Ok(project) = serde_json::from_str::<MixProject>(&raw) {
-                        by_id.insert(project.session.id.clone(), project.session);
-                    }
+        let album_dir = self
+            .album_dir(album_id)
+            .ok_or_else(|| format!("Album {album_id} is not open"))?;
+        let mut by_id: std::collections::HashMap<String, MixSession> =
+            std::collections::HashMap::new();
+        for path in self.song_manifest_paths(&album_dir)? {
+            if let Ok(raw) = fs::read_to_string(path) {
+                if let Ok(project) = serde_json::from_str::<MixProject>(&raw) {
+                    by_id.insert(project.session.id.clone(), project.session);
                 }
             }
         }
-        // Ordered by song_order first, then any stragglers by name.
-        let mut sessions: Vec<MixSession> = Vec::new();
+        let mut sessions = Vec::new();
         for id in &album.song_order {
-            if let Some(s) = by_id.remove(id) {
-                sessions.push(s);
+            if let Some(session) = by_id.remove(id) {
+                sessions.push(session);
             }
         }
         let mut rest: Vec<MixSession> = by_id.into_values().collect();
@@ -161,75 +183,32 @@ impl SessionStore {
     }
 
     pub fn get_project(&self, session_id: &str) -> Result<MixProject, String> {
-        self.init()?;
         let path = self
             .locate_session_file(session_id)
-            .ok_or_else(|| format!("Session {session_id} not found"))?;
-        let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        serde_json::from_str(&raw).map_err(|error| error.to_string())
+            .ok_or_else(|| format!("Session {session_id} not found in the open album"))?;
+        let raw = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let mut project: MixProject =
+            serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        if let Some(song_dir) = path.parent() {
+            Self::resolve_project_paths(&mut project, song_dir);
+        }
+        Ok(project)
     }
 
     pub fn save(&self, project: &MixProject) -> Result<(), String> {
-        self.init()?;
-        // Path follows the session's album folder. If the album isn't known (legacy
-        // or orphan), fall back to (and adopt) the default app-managed album.
-        let dir = match self.album_dir(&project.session.album_id) {
-            Some(d) => d,
-            None => {
-                let id = self.default_album_id()?;
-                self.album_dir(&id).ok_or_else(|| "default album folder missing".to_string())?
-            }
-        };
-        let songs_dir = dir.join("songs");
-        fs::create_dir_all(&songs_dir).map_err(|error| error.to_string())?;
-        let path = songs_dir.join(format!("{}.json", project.session.id));
-        fs::write(path, serde_json::to_string_pretty(project).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())
-    }
-
-    // ---- Album folders (document model — user-chosen locations) -------------
-
-    fn recents_path(&self) -> PathBuf {
-        self.data_dir.join("recents.json")
-    }
-
-    fn read_recents(&self) -> Vec<RecentAlbum> {
-        fs::read_to_string(self.recents_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
-    }
-
-    fn write_recents(&self, recents: &[RecentAlbum]) {
-        if let Ok(json) = serde_json::to_string_pretty(recents) {
-            let _ = fs::write(self.recents_path(), json);
-        }
-    }
-
-    /// Record an album at the front of the recents list (deduped, capped).
-    fn add_recent(&self, id: &str, name: &str, path: &Path) {
-        let mut recents = self.read_recents();
-        recents.retain(|r| r.id != id && Path::new(&r.path) != path);
-        recents.insert(0, RecentAlbum { id: id.to_string(), name: name.to_string(), path: path.to_string_lossy().to_string() });
-        recents.truncate(24);
-        self.write_recents(&recents);
-    }
-
-    /// Load every recent album's folder into the id->path index (dropping any
-    /// whose folder/manifest has gone missing).
-    fn index_recent_albums(&self) {
-        let recents = self.read_recents();
-        let mut still_valid = Vec::new();
-        if let Ok(mut index) = self.album_index.lock() {
-            for r in recents {
-                let dir = PathBuf::from(&r.path);
-                if dir.join("album.json").is_file() {
-                    index.insert(r.id.clone(), dir);
-                    still_valid.push(r);
-                }
-            }
-        }
-        self.write_recents(&still_valid);
+        let path = self
+            .locate_session_file(&project.session.id)
+            .ok_or_else(|| format!("Session {} not found in the open album", project.session.id))?;
+        let song_dir = path
+            .parent()
+            .ok_or_else(|| "Song project has no parent directory.".to_string())?;
+        let mut portable = project.clone();
+        Self::make_project_paths_relative(&mut portable, song_dir);
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&portable).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
     }
 
     fn album_dir(&self, album_id: &str) -> Option<PathBuf> {
@@ -238,95 +217,143 @@ impl SessionStore {
 
     fn register_album(&self, id: &str, dir: &Path) {
         if let Ok(mut index) = self.album_index.lock() {
+            index.clear();
             index.insert(id.to_string(), dir.to_path_buf());
         }
     }
 
     fn album_manifest_path(&self, album_id: &str) -> Option<PathBuf> {
-        self.album_dir(album_id).map(|d| d.join("album.json"))
+        self.album_dir(album_id).map(|dir| dir.join(ALBUM_MANIFEST))
     }
 
-    /// Find the on-disk file for a session by scanning every open album folder.
+    fn song_manifest_paths(&self, album_dir: &Path) -> Result<Vec<PathBuf>, String> {
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(album_dir).map_err(|error| error.to_string())? {
+            let child = entry.map_err(|error| error.to_string())?.path();
+            let manifest = child.join(SONG_MANIFEST);
+            if child.is_dir() && manifest.is_file() {
+                paths.push(manifest);
+            }
+        }
+        // Read-only compatibility with the former `songs/<id>.json` layout.
+        let legacy = album_dir.join("songs");
+        if legacy.is_dir() {
+            for entry in fs::read_dir(legacy).map_err(|error| error.to_string())? {
+                let path = entry.map_err(|error| error.to_string())?.path();
+                if path.extension().and_then(|item| item.to_str()) == Some("json") {
+                    paths.push(path);
+                }
+            }
+        }
+        Ok(paths)
+    }
+
     fn locate_session_file(&self, session_id: &str) -> Option<PathBuf> {
         let dirs: Vec<PathBuf> = self.album_index.lock().ok()?.values().cloned().collect();
         for dir in dirs {
-            let candidate = dir.join("songs").join(format!("{session_id}.json"));
-            if candidate.is_file() {
-                return Some(candidate);
+            for candidate in self.song_manifest_paths(&dir).ok()? {
+                if let Ok(raw) = fs::read_to_string(&candidate) {
+                    if let Ok(project) = serde_json::from_str::<MixProject>(&raw) {
+                        if project.session.id == session_id {
+                            return Some(candidate);
+                        }
+                    }
+                }
             }
         }
         None
     }
 
-    /// All known (recent) albums, freshest first; drops any whose folder vanished.
+    /// Returns only the album explicitly opened in this process.
     pub fn list_albums(&self) -> Result<Vec<MixAlbum>, String> {
-        self.init()?;
+        let ids: Vec<String> = self
+            .album_index
+            .lock()
+            .map_err(|error| error.to_string())?
+            .keys()
+            .cloned()
+            .collect();
         let mut albums = Vec::new();
-        for r in self.read_recents() {
-            if let Ok(album) = self.get_album(&r.id) {
-                albums.push(album);
-            }
+        for id in ids {
+            albums.push(self.get_album(&id)?);
         }
         Ok(albums)
     }
 
-    pub fn list_recents(&self) -> Result<Vec<RecentAlbum>, String> {
-        Ok(self.read_recents())
-    }
-
     pub fn get_album(&self, album_id: &str) -> Result<MixAlbum, String> {
-        let manifest = self.album_manifest_path(album_id).ok_or_else(|| format!("Album {album_id} not open"))?;
-        let raw = fs::read_to_string(manifest).map_err(|_| format!("Album {album_id} not found on disk"))?;
+        let manifest = self
+            .album_manifest_path(album_id)
+            .ok_or_else(|| format!("Album {album_id} is not open"))?;
+        let raw = fs::read_to_string(manifest)
+            .map_err(|_| format!("Album {album_id} not found on disk"))?;
         serde_json::from_str(&raw).map_err(|error| error.to_string())
     }
 
     fn save_album(&self, album: &MixAlbum) -> Result<(), String> {
-        let dir = self.album_dir(&album.id).ok_or_else(|| format!("Album {} not open", album.id))?;
-        fs::create_dir_all(dir.join("songs")).map_err(|error| error.to_string())?;
+        let dir = self
+            .album_dir(&album.id)
+            .ok_or_else(|| format!("Album {} is not open", album.id))?;
         fs::write(
-            dir.join("album.json"),
+            dir.join(ALBUM_MANIFEST),
             serde_json::to_string_pretty(album).map_err(|error| error.to_string())?,
         )
-        .map_err(|error| error.to_string())?;
-        self.add_recent(&album.id, &album.name, &dir);
-        Ok(())
+        .map_err(|error| error.to_string())
     }
 
-    /// Create a new album folder named `name` inside `parent_dir` (document model).
     pub fn create_album_in(&self, parent_dir: &Path, name: String) -> Result<MixAlbum, String> {
-        let folder = unique_album_dir(parent_dir, &name);
-        fs::create_dir_all(folder.join("songs")).map_err(|error| error.to_string())?;
-        let album = MixAlbum { id: Uuid::new_v4().to_string(), name, song_order: Vec::new() };
+        fs::create_dir_all(parent_dir).map_err(|error| error.to_string())?;
+        let folder = unique_named_dir(parent_dir, &name);
+        fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+        let album = MixAlbum {
+            id: Uuid::new_v4().to_string(),
+            name,
+            song_order: Vec::new(),
+        };
         self.register_album(&album.id, &folder);
         self.save_album(&album)?;
         Ok(album)
     }
 
-    /// Open an existing album from its folder on disk.
     pub fn open_album(&self, path: &Path) -> Result<MixAlbum, String> {
-        // Accept either the album folder, or a song file / songs dir inside it.
-        let dir = resolve_album_dir(path).ok_or_else(|| format!("No album.json found at {}", path.display()))?;
-        let raw = fs::read_to_string(dir.join("album.json")).map_err(|error| error.to_string())?;
+        let dir = resolve_album_dir(path)
+            .ok_or_else(|| format!("No album.json found at {}", path.display()))?;
+        let raw =
+            fs::read_to_string(dir.join(ALBUM_MANIFEST)).map_err(|error| error.to_string())?;
         let album: MixAlbum = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         self.register_album(&album.id, &dir);
-        self.add_recent(&album.id, &album.name, &dir);
         Ok(album)
     }
 
     pub fn rename_album(&self, album_id: &str, new_name: String) -> Result<MixAlbum, String> {
         let mut album = self.get_album(album_id)?;
+        let old_dir = self
+            .album_dir(album_id)
+            .ok_or_else(|| format!("Album {album_id} is not open"))?;
+        let parent = old_dir
+            .parent()
+            .ok_or_else(|| "Album folder has no parent directory.".to_string())?;
+        let desired = parent.join(sanitize_name(&new_name));
+        let new_dir = if desired == old_dir {
+            old_dir.clone()
+        } else if desired.exists() {
+            unique_named_dir(parent, &new_name)
+        } else {
+            desired
+        };
+        if new_dir != old_dir {
+            fs::rename(&old_dir, &new_dir)
+                .map_err(|error| format!("Could not rename album folder: {error}"))?;
+            self.register_album(album_id, &new_dir);
+        }
         album.name = new_name;
         self.save_album(&album)?;
         Ok(album)
     }
 
-    /// Forget an album (remove from recents/index). Leaves the folder on disk.
-    pub fn delete_album(&self, album_id: &str) -> Result<(), String> {
+    pub fn close_album(&self, album_id: &str) -> Result<(), String> {
         if let Ok(mut index) = self.album_index.lock() {
             index.remove(album_id);
         }
-        let recents: Vec<RecentAlbum> = self.read_recents().into_iter().filter(|r| r.id != album_id).collect();
-        self.write_recents(&recents);
         Ok(())
     }
 
@@ -338,90 +365,122 @@ impl SessionStore {
         self.save_album(&album)
     }
 
-    /// A default app-managed album (in the data dir) for callers without a chosen
-    /// location (the headless web/agent surface, or orphan sessions).
-    fn default_album_id(&self) -> Result<String, String> {
-        if let Some(first) = self.read_recents().into_iter().next() {
-            if self.album_dir(&first.id).is_some() {
-                return Ok(first.id);
-            }
-        }
-        Ok(self.create_album_in(&self.albums_dir(), "My Album".to_string())?.id)
-    }
-
-    /// Register any pre-existing app-data albums (from the earlier in-app model)
-    /// into recents so users keep their albums after the move to the document model.
-    fn migrate_legacy_albums(&self) -> Result<(), String> {
-        let root = self.albums_dir();
-        if !root.is_dir() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
-            let dir = entry.map_err(|error| error.to_string())?.path();
-            let manifest = dir.join("album.json");
-            if !manifest.is_file() {
-                continue;
-            }
-            if let Ok(raw) = fs::read_to_string(&manifest) {
-                if let Ok(album) = serde_json::from_str::<MixAlbum>(&raw) {
-                    self.register_album(&album.id, &dir);
-                    self.add_recent(&album.id, &album.name, &dir);
-                }
-            }
+    fn create_song_layout(&self, song_dir: &Path) -> Result<(), String> {
+        for child in [AUDIO_DIR, PEAKS_DIR, RECORDINGS_DIR, VIDEO_DIR, RENDERS_DIR] {
+            fs::create_dir_all(song_dir.join(child)).map_err(|error| error.to_string())?;
         }
         Ok(())
     }
 
-    /// One-time migration: wrap pre-album `sessions/{id}.json` files into a default
-    /// album. No-ops once any album exists.
-    fn migrate_legacy_sessions(&self) -> Result<(), String> {
-        let legacy = self.sessions_dir();
-        if !legacy.is_dir() {
-            return Ok(());
-        }
-        if !self.read_recents().is_empty() {
-            return Ok(());
-        }
-        let mut legacy_files: Vec<PathBuf> = Vec::new();
-        for entry in fs::read_dir(&legacy).map_err(|error| error.to_string())? {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            if path.extension().and_then(|i| i.to_str()) == Some("json") {
-                legacy_files.push(path);
+    fn resolve_project_paths(project: &mut MixProject, song_dir: &Path) {
+        for source in &mut project.session.source_files {
+            let cache = PathBuf::from(&source.cache_path);
+            if cache.is_relative() {
+                source.cache_path = song_dir.join(cache).to_string_lossy().to_string();
+            }
+            let peaks = PathBuf::from(&source.peak_path);
+            if peaks.is_relative() {
+                source.peak_path = song_dir.join(peaks).to_string_lossy().to_string();
             }
         }
-        if legacy_files.is_empty() {
-            return Ok(());
-        }
-        let album = self.create_album_in(&self.albums_dir(), "My Album".to_string())?;
-        for path in legacy_files {
-            if let Ok(raw) = fs::read_to_string(&path) {
-                if let Ok(mut project) = serde_json::from_str::<MixProject>(&raw) {
-                    project.session.album_id = album.id.clone();
-                    self.save(&project)?;
-                    self.add_song_to_album(&album.id, &project.session.id)?;
-                    let _ = fs::remove_file(&path);
-                }
+        for source in &mut project.session.video_source_files {
+            let path = PathBuf::from(&source.path);
+            if path.is_relative() {
+                source.path = song_dir.join(path).to_string_lossy().to_string();
             }
         }
-        Ok(())
     }
 
-    pub fn add_source_file(&self, session_id: &str, source_path: &Path) -> Result<MixProject, String> {
+    fn make_project_paths_relative(project: &mut MixProject, song_dir: &Path) {
+        for source in &mut project.session.source_files {
+            source.cache_path = Self::relative_if_inside(&source.cache_path, song_dir);
+            source.peak_path = Self::relative_if_inside(&source.peak_path, song_dir);
+        }
+        for source in &mut project.session.video_source_files {
+            source.path = Self::relative_if_inside(&source.path, song_dir);
+        }
+    }
+
+    fn relative_if_inside(value: &str, song_dir: &Path) -> String {
+        match Path::new(value).strip_prefix(song_dir) {
+            Ok(relative) => relative.to_string_lossy().to_string(),
+            Err(_) => value.to_string(),
+        }
+    }
+
+    fn rebase_project_paths(project: &mut MixProject, old_dir: &Path, new_dir: &Path) {
+        for source in &mut project.session.source_files {
+            source.cache_path = Self::rebase_path(&source.cache_path, old_dir, new_dir);
+            source.peak_path = Self::rebase_path(&source.peak_path, old_dir, new_dir);
+        }
+        for source in &mut project.session.video_source_files {
+            source.path = Self::rebase_path(&source.path, old_dir, new_dir);
+        }
+    }
+
+    fn rebase_path(value: &str, old_dir: &Path, new_dir: &Path) -> String {
+        match Path::new(value).strip_prefix(old_dir) {
+            Ok(relative) => new_dir.join(relative).to_string_lossy().to_string(),
+            Err(_) => value.to_string(),
+        }
+    }
+
+    pub fn song_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        self.locate_session_file(session_id)
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .ok_or_else(|| format!("Session {session_id} not found in the open album"))
+    }
+
+    fn audio_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        Ok(self.song_dir(session_id)?.join(AUDIO_DIR))
+    }
+
+    fn peaks_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        Ok(self.song_dir(session_id)?.join(PEAKS_DIR))
+    }
+
+    pub fn recordings_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        Ok(self.song_dir(session_id)?.join(RECORDINGS_DIR))
+    }
+
+    pub fn videos_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        Ok(self.song_dir(session_id)?.join(VIDEO_DIR))
+    }
+
+    pub fn renders_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        Ok(self.song_dir(session_id)?.join(RENDERS_DIR))
+    }
+
+    pub fn add_source_file(
+        &self,
+        session_id: &str,
+        source_path: &Path,
+    ) -> Result<MixProject, String> {
         self.add_source_file_at(session_id, source_path, 0)
     }
 
     /// Import a wav into the cache (analysis + peaks) and return the SourceFile
     /// WITHOUT touching any session — used by transforms (e.g. tempo stretch) that
     /// register the file themselves.
-    pub fn import_source_standalone(&self, source_path: &Path, session_rate: u32) -> Result<SourceFile, String> {
-        let (source, _imported) = self.import_source(source_path, session_rate)?;
+    pub fn import_source_standalone(
+        &self,
+        session_id: &str,
+        source_path: &Path,
+        session_rate: u32,
+    ) -> Result<SourceFile, String> {
+        let (source, _imported) = self.import_source(session_id, source_path, session_rate)?;
         Ok(source)
     }
 
-    pub fn add_source_file_at(&self, session_id: &str, source_path: &Path, start_sample: u64) -> Result<MixProject, String> {
+    pub fn add_source_file_at(
+        &self,
+        session_id: &str,
+        source_path: &Path,
+        start_sample: u64,
+    ) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
         let session_rate = project.session.sample_rate;
-        let (source, _imported) = self.import_source(source_path, session_rate)?;
+        let (source, _imported) = self.import_source(session_id, source_path, session_rate)?;
         let source_id = source.id.clone();
 
         let track_name = strip_extension(&source.original_name);
@@ -434,20 +493,38 @@ impl SessionStore {
         Ok(project)
     }
 
-    pub fn create_recording_track(&self, session_id: &str, channels: u16) -> Result<MixProject, String> {
+    pub fn create_recording_track(
+        &self,
+        session_id: &str,
+        channels: u16,
+    ) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
         if project.session.minimum_timeline_seconds.is_none()
             && project.session.tracks.is_empty()
             && project.session.source_files.is_empty()
             && project.session.video_source_files.is_empty()
         {
-            project.session.minimum_timeline_seconds = Some(SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
+            project.session.minimum_timeline_seconds =
+                Some(SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
         }
-        let source = self.create_silent_source(project.session.sample_rate, "Recording", channels)?;
+        let source = self.create_silent_source(
+            session_id,
+            project.session.sample_rate,
+            "Recording",
+            channels,
+        )?;
         let source_id = source.id.clone();
         let track_index = project.session.tracks.len();
-        let label = if channels >= 2 { "Stereo Recording" } else { "Recording" };
-        let track = make_track(source_id, format!("{} {}", label, track_index + 1), track_index);
+        let label = if channels >= 2 {
+            "Stereo Recording"
+        } else {
+            "Recording"
+        };
+        let track = make_track(
+            source_id,
+            format!("{} {}", label, track_index + 1),
+            track_index,
+        );
         project.session.source_files.push(source);
         project.session.tracks.push(track);
         self.save(&project)?;
@@ -461,11 +538,21 @@ impl SessionStore {
             && project.session.source_files.is_empty()
             && project.session.video_source_files.is_empty()
         {
-            project.session.minimum_timeline_seconds = Some(SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
+            project.session.minimum_timeline_seconds =
+                Some(SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
         }
-        let source = self.create_silent_source(project.session.sample_rate, "Video Placeholder", 1)?;
+        let source = self.create_silent_source(
+            session_id,
+            project.session.sample_rate,
+            "Video Placeholder",
+            1,
+        )?;
         let source_id = source.id.clone();
-        let mut track = make_track(source_id, format!("Video {}", project.session.tracks.len() + 1), project.session.tracks.len());
+        let mut track = make_track(
+            source_id,
+            format!("Video {}", project.session.tracks.len() + 1),
+            project.session.tracks.len(),
+        );
         track.kind = TrackKind::Video;
         track.role = Some("video".into());
         track.solo = false;
@@ -488,7 +575,8 @@ impl SessionStore {
         duration_ms: u64,
     ) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
-        let placeholder = self.create_silent_source(project.session.sample_rate, &name, 1)?;
+        let placeholder =
+            self.create_silent_source(session_id, project.session.sample_rate, &name, 1)?;
         let placeholder_id = placeholder.id.clone();
         let mut track = make_track(placeholder_id, name.clone(), project.session.tracks.len());
         track.kind = TrackKind::Video;
@@ -497,8 +585,13 @@ impl SessionStore {
         track.record_camera_audio = false;
 
         let source_id = Uuid::new_v4().to_string();
-        let extension = video_path.extension().and_then(|item| item.to_str()).unwrap_or("mp4");
-        let destination = self.videos_dir().join(format!("{source_id}.{extension}"));
+        let extension = video_path
+            .extension()
+            .and_then(|item| item.to_str())
+            .unwrap_or("mp4");
+        let destination = self
+            .videos_dir(session_id)?
+            .join(format!("{source_id}.{extension}"));
         fs::copy(video_path, &destination)
             .map_err(|error| format!("Could not store rendered video: {error}"))?;
         let original_name = video_path
@@ -513,7 +606,8 @@ impl SessionStore {
             mime_type: "video/mp4".into(),
             duration_ms,
         };
-        let duration_samples = ((duration_ms as f64 / 1000.0) * project.session.sample_rate as f64).round() as u64;
+        let duration_samples =
+            ((duration_ms as f64 / 1000.0) * project.session.sample_rate as f64).round() as u64;
         track.video_clips.push(VideoClipRegion {
             id: Uuid::new_v4().to_string(),
             video_source_file_id: source_id.clone(),
@@ -560,8 +654,13 @@ impl SessionStore {
             .ok_or_else(|| format!("Unknown video clip {clip_id}"))?;
 
         let source_id = Uuid::new_v4().to_string();
-        let extension = video_path.extension().and_then(|item| item.to_str()).unwrap_or("mp4");
-        let destination = self.videos_dir().join(format!("{source_id}.{extension}"));
+        let extension = video_path
+            .extension()
+            .and_then(|item| item.to_str())
+            .unwrap_or("mp4");
+        let destination = self
+            .videos_dir(session_id)?
+            .join(format!("{source_id}.{extension}"));
         fs::copy(video_path, &destination)
             .map_err(|error| format!("Could not store rendered video: {error}"))?;
 
@@ -572,7 +671,8 @@ impl SessionStore {
         if clip.pristine_video_source_file_id.is_none() {
             clip.pristine_video_source_file_id = Some(clip.video_source_file_id.clone());
             clip.pristine_source_offset_ms = Some(clip.source_offset_ms);
-            clip.pristine_duration_samples = Some(clip.end_sample.saturating_sub(clip.start_sample));
+            clip.pristine_duration_samples =
+                Some(clip.end_sample.saturating_sub(clip.start_sample));
         }
         clip.video_source_file_id = source_id.clone();
         clip.source_offset_ms = 0;
@@ -637,8 +737,13 @@ impl SessionStore {
 
         // Stage the new render into the videos dir.
         let source_id = Uuid::new_v4().to_string();
-        let extension = video_path.extension().and_then(|item| item.to_str()).unwrap_or("mp4");
-        let destination = self.videos_dir().join(format!("{source_id}.{extension}"));
+        let extension = video_path
+            .extension()
+            .and_then(|item| item.to_str())
+            .unwrap_or("mp4");
+        let destination = self
+            .videos_dir(session_id)?
+            .join(format!("{source_id}.{extension}"));
         fs::copy(video_path, &destination)
             .map_err(|error| format!("Could not store rendered video: {error}"))?;
         let original_name = video_path
@@ -719,9 +824,10 @@ impl SessionStore {
             return Ok(project); // Nothing to revert.
         };
         let pristine_offset = clip.pristine_source_offset_ms.take().unwrap_or(0);
-        let pristine_duration = clip.pristine_duration_samples.take().unwrap_or_else(
-            || clip.end_sample.saturating_sub(clip.start_sample),
-        );
+        let pristine_duration = clip
+            .pristine_duration_samples
+            .take()
+            .unwrap_or_else(|| clip.end_sample.saturating_sub(clip.start_sample));
         clip.video_source_file_id = pristine_id;
         clip.source_offset_ms = pristine_offset;
         clip.end_sample = clip.start_sample + pristine_duration.max(1);
@@ -738,7 +844,7 @@ impl SessionStore {
     ) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
         let session_rate = project.session.sample_rate;
-        let (source, _imported) = self.import_source(source_path, session_rate)?;
+        let (source, _imported) = self.import_source(session_id, source_path, session_rate)?;
         let source_id = source.id.clone();
         let track = project
             .session
@@ -763,7 +869,7 @@ impl SessionStore {
     ) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
         let session_rate = project.session.sample_rate;
-        let (source, _imported) = self.import_source(source_path, session_rate)?;
+        let (source, _imported) = self.import_source(session_id, source_path, session_rate)?;
         let source_id = source.id.clone();
         let duration = source.duration_samples;
         let clip_name = strip_extension(&source.original_name);
@@ -771,7 +877,16 @@ impl SessionStore {
             .session
             .source_files
             .iter()
-            .find(|source| source.id == project.session.tracks.iter().find(|track| track.id == track_id).map(|track| track.source_file_id.as_str()).unwrap_or(""))
+            .find(|source| {
+                source.id
+                    == project
+                        .session
+                        .tracks
+                        .iter()
+                        .find(|track| track.id == track_id)
+                        .map(|track| track.source_file_id.as_str())
+                        .unwrap_or("")
+            })
             .cloned();
         let track = project
             .session
@@ -782,14 +897,18 @@ impl SessionStore {
         // Latency compensation: shift the new clip earlier by the configured ms so the
         // recorded transient lands where it was actually played, not when the buffer
         // arrived. Positive ms => earlier; negative => later.
-        let offset_samples = (track.input_latency_ms as f64 * session_rate as f64 / 1000.0).round() as i64;
+        let offset_samples =
+            (track.input_latency_ms as f64 * session_rate as f64 / 1000.0).round() as i64;
         let adjusted_start = if offset_samples >= 0 {
             start_sample.saturating_sub(offset_samples as u64)
         } else {
             start_sample.saturating_add((-offset_samples) as u64)
         };
         if track.clips.is_empty() && !track.clips_materialized {
-            if let Some(existing) = existing_source.as_ref().filter(|source| source.original_name != "Recording") {
+            if let Some(existing) = existing_source
+                .as_ref()
+                .filter(|source| source.original_name != "Recording")
+            {
                 track.clips.push(ClipRegion {
                     id: Uuid::new_v4().to_string(),
                     source_file_id: Some(existing.id.clone()),
@@ -838,8 +957,13 @@ impl SessionStore {
             return Err("Record video into a video track.".into());
         }
         let source_id = Uuid::new_v4().to_string();
-        let extension = video_path.extension().and_then(|item| item.to_str()).unwrap_or("webm");
-        let destination = self.videos_dir().join(format!("{source_id}.{extension}"));
+        let extension = video_path
+            .extension()
+            .and_then(|item| item.to_str())
+            .unwrap_or("webm");
+        let destination = self
+            .videos_dir(session_id)?
+            .join(format!("{source_id}.{extension}"));
         fs::copy(video_path, &destination)
             .map_err(|error| format!("Could not save video recording: {error}"))?;
         let source = VideoSourceFile {
@@ -850,9 +974,12 @@ impl SessionStore {
             duration_ms,
         };
         let playable_ms = duration_ms.saturating_sub(source_offset_ms).max(1);
-        let duration_samples = ((playable_ms as f64 / 1000.0) * project.session.sample_rate as f64).round() as u64;
+        let duration_samples =
+            ((playable_ms as f64 / 1000.0) * project.session.sample_rate as f64).round() as u64;
         // Latency compensation (see add_recording_clip).
-        let offset_samples = (track.input_latency_ms as f64 * project.session.sample_rate as f64 / 1000.0).round() as i64;
+        let offset_samples = (track.input_latency_ms as f64 * project.session.sample_rate as f64
+            / 1000.0)
+            .round() as i64;
         let adjusted_start = if offset_samples >= 0 {
             start_sample.saturating_sub(offset_samples as u64)
         } else {
@@ -875,7 +1002,12 @@ impl SessionStore {
         Ok(project)
     }
 
-    pub fn delete_clip(&self, session_id: &str, track_id: &str, clip_id: &str) -> Result<MixProject, String> {
+    pub fn delete_clip(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        clip_id: &str,
+    ) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
         let track_index = project
             .session
@@ -1072,9 +1204,12 @@ impl SessionStore {
                 let mut right = clip;
                 right.id = Uuid::new_v4().to_string();
                 right.start_sample = end_sample;
-                right.source_offset_ms = right
-                    .source_offset_ms
-                    .saturating_add(((end_sample.saturating_sub(clip_start) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64);
+                right.source_offset_ms = right.source_offset_ms.saturating_add(
+                    ((end_sample.saturating_sub(clip_start) as f64
+                        / project.session.sample_rate as f64)
+                        * 1000.0)
+                        .round() as u64,
+                );
                 next.push(right);
             }
         }
@@ -1103,7 +1238,12 @@ impl SessionStore {
         Ok(project)
     }
 
-    fn import_source(&self, source_path: &Path, session_rate: u32) -> Result<(SourceFile, ImportedAudio), String> {
+    fn import_source(
+        &self,
+        session_id: &str,
+        source_path: &Path,
+        session_rate: u32,
+    ) -> Result<(SourceFile, ImportedAudio), String> {
         let source_id = Uuid::new_v4().to_string();
         let original_name = source_path
             .file_name()
@@ -1113,10 +1253,14 @@ impl SessionStore {
 
         let imported = import_to_session_rate(source_path, session_rate)
             .map_err(|e| format!("import {original_name}: {e}"))?;
-        let cache_path = self.sources_dir().join(format!("{source_id}.f32cache"));
+        let cache_path = self
+            .audio_dir(session_id)?
+            .join(format!("{source_id}.f32cache"));
         write_to_cache(&cache_path, &imported)?;
 
-        let peak_path = self.peaks_dir().join(format!("{source_id}.peaks.json"));
+        let peak_path = self
+            .peaks_dir(session_id)?
+            .join(format!("{source_id}.peaks.json"));
         fs::write(
             &peak_path,
             serde_json::to_string(&imported.peaks).map_err(|error| error.to_string())?,
@@ -1143,25 +1287,52 @@ impl SessionStore {
 
     pub fn rename_session(&self, session_id: &str, new_name: String) -> Result<MixProject, String> {
         let mut project = self.get_project(session_id)?;
+        let manifest = self
+            .locate_session_file(session_id)
+            .ok_or_else(|| format!("Session {session_id} not found in the open album"))?;
+        let old_dir = manifest
+            .parent()
+            .ok_or_else(|| "Song project has no parent directory.".to_string())?
+            .to_path_buf();
+        let is_document_folder =
+            manifest.file_name().and_then(|name| name.to_str()) == Some(SONG_MANIFEST);
+        if is_document_folder {
+            let album_dir = old_dir
+                .parent()
+                .ok_or_else(|| "Song folder has no album directory.".to_string())?;
+            let desired = album_dir.join(sanitize_name(&new_name));
+            let new_dir = if desired == old_dir {
+                old_dir.clone()
+            } else if desired.exists() {
+                unique_named_dir(album_dir, &new_name)
+            } else {
+                desired
+            };
+            if new_dir != old_dir {
+                fs::rename(&old_dir, &new_dir)
+                    .map_err(|error| format!("Could not rename song folder: {error}"))?;
+                Self::rebase_project_paths(&mut project, &old_dir, &new_dir);
+            }
+        }
         project.session.name = new_name;
         self.save(&project)?;
         Ok(project)
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        let project = self.get_project(session_id)?;
         if let Some(path) = self.locate_session_file(session_id) {
-            // albums/{album_id}/songs/{id}.json → album id is the grandparent dir name.
-            let album_id = path
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string());
-            fs::remove_file(&path).map_err(|error| error.to_string())?;
-            if let Some(aid) = album_id {
-                if let Ok(mut album) = self.get_album(&aid) {
-                    album.song_order.retain(|id| id != session_id);
-                    let _ = self.save_album(&album);
-                }
+            if path.file_name().and_then(|name| name.to_str()) == Some(SONG_MANIFEST) {
+                let song_dir = path
+                    .parent()
+                    .ok_or_else(|| "Song project has no parent directory.".to_string())?;
+                fs::remove_dir_all(song_dir).map_err(|error| error.to_string())?;
+            } else {
+                fs::remove_file(&path).map_err(|error| error.to_string())?;
+            }
+            if let Ok(mut album) = self.get_album(&project.session.album_id) {
+                album.song_order.retain(|id| id != session_id);
+                self.save_album(&album)?;
             }
         }
         Ok(())
@@ -1194,7 +1365,10 @@ impl SessionStore {
         fs::create_dir_all(bundle_dir.join("videos")).map_err(|error| error.to_string())?;
         for src in &mut bundled.session.video_source_files {
             let video_src = PathBuf::from(&src.path);
-            let extension = video_src.extension().and_then(|item| item.to_str()).unwrap_or("webm");
+            let extension = video_src
+                .extension()
+                .and_then(|item| item.to_str())
+                .unwrap_or("webm");
             let video_rel = format!("videos/{}.{}", src.id, extension);
             let video_dst = bundle_dir.join(&video_rel);
             fs::copy(&video_src, &video_dst)
@@ -1221,76 +1395,85 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Import a bundle directory into the app's data directory and register
-    /// the session under a fresh id (so re-imports don't overwrite prior copies).
+    /// Import a portable bundle as a self-contained song in the open album.
     pub fn import_project_bundle(&self, bundle_dir: &Path) -> Result<MixProject, String> {
-        self.init()?;
         let project_path = bundle_dir.join("project.json");
         let raw = fs::read_to_string(&project_path).map_err(|e| {
-            format!("Could not read {} (not a project bundle?): {e}", project_path.display())
+            format!(
+                "Could not read {} (not a project bundle?): {e}",
+                project_path.display()
+            )
         })?;
-        let mut project: MixProject = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-
+        let mut project: MixProject =
+            serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        let album =
+            self.list_albums()?.into_iter().next().ok_or_else(|| {
+                "Open or create an album before importing a song bundle.".to_string()
+            })?;
         project.session.id = Uuid::new_v4().to_string();
-        project.session.album_id = self.default_album_id()?;
+        project.session.album_id = album.id.clone();
+        let album_dir = self
+            .album_dir(&album.id)
+            .ok_or_else(|| "The open album folder is unavailable.".to_string())?;
+        let song_dir = unique_named_dir(&album_dir, &project.session.name);
+        self.create_song_layout(&song_dir)?;
 
         for src in &mut project.session.source_files {
             let cache_src = bundle_dir.join(&src.cache_path);
-            let cache_dst = self.sources_dir().join(format!("{}.f32cache", src.id));
+            let cache_dst = song_dir
+                .join(AUDIO_DIR)
+                .join(format!("{}.f32cache", src.id));
             fs::copy(&cache_src, &cache_dst)
                 .map_err(|e| format!("import cache for {}: {e}", src.original_name))?;
             src.cache_path = cache_dst.to_string_lossy().to_string();
 
             let peak_src = bundle_dir.join(&src.peak_path);
-            let peak_dst = self.peaks_dir().join(format!("{}.peaks.json", src.id));
+            let peak_dst = song_dir
+                .join(PEAKS_DIR)
+                .join(format!("{}.peaks.json", src.id));
             fs::copy(&peak_src, &peak_dst)
                 .map_err(|e| format!("import peaks for {}: {e}", src.original_name))?;
             src.peak_path = peak_dst.to_string_lossy().to_string();
         }
         for src in &mut project.session.video_source_files {
             let video_src = bundle_dir.join(&src.path);
-            let extension = video_src.extension().and_then(|item| item.to_str()).unwrap_or("webm");
-            let video_dst = self.videos_dir().join(format!("{}.{}", src.id, extension));
+            let extension = video_src
+                .extension()
+                .and_then(|item| item.to_str())
+                .unwrap_or("webm");
+            let video_dst = song_dir
+                .join(VIDEO_DIR)
+                .join(format!("{}.{}", src.id, extension));
             fs::copy(&video_src, &video_dst)
                 .map_err(|e| format!("import video for {}: {e}", src.original_name))?;
             src.path = video_dst.to_string_lossy().to_string();
         }
 
-        self.save(&project)?;
+        let mut portable = project.clone();
+        Self::make_project_paths_relative(&mut portable, &song_dir);
+        fs::write(
+            song_dir.join(SONG_MANIFEST),
+            serde_json::to_string_pretty(&portable).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
         self.add_song_to_album(&project.session.album_id, &project.session.id)?;
         Ok(project)
     }
 
-    pub fn renders_dir(&self) -> PathBuf {
-        self.data_dir.join("renders")
-    }
-
-    fn albums_dir(&self) -> PathBuf {
-        self.data_dir.join("albums")
-    }
-
-    pub fn videos_dir(&self) -> PathBuf {
-        self.data_dir.join("recordings")
-    }
-
-    fn sessions_dir(&self) -> PathBuf {
-        self.data_dir.join("sessions")
-    }
-
-    fn sources_dir(&self) -> PathBuf {
-        self.data_dir.join("sources")
-    }
-
-    fn peaks_dir(&self) -> PathBuf {
-        self.data_dir.join("peaks")
-    }
-
-    fn create_silent_source(&self, sample_rate: u32, original_name: &str, channels: u16) -> Result<SourceFile, String> {
+    fn create_silent_source(
+        &self,
+        session_id: &str,
+        sample_rate: u32,
+        original_name: &str,
+        channels: u16,
+    ) -> Result<SourceFile, String> {
         let source_id = Uuid::new_v4().to_string();
         let frames = sample_rate as u64;
         let channels = channels.max(1).min(2);
         let samples = vec![0.0_f32; frames as usize * channels as usize];
-        let cache_path = self.sources_dir().join(format!("{source_id}.f32cache"));
+        let cache_path = self
+            .audio_dir(session_id)?
+            .join(format!("{source_id}.f32cache"));
         crate::engine::source::cache::write_cache(
             &cache_path,
             &crate::engine::source::cache::CacheHeader {
@@ -1301,7 +1484,9 @@ impl SessionStore {
             &samples,
         )?;
         let peaks = crate::engine::source::peaks::build_peaks(&samples, channels, sample_rate);
-        let peak_path = self.peaks_dir().join(format!("{source_id}.peaks.json"));
+        let peak_path = self
+            .peaks_dir(session_id)?
+            .join(format!("{source_id}.peaks.json"));
         fs::write(
             &peak_path,
             serde_json::to_string(&peaks).map_err(|error| error.to_string())?,
@@ -1327,11 +1512,7 @@ fn analyze_imported(imported: &ImportedAudio) -> TrackAnalysis {
 }
 
 fn analyze_samples(samples: &[f32], channels: u16, sample_rate: u32) -> TrackAnalysis {
-    let a = crate::engine::source::analysis::analyze(
-        samples,
-        channels,
-        sample_rate,
-    );
+    let a = crate::engine::source::analysis::analyze(samples, channels, sample_rate);
     TrackAnalysis {
         peak_db: a.peak_db,
         rms_db: a.rms_db,
@@ -1346,5 +1527,144 @@ fn analyze_samples(samples: &[f32], channels: u16, sample_rate: u32) -> TrackAna
 }
 
 fn strip_extension(name: &str) -> String {
-    name.rsplit_once('.').map(|(base, _)| base).unwrap_or(name).to_string()
+    name.rsplit_once('.')
+        .map(|(base, _)| base)
+        .unwrap_or(name)
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("automixer-{label}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn album_document_is_portable_and_never_reopens_implicitly() {
+        let root = test_root("album-document");
+        let internal = root.join("Internal");
+        let documents = root.join("Documents");
+        fs::create_dir_all(&documents).expect("create test documents directory");
+
+        let store = SessionStore::new(internal.clone());
+        assert!(store.list_albums().expect("list empty store").is_empty());
+
+        let album = store
+            .create_album_in(&documents, "Studio Album".to_string())
+            .expect("create album document");
+        let album_dir = documents.join("Studio Album");
+        assert!(album_dir.join(ALBUM_MANIFEST).is_file());
+        assert!(store
+            .list_sessions(&album.id)
+            .expect("list empty album")
+            .is_empty());
+
+        let song = store
+            .create_session(&album.id, "First Song".to_string())
+            .expect("create song");
+        let session_id = song.session.id.clone();
+        let song_dir = album_dir.join("First Song");
+        for path in [
+            song_dir.join(SONG_MANIFEST),
+            song_dir.join(AUDIO_DIR),
+            song_dir.join(PEAKS_DIR),
+            song_dir.join(RECORDINGS_DIR),
+            song_dir.join(VIDEO_DIR),
+            song_dir.join(RENDERS_DIR),
+        ] {
+            assert!(
+                path.exists(),
+                "expected portable song path {}",
+                path.display()
+            );
+        }
+
+        store
+            .create_recording_track(&session_id, 1)
+            .expect("create self-contained recording track");
+        let video_path = song_dir.join(VIDEO_DIR).join("portable-test.mp4");
+        fs::write(&video_path, b"portable video fixture").expect("write video fixture");
+        let mut with_video = store
+            .get_project(&session_id)
+            .expect("load song for video fixture");
+        with_video.session.video_source_files.push(VideoSourceFile {
+            id: Uuid::new_v4().to_string(),
+            original_name: "portable-test.mp4".to_string(),
+            path: video_path.to_string_lossy().to_string(),
+            mime_type: "video/mp4".to_string(),
+            duration_ms: 1,
+        });
+        store
+            .save(&with_video)
+            .expect("save portable video fixture");
+        let raw = fs::read_to_string(song_dir.join(SONG_MANIFEST)).expect("read song manifest");
+        assert!(raw.contains("\"Audio/"));
+        assert!(raw.contains("\"Peaks/"));
+        assert!(raw.contains("\"Video/portable-test.mp4\""));
+        assert!(!raw.contains(&root.to_string_lossy().to_string()));
+
+        store.close_album(&album.id).expect("close album");
+        assert!(store.list_albums().expect("list closed store").is_empty());
+
+        let moved_album = root.join("Moved Studio Album");
+        fs::rename(&album_dir, &moved_album).expect("move album document");
+
+        let reopened_store = SessionStore::new(internal);
+        assert!(
+            reopened_store
+                .list_albums()
+                .expect("new process starts empty")
+                .is_empty(),
+            "an album must never reopen implicitly"
+        );
+        let reopened_album = reopened_store
+            .open_album(&moved_album)
+            .expect("open moved album");
+        assert_eq!(reopened_album.id, album.id);
+        let sessions = reopened_store
+            .list_sessions(&album.id)
+            .expect("list moved songs");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+
+        let loaded = reopened_store
+            .get_project(&session_id)
+            .expect("load moved song");
+        let source = loaded
+            .session
+            .source_files
+            .first()
+            .expect("recording source");
+        assert!(Path::new(&source.cache_path).starts_with(&moved_album));
+        assert!(Path::new(&source.cache_path).is_file());
+        assert!(Path::new(&source.peak_path).is_file());
+        let video = loaded
+            .session
+            .video_source_files
+            .first()
+            .expect("portable video source");
+        assert!(Path::new(&video.path).starts_with(&moved_album));
+        assert!(Path::new(&video.path).is_file());
+
+        let renamed = reopened_store
+            .rename_session(&session_id, "Renamed Song".to_string())
+            .expect("rename song folder");
+        assert_eq!(renamed.session.name, "Renamed Song");
+        assert!(moved_album
+            .join("Renamed Song")
+            .join(SONG_MANIFEST)
+            .is_file());
+        assert!(!moved_album.join("First Song").exists());
+
+        let renamed_album = reopened_store
+            .rename_album(&album.id, "Final Album".to_string())
+            .expect("rename album folder");
+        assert_eq!(renamed_album.name, "Final Album");
+        assert!(root.join("Final Album").join(ALBUM_MANIFEST).is_file());
+        assert!(!moved_album.exists());
+
+        fs::remove_dir_all(&root).expect("remove isolated test root");
+    }
 }

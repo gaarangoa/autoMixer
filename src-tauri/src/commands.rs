@@ -13,10 +13,13 @@ use tauri::{AppHandle, Emitter, State};
 use crate::{
     ab_judge::{AbJudgeOptions, AbJudgeResponse},
     actions::{apply_actions, record_patch, redo, undo},
-    assistant,
-    audio,
+    assistant, audio,
     engine::commands::EngineCommand,
-    model::{AssistantRequest, AssistantResponse, HistorySource, JsonPatchOp, MixAction, MixProject, MixSection, MixSession, MixerProfile, SectionAnalysis, SkillCatalog, VideoFilterPreset, VideoLayout},
+    model::{
+        AssistantRequest, AssistantResponse, HistorySource, JsonPatchOp, MixAction, MixProject,
+        MixSection, MixSession, MixerProfile, SectionAnalysis, SkillCatalog, VideoFilterPreset,
+        VideoLayout,
+    },
     store::SessionStore,
     AppState,
 };
@@ -318,12 +321,17 @@ pub fn get_skill_catalog() -> SkillCatalog {
 #[tauri::command]
 pub async fn list_ollama_models(base_url: String) -> Result<ModelsResponse, String> {
     let (provider, models) = assistant::list_models(base_url).await?;
-    Ok(ModelsResponse { models, provider: provider.label().to_string() })
+    Ok(ModelsResponse {
+        models,
+        provider: provider.label().to_string(),
+    })
 }
 
 #[tauri::command]
 pub fn list_input_devices() -> Result<InputDevicesResponse, String> {
-    Ok(InputDevicesResponse { devices: crate::recorder::input_devices()? })
+    Ok(InputDevicesResponse {
+        devices: crate::recorder::input_devices()?,
+    })
 }
 
 #[tauri::command]
@@ -332,13 +340,28 @@ pub fn list_input_device_channels(input_device: Option<String>) -> Result<u32, S
 }
 
 #[tauri::command]
-pub fn list_sessions(state: State<'_, AppState>, album_id: String) -> Result<Vec<MixSession>, String> {
-    state.store.lock().map_err(|error| error.to_string())?.list_sessions(&album_id)
+pub fn list_sessions(
+    state: State<'_, AppState>,
+    album_id: String,
+) -> Result<Vec<MixSession>, String> {
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .list_sessions(&album_id)
 }
 
 #[tauri::command]
-pub fn create_session(state: State<'_, AppState>, album_id: String, name: String) -> Result<MixProject, String> {
-    state.store.lock().map_err(|error| error.to_string())?.create_session(&album_id, name)
+pub fn create_session(
+    state: State<'_, AppState>,
+    album_id: String,
+    name: String,
+) -> Result<MixProject, String> {
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .create_session(&album_id, name)
 }
 
 // ---- Native menu (File submenu with album/song switching) ----
@@ -360,7 +383,13 @@ pub fn set_file_menu(
     // Menu mutation must run on the main thread (macOS).
     let handle = app.clone();
     app.run_on_main_thread(move || {
-        let _ = crate::build_and_set_menu(&handle, &albums, &sessions, &current_album_id, &current_session_id);
+        let _ = crate::build_and_set_menu(
+            &handle,
+            &albums,
+            &sessions,
+            &current_album_id,
+            &current_session_id,
+        );
     })
     .map_err(|error| error.to_string())
 }
@@ -369,55 +398,89 @@ pub fn set_file_menu(
 
 #[tauri::command]
 pub fn list_albums(state: State<'_, AppState>) -> Result<Vec<crate::model::MixAlbum>, String> {
-    state.store.lock().map_err(|error| error.to_string())?.list_albums()
-}
-
-#[tauri::command]
-pub fn list_recents(state: State<'_, AppState>) -> Result<Vec<crate::store::RecentAlbum>, String> {
-    state.store.lock().map_err(|error| error.to_string())?.list_recents()
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .list_albums()
 }
 
 // Document model: `create_album` saves a NEW album folder inside `dir`; `open_album`
 // loads an existing album folder picked from disk.
 #[tauri::command]
-pub fn create_album(state: State<'_, AppState>, name: String, dir: String) -> Result<crate::model::MixAlbum, String> {
-    state.store.lock().map_err(|error| error.to_string())?.create_album_in(std::path::Path::new(&dir), name)
+pub fn create_album(
+    state: State<'_, AppState>,
+    name: String,
+    dir: String,
+) -> Result<crate::model::MixAlbum, String> {
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .create_album_in(std::path::Path::new(&dir), name)
 }
 
 #[tauri::command]
-pub fn open_album(state: State<'_, AppState>, path: String) -> Result<crate::model::MixAlbum, String> {
-    state.store.lock().map_err(|error| error.to_string())?.open_album(std::path::Path::new(&path))
-}
-
-// Startup fallback: ensure there's a song to show when no albums exist yet
-// (creates a default app-managed album + song).
-#[tauri::command]
-pub fn create_default_session(state: State<'_, AppState>, name: String) -> Result<MixProject, String> {
-    state.store.lock().map_err(|error| error.to_string())?.create_session_default(name)
-}
-
-#[tauri::command]
-pub fn get_album(state: State<'_, AppState>, album_id: String) -> Result<crate::model::MixAlbum, String> {
-    state.store.lock().map_err(|error| error.to_string())?.get_album(&album_id)
+pub fn open_album(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::model::MixAlbum, String> {
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .open_album(std::path::Path::new(&path))
 }
 
 #[tauri::command]
-pub fn rename_album(state: State<'_, AppState>, album_id: String, name: String) -> Result<crate::model::MixAlbum, String> {
-    state.store.lock().map_err(|error| error.to_string())?.rename_album(&album_id, name)
+pub fn get_album(
+    state: State<'_, AppState>,
+    album_id: String,
+) -> Result<crate::model::MixAlbum, String> {
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_album(&album_id)
 }
 
 #[tauri::command]
-pub fn delete_album(state: State<'_, AppState>, album_id: String) -> Result<(), String> {
-    state.store.lock().map_err(|error| error.to_string())?.delete_album(&album_id)
+pub fn rename_album(
+    state: State<'_, AppState>,
+    album_id: String,
+    name: String,
+) -> Result<crate::model::MixAlbum, String> {
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .rename_album(&album_id, name)
+}
+
+#[tauri::command]
+pub fn close_album(state: State<'_, AppState>, album_id: String) -> Result<(), String> {
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .close_album(&album_id)
 }
 
 #[tauri::command]
 pub fn get_project(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
-    state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)
 }
 
 #[tauri::command]
-pub fn import_audio_files(state: State<'_, AppState>, session_id: String, paths: Vec<String>) -> Result<MixProject, String> {
+pub fn import_audio_files(
+    state: State<'_, AppState>,
+    session_id: String,
+    paths: Vec<String>,
+) -> Result<MixProject, String> {
     let store = state.store.lock().map_err(|error| error.to_string())?;
     let mut latest = None;
     for path in paths {
@@ -427,7 +490,11 @@ pub fn import_audio_files(state: State<'_, AppState>, session_id: String, paths:
 }
 
 #[tauri::command]
-pub fn create_recording_track(state: State<'_, AppState>, session_id: String, channels: Option<u16>) -> Result<MixProject, String> {
+pub fn create_recording_track(
+    state: State<'_, AppState>,
+    session_id: String,
+    channels: Option<u16>,
+) -> Result<MixProject, String> {
     let project = state
         .store
         .lock()
@@ -442,7 +509,10 @@ pub fn create_recording_track(state: State<'_, AppState>, session_id: String, ch
 }
 
 #[tauri::command]
-pub fn create_video_track(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+pub fn create_video_track(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<MixProject, String> {
     let project = state
         .store
         .lock()
@@ -472,7 +542,13 @@ pub fn replace_rendered_video_track(
         .store
         .lock()
         .map_err(|error| error.to_string())?
-        .replace_track_video(&session_id, &track_id, &clip_id, Path::new(&video_path), duration_ms.max(1))?;
+        .replace_track_video(
+            &session_id,
+            &track_id,
+            &clip_id,
+            Path::new(&video_path),
+            duration_ms.max(1),
+        )?;
     if let Ok(mut audio) = state.audio.lock() {
         audio.bind_session_sources(&project.session)?;
         sync_session_to_engine(&mut audio, &project.session);
@@ -494,7 +570,13 @@ pub fn add_rendered_video_track(
         .store
         .lock()
         .map_err(|error| error.to_string())?
-        .add_rendered_video_track(&session_id, Path::new(&video_path), name, start_sample, duration_ms)?;
+        .add_rendered_video_track(
+            &session_id,
+            Path::new(&video_path),
+            name,
+            start_sample,
+            duration_ms,
+        )?;
     if let Ok(mut audio) = state.audio.lock() {
         audio.bind_session_sources(&project.session)?;
         sync_session_to_engine(&mut audio, &project.session);
@@ -604,16 +686,28 @@ pub fn apply_mix_actions(
     actions: Vec<MixAction>,
     explanation: Option<String>,
 ) -> Result<MixProject, String> {
-    apply_and_sync(state.inner(), &session_id, &actions, HistorySource::User, explanation)
+    apply_and_sync(
+        state.inner(),
+        &session_id,
+        &actions,
+        HistorySource::User,
+        explanation,
+    )
 }
 
 #[tauri::command]
-pub fn undo_mix_action(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+pub fn undo_mix_action(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<MixProject, String> {
     undo_and_sync(state.inner(), &session_id)
 }
 
 #[tauri::command]
-pub fn redo_mix_action(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+pub fn redo_mix_action(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<MixProject, String> {
     redo_and_sync(state.inner(), &session_id)
 }
 
@@ -623,7 +717,8 @@ pub fn reset_session(state: State<'_, AppState>, session_id: String) -> Result<M
     let mut project = store.get_project(&session_id)?;
     project.session.tracks.clear();
     project.session.source_files.clear();
-    project.session.minimum_timeline_seconds = Some(crate::store::SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
+    project.session.minimum_timeline_seconds =
+        Some(crate::store::SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS);
     project.session.regions.clear();
     project.session.markers.clear();
     project.history.clear();
@@ -646,7 +741,13 @@ pub fn apply_recorded_patch(
 ) -> Result<MixProject, String> {
     let store = state.store.lock().map_err(|error| error.to_string())?;
     let mut project = store.get_project(&session_id)?;
-    record_patch(&mut project, forward_patch, inverse_patch, HistorySource::User, explanation)?;
+    record_patch(
+        &mut project,
+        forward_patch,
+        inverse_patch,
+        HistorySource::User,
+        explanation,
+    )?;
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
         sync_session_to_engine(&mut audio, &project.session);
@@ -665,7 +766,11 @@ impl Drop for AutoMixHeartbeat {
     }
 }
 
-fn spawn_auto_mix_heartbeat(app: tauri::AppHandle, session_id: &str, stage_id: &str) -> AutoMixHeartbeat {
+fn spawn_auto_mix_heartbeat(
+    app: tauri::AppHandle,
+    session_id: &str,
+    stage_id: &str,
+) -> AutoMixHeartbeat {
     let session_id = session_id.to_string();
     let phase = stage_id.to_string();
     let handle = tokio::spawn(async move {
@@ -689,7 +794,11 @@ struct AutoMixRunGuard {
 
 impl AutoMixRunGuard {
     fn new(app: tauri::AppHandle, session_id: &str) -> Self {
-        Self { app, session_id: session_id.to_string(), completed: false }
+        Self {
+            app,
+            session_id: session_id.to_string(),
+            completed: false,
+        }
     }
 
     fn complete(&mut self) {
@@ -700,7 +809,10 @@ impl AutoMixRunGuard {
 impl Drop for AutoMixRunGuard {
     fn drop(&mut self) {
         if !self.completed {
-            let _ = self.app.emit("auto-mix:complete", serde_json::json!({ "sessionId": self.session_id }));
+            let _ = self.app.emit(
+                "auto-mix:complete",
+                serde_json::json!({ "sessionId": self.session_id }),
+            );
         }
     }
 }
@@ -714,7 +826,12 @@ struct AutoMixStageGuard {
 
 impl AutoMixStageGuard {
     fn new(app: tauri::AppHandle, session_id: &str, stage: crate::auto_mix::AutoMixStage) -> Self {
-        Self { app, session_id: session_id.to_string(), stage, completed: false }
+        Self {
+            app,
+            session_id: session_id.to_string(),
+            stage,
+            completed: false,
+        }
     }
 
     fn complete(&mut self) {
@@ -775,7 +892,10 @@ fn emit_auto_mix_stage_done(
     session_id: &str,
     report: &crate::auto_mix::StageReport,
 ) {
-    let _ = app.emit("auto-mix:stage-done", auto_mix_stage_payload(session_id, report));
+    let _ = app.emit(
+        "auto-mix:stage-done",
+        auto_mix_stage_payload(session_id, report),
+    );
 }
 
 async fn run_auto_mix_stage_bounded(
@@ -825,18 +945,34 @@ fn model_n_ctx(model_entry: &serde_json::Value) -> Option<u64> {
     model_entry
         .pointer("/meta/n_ctx")
         .and_then(serde_json::Value::as_u64)
-        .or_else(|| model_entry.pointer("/meta/context_length").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            model_entry
+                .pointer("/meta/context_length")
+                .and_then(serde_json::Value::as_u64)
+        })
         .or_else(|| model_entry.get("n_ctx").and_then(serde_json::Value::as_u64))
-        .or_else(|| model_entry.get("context_length").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            model_entry
+                .get("context_length")
+                .and_then(serde_json::Value::as_u64)
+        })
 }
 
 fn props_n_ctx(props: &serde_json::Value) -> Option<u64> {
     props
         .pointer("/default_generation_settings/n_ctx")
         .and_then(serde_json::Value::as_u64)
-        .or_else(|| props.pointer("/default_generation_settings/params/n_ctx").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            props
+                .pointer("/default_generation_settings/params/n_ctx")
+                .and_then(serde_json::Value::as_u64)
+        })
         .or_else(|| props.get("n_ctx").and_then(serde_json::Value::as_u64))
-        .or_else(|| props.get("context_length").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            props
+                .get("context_length")
+                .and_then(serde_json::Value::as_u64)
+        })
 }
 
 async fn detect_model_context_tokens(base_url: &str, model: &str) -> Result<Option<u64>, String> {
@@ -849,7 +985,12 @@ async fn detect_model_context_tokens(base_url: &str, model: &str) -> Result<Opti
     } else {
         format!("{root}/v1/models")
     };
-    if let Ok(response) = client.get(models_url).timeout(Duration::from_secs(5)).send().await {
+    if let Ok(response) = client
+        .get(models_url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         if response.status().is_success() {
             if let Ok(value) = response.json::<serde_json::Value>().await {
                 if let Some(items) = value.get("data").and_then(serde_json::Value::as_array) {
@@ -857,11 +998,14 @@ async fn detect_model_context_tokens(base_url: &str, model: &str) -> Result<Opti
                         .iter()
                         .find(|item| {
                             item.get("id").and_then(serde_json::Value::as_str) == Some(model_id)
-                                || item.get("model").and_then(serde_json::Value::as_str) == Some(model_id)
+                                || item.get("model").and_then(serde_json::Value::as_str)
+                                    == Some(model_id)
                                 || item
                                     .get("aliases")
                                     .and_then(serde_json::Value::as_array)
-                                    .map(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(model_id)))
+                                    .map(|aliases| {
+                                        aliases.iter().any(|alias| alias.as_str() == Some(model_id))
+                                    })
                                     .unwrap_or(false)
                         })
                         .or_else(|| items.first());
@@ -874,7 +1018,12 @@ async fn detect_model_context_tokens(base_url: &str, model: &str) -> Result<Opti
     }
 
     let props_url = format!("{root}/props");
-    if let Ok(response) = client.get(props_url).timeout(Duration::from_secs(5)).send().await {
+    if let Ok(response) = client
+        .get(props_url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         if response.status().is_success() {
             if let Ok(value) = response.json::<serde_json::Value>().await {
                 if let Some(ctx) = props_n_ctx(&value) {
@@ -930,7 +1079,11 @@ fn read_hermes_model() -> HermesModel {
             }
         }
     }
-    HermesModel { base_url, model, provider }
+    HermesModel {
+        base_url,
+        model,
+        provider,
+    }
 }
 
 /// Read the Hermes agent's current orchestration model so the settings UI can display it.
@@ -967,7 +1120,13 @@ pub async fn warm_up_models(
     let base = video_base.trim_end_matches('/').to_string();
     if !base.is_empty() && !video_model.trim().is_empty() {
         if let Ok(frame) = warmup_frame_b64() {
-            let _ = call_ollama_chat(&base, &video_model, "Reply with the single word: ok.".to_string(), Some(vec![frame])).await;
+            let _ = call_ollama_chat(
+                &base,
+                &video_model,
+                "Reply with the single word: ok.".to_string(),
+                Some(vec![frame]),
+            )
+            .await;
         }
     }
 }
@@ -976,7 +1135,18 @@ pub async fn warm_up_models(
 fn warmup_frame_b64() -> Result<String, String> {
     let path = std::env::temp_dir().join(format!("automixer-warmup-{}.jpg", uuid::Uuid::new_v4()));
     let status = Command::new("ffmpeg")
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=64x64", "-frames:v", "1"])
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:s=64x64",
+            "-frames:v",
+            "1",
+        ])
         .arg(&path)
         .status()
         .map_err(|e| e.to_string())?;
@@ -1039,16 +1209,26 @@ pub async fn set_hermes_model(
     // ACP path. `/health` alone is insufficient: Hermes can be alive while the
     // configured model fails when creating the first agent session.
     state.hermes_service.restart();
-    if !state.hermes_service.wait_ready(std::time::Duration::from_secs(30)).await {
+    if !state
+        .hermes_service
+        .wait_ready(std::time::Duration::from_secs(30))
+        .await
+    {
         let _ = apply_model(&previous.provider, &previous.base_url, &previous.model);
         state.hermes_service.restart();
-        let _ = state.hermes_service.wait_ready(std::time::Duration::from_secs(30)).await;
+        let _ = state
+            .hermes_service
+            .wait_ready(std::time::Duration::from_secs(30))
+            .await;
         return Err("Hermes sidecar did not become ready after applying the model settings; restored the previous model.".into());
     }
     if let Err(error) = state.hermes_service.probe().await {
         let _ = apply_model(&previous.provider, &previous.base_url, &previous.model);
         state.hermes_service.restart();
-        let _ = state.hermes_service.wait_ready(std::time::Duration::from_secs(30)).await;
+        let _ = state
+            .hermes_service
+            .wait_ready(std::time::Duration::from_secs(30))
+            .await;
         return Err(format!(
             "The model settings were saved but Hermes could not use them, so I restored the previous model. {error}"
         ));
@@ -1148,7 +1328,9 @@ pub async fn run_auto_mix_blocking(
     let stages: Vec<AutoMixStage> = if stage_ids.is_empty() {
         all.to_vec()
     } else {
-        all.into_iter().filter(|s| stage_ids.iter().any(|id| id == s.id())).collect()
+        all.into_iter()
+            .filter(|s| stage_ids.iter().any(|id| id == s.id()))
+            .collect()
     };
     if stages.is_empty() {
         return Err("No valid auto-mix stages selected.".into());
@@ -1165,10 +1347,16 @@ pub async fn run_auto_mix_blocking(
     if !agent.model.is_empty() {
         config.ollama_model = agent.model;
     }
-    let store = std::sync::Arc::new(std::sync::Mutex::new(SessionStore::new(config.data_dir.clone())));
+    let store = {
+        use tauri::Manager;
+        let state = app.state::<AppState>();
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        std::sync::Arc::new(std::sync::Mutex::new(store.clone_open_handle()?))
+    };
     // No hot-path streaming: the user gets each stage's rationale + action count
     // from the StageReport, plus the 1/sec heartbeat while a stage is running.
-    let observer: std::sync::Arc<dyn assistant::LlmObserver> = std::sync::Arc::new(assistant::NoopObserver);
+    let observer: std::sync::Arc<dyn assistant::LlmObserver> =
+        std::sync::Arc::new(assistant::NoopObserver);
 
     let _ = app.emit(
         "auto-mix:start",
@@ -1188,13 +1376,22 @@ pub async fn run_auto_mix_blocking(
         eprintln!("[automix-step] stage {i} ({}) running", stage.id());
         let mut stage_guard = AutoMixStageGuard::new(app.clone(), session_id, *stage);
         let heartbeat = spawn_auto_mix_heartbeat(app.clone(), session_id, stage.id());
-        let report = run_auto_mix_stage_bounded(&config, store.clone(), session_id, *stage, observer.clone()).await;
+        let report = run_auto_mix_stage_bounded(
+            &config,
+            store.clone(),
+            session_id,
+            *stage,
+            observer.clone(),
+        )
+        .await;
         drop(heartbeat);
         stage_guard.complete();
         let action_count = report.action_count;
         let status = report.status.clone();
         let stage_id = report.stage_id.clone();
-        eprintln!("[automix-step] stage {i} ({stage_id}) report: status={status} actions={action_count}");
+        eprintln!(
+            "[automix-step] stage {i} ({stage_id}) report: status={status} actions={action_count}"
+        );
         emit_auto_mix_stage_done(app, session_id, &report);
         eprintln!("[automix-step] stage {i} syncing audio…");
         let _ = sync_audio_from_app(app, session_id);
@@ -1206,7 +1403,11 @@ pub async fn run_auto_mix_blocking(
         }
     }
     run_guard.complete();
-    Ok(AutoMixSummary { stages_run: summaries.len(), total_actions, stages: summaries })
+    Ok(AutoMixSummary {
+        stages_run: summaries.len(),
+        total_actions,
+        stages: summaries,
+    })
 }
 
 #[derive(Deserialize)]
@@ -1235,15 +1436,30 @@ pub async fn auto_crop_clip(
     assistant::reset_agent_cancel();
     let config = crate::config::Config::load();
 
-    let mut project = { app.state::<AppState>().store.lock().map_err(|e| e.to_string())?.get_project(session_id)? };
+    let mut project = {
+        app.state::<AppState>()
+            .store
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get_project(session_id)?
+    };
 
     // Locate the clip's source video + a representative timestamp (its midpoint).
     let (source_path, frame_time) = {
-        let track = project.session.tracks.iter().find(|t| t.id == track_id).ok_or("Track not found")?;
+        let track = project
+            .session
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .ok_or("Track not found")?;
         if !matches!(track.kind, crate::model::TrackKind::Video) {
             return Err("That track is not a video track.".into());
         }
-        let clip = track.video_clips.iter().find(|c| c.id == clip_id).ok_or("Clip not found on the track")?;
+        let clip = track
+            .video_clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .ok_or("Clip not found on the track")?;
         let source = project
             .session
             .video_source_files
@@ -1251,14 +1467,18 @@ pub async fn auto_crop_clip(
             .find(|s| s.id == clip.video_source_file_id)
             .ok_or("The clip's source video file is missing")?;
         let offset_s = clip.source_offset_ms as f64 / 1000.0;
-        let dur_s = clip.end_sample.saturating_sub(clip.start_sample) as f64 / project.session.sample_rate as f64;
+        let dur_s = clip.end_sample.saturating_sub(clip.start_sample) as f64
+            / project.session.sample_rate as f64;
         (PathBuf::from(&source.path), offset_s + dur_s.max(0.0) / 2.0)
     };
     if !source_path.exists() {
         return Err("The clip's source video file is no longer on disk.".into());
     }
 
-    let temp_dir = config.data_dir.join("auto-crop").join(uuid::Uuid::new_v4().to_string());
+    let temp_dir = config
+        .data_dir
+        .join("auto-crop")
+        .join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&temp_dir).map_err(|e| format!("Could not prepare temp dir: {e}"))?;
     let frame_path = temp_dir.join("frame.jpg");
     let _ = Command::new("ffmpeg")
@@ -1267,13 +1487,21 @@ pub async fn auto_crop_clip(
         .arg(format!("{frame_time:.3}"))
         .arg("-i")
         .arg(&source_path)
-        .args(["-frames:v", "1", "-q:v", "6", "-vf", "scale=768:768:force_original_aspect_ratio=decrease"])
+        .args([
+            "-frames:v",
+            "1",
+            "-q:v",
+            "6",
+            "-vf",
+            "scale=768:768:force_original_aspect_ratio=decrease",
+        ])
         .arg(&frame_path)
         .status();
 
     let frame_read = fs::read(&frame_path);
     let _ = fs::remove_dir_all(&temp_dir);
-    let bytes = frame_read.map_err(|e| format!("Could not extract a frame at {frame_time:.1}s: {e}"))?;
+    let bytes =
+        frame_read.map_err(|e| format!("Could not extract a frame at {frame_time:.1}s: {e}"))?;
     let prompt = format!(
         "You are reframing a video. Look at this frame and decide how to crop it so: {instructions}. \
          Reply with ONLY a JSON object giving the percentage to REMOVE from each edge (each 0-45): \
@@ -1281,29 +1509,81 @@ pub async fn auto_crop_clip(
          Crop conservatively and keep the main subject fully in frame."
     );
     let base_url = config.video_base_url.trim_end_matches('/').to_string();
-    let resp = call_ollama_chat(&base_url, &config.video_model, prompt, Some(vec![BASE64_STANDARD.encode(bytes)]))
-        .await
-        .map_err(|e| format!("Video model call failed ({base_url} / {}): {e}", config.video_model))?;
+    let resp = call_ollama_chat(
+        &base_url,
+        &config.video_model,
+        prompt,
+        Some(vec![BASE64_STANDARD.encode(bytes)]),
+    )
+    .await
+    .map_err(|e| {
+        format!(
+            "Video model call failed ({base_url} / {}): {e}",
+            config.video_model
+        )
+    })?;
     let text = resp.message.content;
     let json = crate::assistant::extract_json_object(&text).unwrap_or_else(|| text.clone());
-    let crop: CropChoice = serde_json::from_str(&json)
-        .map_err(|e| format!("Video model returned an unparseable crop ({e}). Raw: {}", text.chars().take(180).collect::<String>()))?;
+    let crop: CropChoice = serde_json::from_str(&json).map_err(|e| {
+        format!(
+            "Video model returned an unparseable crop ({e}). Raw: {}",
+            text.chars().take(180).collect::<String>()
+        )
+    })?;
 
     // Apply as a reversible history entry so the auto-crop can be undone (⌘Z).
-    let ti = project.session.tracks.iter().position(|t| t.id == track_id).ok_or("Track not found")?;
-    let ci = project.session.tracks[ti].video_clips.iter().position(|c| c.id == clip_id).ok_or("Clip not found")?;
-    let old_layout = project.session.tracks[ti].video_clips[ci].layout.clone().unwrap_or_default();
+    let ti = project
+        .session
+        .tracks
+        .iter()
+        .position(|t| t.id == track_id)
+        .ok_or("Track not found")?;
+    let ci = project.session.tracks[ti]
+        .video_clips
+        .iter()
+        .position(|c| c.id == clip_id)
+        .ok_or("Clip not found")?;
+    let old_layout = project.session.tracks[ti].video_clips[ci]
+        .layout
+        .clone()
+        .unwrap_or_default();
     let mut layout = old_layout.clone();
-    if let Some(v) = crop.crop_top { layout.crop_top = v; }
-    if let Some(v) = crop.crop_right { layout.crop_right = v; }
-    if let Some(v) = crop.crop_bottom { layout.crop_bottom = v; }
-    if let Some(v) = crop.crop_left { layout.crop_left = v; }
+    if let Some(v) = crop.crop_top {
+        layout.crop_top = v;
+    }
+    if let Some(v) = crop.crop_right {
+        layout.crop_right = v;
+    }
+    if let Some(v) = crop.crop_bottom {
+        layout.crop_bottom = v;
+    }
+    if let Some(v) = crop.crop_left {
+        layout.crop_left = v;
+    }
     let new_layout = normalized_video_layout(&layout);
     let path = format!("/tracks/{ti}/videoClips/{ci}/layout");
-    let forward = vec![crate::model::JsonPatchOp { op: "replace".into(), path: path.clone(), value: Some(serde_json::to_value(&new_layout).map_err(|e| e.to_string())?) }];
-    let inverse = vec![crate::model::JsonPatchOp { op: "replace".into(), path, value: Some(serde_json::to_value(&old_layout).map_err(|e| e.to_string())?) }];
-    crate::actions::record_patch(&mut project, forward, inverse, crate::model::HistorySource::Assistant, Some("Auto-crop".to_string()))?;
-    app.state::<AppState>().store.lock().map_err(|e| e.to_string())?.save(&project)?;
+    let forward = vec![crate::model::JsonPatchOp {
+        op: "replace".into(),
+        path: path.clone(),
+        value: Some(serde_json::to_value(&new_layout).map_err(|e| e.to_string())?),
+    }];
+    let inverse = vec![crate::model::JsonPatchOp {
+        op: "replace".into(),
+        path,
+        value: Some(serde_json::to_value(&old_layout).map_err(|e| e.to_string())?),
+    }];
+    crate::actions::record_patch(
+        &mut project,
+        forward,
+        inverse,
+        crate::model::HistorySource::Assistant,
+        Some("Auto-crop".to_string()),
+    )?;
+    app.state::<AppState>()
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .save(&project)?;
     Ok(project)
 }
 
@@ -1324,58 +1604,123 @@ pub fn apply_video_effects(
 ) -> Result<MixProject, String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
-    let project = state.store.lock().map_err(|e| e.to_string())?.get_project(session_id)?;
+    let project = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get_project(session_id)?;
 
     // Resolve the clip's source video (pristine when available) + its region length.
     let (source_path, region_seconds) = {
-        let track = project.session.tracks.iter().find(|t| t.id == track_id).ok_or("Track not found")?;
+        let track = project
+            .session
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .ok_or("Track not found")?;
         if !matches!(track.kind, crate::model::TrackKind::Video) {
             return Err("That track is not a video track.".into());
         }
-        let clip = track.video_clips.iter().find(|c| c.id == clip_id).ok_or("Clip not found on the track")?;
-        let source_id = clip.pristine_video_source_file_id.as_ref().unwrap_or(&clip.video_source_file_id);
-        let source = project.session.video_source_files.iter().find(|s| &s.id == source_id)
+        let clip = track
+            .video_clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .ok_or("Clip not found on the track")?;
+        let source_id = clip
+            .pristine_video_source_file_id
+            .as_ref()
+            .unwrap_or(&clip.video_source_file_id);
+        let source = project
+            .session
+            .video_source_files
+            .iter()
+            .find(|s| &s.id == source_id)
             .ok_or("The clip's source video file is missing")?;
-        let region = clip.end_sample.saturating_sub(clip.start_sample) as f64 / project.session.sample_rate as f64;
+        let region = clip.end_sample.saturating_sub(clip.start_sample) as f64
+            / project.session.sample_rate as f64;
         (PathBuf::from(&source.path), region)
     };
     if !source_path.exists() {
         return Err("The clip's video file is missing on disk.".into());
     }
 
-    let effects = AgentVideoEffects { reason: None, fade_in_seconds, fade_out_seconds, speed_factor };
+    let effects = AgentVideoEffects {
+        reason: None,
+        fade_in_seconds,
+        fade_out_seconds,
+        speed_factor,
+    };
     // Total duration for fade-out placement: probe the actual source, fall back to the
     // clip region length.
-    let total_s = probe_video_duration(&source_path).unwrap_or(region_seconds).max(0.05);
+    let total_s = probe_video_duration(&source_path)
+        .unwrap_or(region_seconds)
+        .max(0.05);
     let (video_chain, audio_chain, _speed) = build_effects_filters(&effects, total_s);
     if video_chain.is_none() && audio_chain.is_none() {
         return Err("Nothing to apply — set a fade-in, fade-out, or speed.".into());
     }
 
-    let renders_dir = state.store.lock().map_err(|e| e.to_string())?.renders_dir();
+    let renders_dir = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|e| e.to_string())?;
     let out_path = renders_dir.join(format!("fx-{}.mp4", uuid::Uuid::new_v4()));
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error").arg("-i").arg(&source_path);
-    if let Some(v) = video_chain.as_ref() { cmd.arg("-vf").arg(v); }
-    if let Some(a) = audio_chain.as_ref() { cmd.arg("-af").arg(a); }
-    cmd.arg("-c:v").arg("libx264").arg("-preset").arg("medium").arg("-crf").arg("18")
-        .arg("-pix_fmt").arg("yuv420p").arg("-movflags").arg("+faststart")
-        .arg("-c:a").arg("aac").arg("-b:a").arg("256k");
-    let output = cmd.arg(&out_path).output().map_err(|e| format!("Could not run ffmpeg: {e}"))?;
+    cmd.arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(&source_path);
+    if let Some(v) = video_chain.as_ref() {
+        cmd.arg("-vf").arg(v);
+    }
+    if let Some(a) = audio_chain.as_ref() {
+        cmd.arg("-af").arg(a);
+    }
+    cmd.arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("medium")
+        .arg("-crf")
+        .arg("18")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("256k");
+    let output = cmd
+        .arg(&out_path)
+        .output()
+        .map_err(|e| format!("Could not run ffmpeg: {e}"))?;
     if !output.status.success() {
-        return Err(format!("ffmpeg effects render failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        return Err(format!(
+            "ffmpeg effects render failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
 
-    let new_duration_ms = (probe_video_duration(&out_path).unwrap_or(total_s) * 1000.0).round() as u64;
-    let project = state.store.lock().map_err(|e| e.to_string())?
+    let new_duration_ms =
+        (probe_video_duration(&out_path).unwrap_or(total_s) * 1000.0).round() as u64;
+    let project = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
         .replace_track_video(session_id, track_id, clip_id, &out_path, new_duration_ms)?;
     if let Ok(mut audio) = state.audio.lock() {
         let _ = audio.bind_session_sources(&project.session);
         sync_session_to_engine(&mut audio, &project.session);
         audio.publish_automation(&project.session);
     }
-    let _ = app.emit("session:externally-updated", serde_json::json!({ "sessionId": session_id, "project": project }));
+    let _ = app.emit(
+        "session:externally-updated",
+        serde_json::json!({ "sessionId": session_id, "project": project }),
+    );
     Ok(project)
 }
 
@@ -1402,7 +1747,10 @@ pub async fn assistant_request(
     }
 
     let session_id = request.session_id.clone();
-    let _ = app.emit("llm:turn-start", serde_json::json!({ "sessionId": &session_id, "userText": &request.user_text }));
+    let _ = app.emit(
+        "llm:turn-start",
+        serde_json::json!({ "sessionId": &session_id, "userText": &request.user_text }),
+    );
 
     // Accumulate the visible assistant message so the finished turn persists in the
     // chat log (the live bubble is cleared on turn-end).
@@ -1450,7 +1798,10 @@ pub async fn assistant_request(
         }, assistant::agent_cancelled)
         .await;
 
-    let _ = app.emit("llm:turn-end", serde_json::json!({ "sessionId": &session_id }));
+    let _ = app.emit(
+        "llm:turn-end",
+        serde_json::json!({ "sessionId": &session_id }),
+    );
     if assistant::agent_cancelled() {
         // The user pressed Stop — the sidecar was disconnected and cancelled the
         // ACP turn. Whatever tool calls already landed stay applied (they're real
@@ -1481,7 +1832,11 @@ pub async fn assistant_request(
 
 #[tauri::command]
 pub fn transport_play(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
-    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
     let mut audio = state.audio.lock().map_err(|error| error.to_string())?;
     audio.bind_session_sources(&project.session)?;
     sync_session_to_engine(&mut audio, &project.session);
@@ -1492,19 +1847,31 @@ pub fn transport_play(state: State<'_, AppState>, session_id: String) -> Result<
 
 #[tauri::command]
 pub fn transport_pause(state: State<'_, AppState>) -> Result<(), String> {
-    state.audio.lock().map_err(|error| error.to_string())?.pause();
+    state
+        .audio
+        .lock()
+        .map_err(|error| error.to_string())?
+        .pause();
     Ok(())
 }
 
 #[tauri::command]
 pub fn transport_stop(state: State<'_, AppState>) -> Result<(), String> {
-    state.audio.lock().map_err(|error| error.to_string())?.stop();
+    state
+        .audio
+        .lock()
+        .map_err(|error| error.to_string())?
+        .stop();
     Ok(())
 }
 
 #[tauri::command]
 pub fn transport_seek(state: State<'_, AppState>, sample: u64) -> Result<(), String> {
-    state.audio.lock().map_err(|error| error.to_string())?.seek(sample);
+    state
+        .audio
+        .lock()
+        .map_err(|error| error.to_string())?
+        .seek(sample);
     Ok(())
 }
 
@@ -1525,7 +1892,12 @@ pub fn start_recording(
         .get_project(&session_id)?
         .session;
     let safe_start = start_sample.min(session_duration_samples(&session));
-    if let Some(handle) = state.input_monitor.lock().map_err(|error| error.to_string())?.take() {
+    if let Some(handle) = state
+        .input_monitor
+        .lock()
+        .map_err(|error| error.to_string())?
+        .take()
+    {
         handle.stop()?;
     }
     let mut recorder = state.recorder.lock().map_err(|error| error.to_string())?;
@@ -1537,9 +1909,10 @@ pub fn start_recording(
         .map_err(|error| error.to_string())?
         .as_millis();
     let path = state
-        .config
-        .data_dir
-        .join("recordings")
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .recordings_dir(&session_id)?
         .join(format!("recording-{stamp}.wav"));
     if let Some(track_id) = target_track_id.as_deref() {
         if !session.tracks.iter().any(|track| track.id == track_id) {
@@ -1551,13 +1924,26 @@ pub fn start_recording(
     let target_channels: u16 = target_track_id
         .as_deref()
         .and_then(|track_id| session.tracks.iter().find(|track| track.id == track_id))
-        .and_then(|track| session.source_files.iter().find(|source| source.id == track.source_file_id))
+        .and_then(|track| {
+            session
+                .source_files
+                .iter()
+                .find(|source| source.id == track.source_file_id)
+        })
         .map(|source| source.channels.max(1).min(2))
         .unwrap_or(1);
     // dB -> linear gain factor. Clamp to a sane range so we can't massively boost noise.
     let gain_db = input_gain_db.unwrap_or(0.0).clamp(-60.0, 24.0);
     let gain_factor = 10f32.powf(gain_db / 20.0);
-    let handle = crate::recorder::start_recording(path, safe_start, target_track_id, input_device, target_channels, gain_factor, input_channels)?;
+    let handle = crate::recorder::start_recording(
+        path,
+        safe_start,
+        target_track_id,
+        input_device,
+        target_channels,
+        gain_factor,
+        input_channels,
+    )?;
     if let Err(error) = handle.wait_until_ready(Duration::from_secs(3)) {
         let _ = handle.stop();
         return Err(error);
@@ -1567,7 +1953,9 @@ pub fn start_recording(
 }
 
 #[tauri::command]
-pub fn poll_recording_meters(state: State<'_, AppState>) -> Result<RecordingMetersResponse, String> {
+pub fn poll_recording_meters(
+    state: State<'_, AppState>,
+) -> Result<RecordingMetersResponse, String> {
     let mut recorder = state.recorder.lock().map_err(|error| error.to_string())?;
     if let Some(error) = recorder.as_ref().and_then(|handle| handle.startup_error()) {
         let _ = recorder.take();
@@ -1577,13 +1965,22 @@ pub fn poll_recording_meters(state: State<'_, AppState>) -> Result<RecordingMete
         .as_ref()
         .map(|handle| handle.drain_meters())
         .unwrap_or_default();
-    let channel_peaks = drained.last().map(|m| m.channel_peaks.clone()).unwrap_or_default();
+    let channel_peaks = drained
+        .last()
+        .map(|m| m.channel_peaks.clone())
+        .unwrap_or_default();
     let peaks = drained.into_iter().map(|meter| meter.peak).collect();
-    Ok(RecordingMetersResponse { peaks, channel_peaks })
+    Ok(RecordingMetersResponse {
+        peaks,
+        channel_peaks,
+    })
 }
 
 #[tauri::command]
-pub fn stop_recording(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+pub fn stop_recording(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<MixProject, String> {
     let handle = state
         .recorder
         .lock()
@@ -1608,11 +2005,22 @@ pub fn stop_recording(state: State<'_, AppState>, session_id: String) -> Result<
 }
 
 #[tauri::command]
-pub fn start_input_monitor(state: State<'_, AppState>, input_device: Option<String>) -> Result<(), String> {
-    if state.recorder.lock().map_err(|error| error.to_string())?.is_some() {
+pub fn start_input_monitor(
+    state: State<'_, AppState>,
+    input_device: Option<String>,
+) -> Result<(), String> {
+    if state
+        .recorder
+        .lock()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
         return Ok(());
     }
-    let mut monitor = state.input_monitor.lock().map_err(|error| error.to_string())?;
+    let mut monitor = state
+        .input_monitor
+        .lock()
+        .map_err(|error| error.to_string())?;
     if let Some(handle) = monitor.take() {
         handle.stop()?;
     }
@@ -1626,8 +2034,13 @@ pub fn start_input_monitor(state: State<'_, AppState>, input_device: Option<Stri
 }
 
 #[tauri::command]
-pub fn poll_input_monitor_meters(state: State<'_, AppState>) -> Result<RecordingMetersResponse, String> {
-    let mut monitor = state.input_monitor.lock().map_err(|error| error.to_string())?;
+pub fn poll_input_monitor_meters(
+    state: State<'_, AppState>,
+) -> Result<RecordingMetersResponse, String> {
+    let mut monitor = state
+        .input_monitor
+        .lock()
+        .map_err(|error| error.to_string())?;
     if let Some(error) = monitor.as_ref().and_then(|handle| handle.startup_error()) {
         let _ = monitor.take();
         return Err(error);
@@ -1636,14 +2049,25 @@ pub fn poll_input_monitor_meters(state: State<'_, AppState>) -> Result<Recording
         .as_ref()
         .map(|handle| handle.drain_meters())
         .unwrap_or_default();
-    let channel_peaks = drained.last().map(|m| m.channel_peaks.clone()).unwrap_or_default();
+    let channel_peaks = drained
+        .last()
+        .map(|m| m.channel_peaks.clone())
+        .unwrap_or_default();
     let peaks = drained.into_iter().map(|meter| meter.peak).collect();
-    Ok(RecordingMetersResponse { peaks, channel_peaks })
+    Ok(RecordingMetersResponse {
+        peaks,
+        channel_peaks,
+    })
 }
 
 #[tauri::command]
 pub fn stop_input_monitor(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(handle) = state.input_monitor.lock().map_err(|error| error.to_string())?.take() {
+    if let Some(handle) = state
+        .input_monitor
+        .lock()
+        .map_err(|error| error.to_string())?
+        .take()
+    {
         handle.stop()?;
     }
     Ok(())
@@ -1685,20 +2109,27 @@ pub fn delete_clip_range(
 }
 
 #[tauri::command]
-pub fn set_master_gain(state: State<'_, AppState>, session_id: String, gain_db: f32) -> Result<MixProject, String> {
+pub fn set_master_gain(
+    state: State<'_, AppState>,
+    session_id: String,
+    gain_db: f32,
+) -> Result<MixProject, String> {
     let store = state.store.lock().map_err(|error| error.to_string())?;
     let mut project = store.get_project(&session_id)?;
     project.session.master.gain_db = gain_db.clamp(-24.0, 12.0);
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
-        audio.send(EngineCommand::SetMasterGainDb(project.session.master.gain_db));
+        audio.send(EngineCommand::SetMasterGainDb(
+            project.session.master.gain_db,
+        ));
     }
     Ok(project)
 }
 
 #[tauri::command]
 pub fn set_master_bypass(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
-    state.audio
+    state
+        .audio
         .lock()
         .map_err(|error| error.to_string())?
         .send(EngineCommand::SetMasterBypass { enabled });
@@ -1739,7 +2170,8 @@ pub fn list_mixer_profiles() -> Vec<ProfilePreset> {
         ProfilePreset {
             id: "scheps_minimalist".into(),
             display_name: "Scheps minimalist".into(),
-            summary: "Less is more. Tiny cuts over boosts, almost no compression, dry space.".into(),
+            summary: "Less is more. Tiny cuts over boosts, almost no compression, dry space."
+                .into(),
             profile: P {
                 preset_id: "scheps_minimalist".into(),
                 aggressiveness: "subtle".into(),
@@ -1833,17 +2265,33 @@ pub fn set_mixer_profile(
 }
 
 #[tauri::command]
-pub fn rename_session(state: State<'_, AppState>, session_id: String, name: String) -> Result<MixProject, String> {
-    state.store.lock().map_err(|error| error.to_string())?.rename_session(&session_id, name)
+pub fn rename_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    name: String,
+) -> Result<MixProject, String> {
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .rename_session(&session_id, name)
 }
 
 #[tauri::command]
 pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
-    state.store.lock().map_err(|error| error.to_string())?.delete_session(&session_id)
+    state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .delete_session(&session_id)
 }
 
 #[tauri::command]
-pub fn export_project_bundle(state: State<'_, AppState>, session_id: String, bundle_dir: String) -> Result<(), String> {
+pub fn export_project_bundle(
+    state: State<'_, AppState>,
+    session_id: String,
+    bundle_dir: String,
+) -> Result<(), String> {
     state
         .store
         .lock()
@@ -1852,7 +2300,10 @@ pub fn export_project_bundle(state: State<'_, AppState>, session_id: String, bun
 }
 
 #[tauri::command]
-pub fn import_project_bundle(state: State<'_, AppState>, bundle_dir: String) -> Result<MixProject, String> {
+pub fn import_project_bundle(
+    state: State<'_, AppState>,
+    bundle_dir: String,
+) -> Result<MixProject, String> {
     let project = state
         .store
         .lock()
@@ -1908,22 +2359,43 @@ pub async fn start_auto_mix(
         return Err("No stages selected.".into());
     }
 
-    let observer: std::sync::Arc<dyn assistant::LlmObserver> = std::sync::Arc::new(assistant::NoopObserver);
+    let observer: std::sync::Arc<dyn assistant::LlmObserver> =
+        std::sync::Arc::new(assistant::NoopObserver);
     let mut config = state.config.clone();
-    if let Some(base_url) = options.ollama_base_url.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(base_url) = options
+        .ollama_base_url
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         config.ollama_base_url = base_url.to_string();
     }
-    if let Some(model) = options.ollama_model.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(model) = options
+        .ollama_model
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         config.ollama_model = model.to_string();
     }
-    // Hold an Arc clone of the store so the background task can lock it.
-    let store_arc = std::sync::Arc::new(std::sync::Mutex::new(unsafe_clone_store(&state)));
+    // Give the background task an ephemeral handle to the one explicitly open
+    // album. It is not written to recents and will not reopen on the next launch.
+    let store_arc = std::sync::Arc::new(std::sync::Mutex::new(
+        state
+            .store
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone_open_handle()?,
+    ));
 
     assistant::reset_agent_cancel();
     let app_clone = app.clone();
     let session_id_clone = session_id.clone();
     tokio::spawn(async move {
-        let _ = app_clone.emit("auto-mix:start", serde_json::json!({ "sessionId": &session_id_clone, "stages": options.stages }));
+        let _ = app_clone.emit(
+            "auto-mix:start",
+            serde_json::json!({ "sessionId": &session_id_clone, "stages": options.stages }),
+        );
         for (i, stage) in stages.iter().enumerate() {
             if assistant::agent_cancelled() {
                 break;
@@ -1932,7 +2404,8 @@ pub async fn start_auto_mix(
                 "auto-mix:stage-start",
                 serde_json::json!({ "sessionId": &session_id_clone, "index": i, "stageId": stage.id(), "displayName": stage.display_name() }),
             );
-            let heartbeat = spawn_auto_mix_heartbeat(app_clone.clone(), &session_id_clone, stage.id());
+            let heartbeat =
+                spawn_auto_mix_heartbeat(app_clone.clone(), &session_id_clone, stage.id());
             let report = run_auto_mix_stage_bounded(
                 &config,
                 store_arc.clone(),
@@ -1952,19 +2425,18 @@ pub async fn start_auto_mix(
         // Reload the project once everything's done so the UI sees the final state.
         if let Ok(p) = state_get_project(&app_clone, &session_id_clone) {
             let _ = sync_audio_from_app(&app_clone, &session_id_clone);
-            let _ = app_clone.emit("auto-mix:complete", serde_json::json!({ "sessionId": &session_id_clone, "project": p }));
+            let _ = app_clone.emit(
+                "auto-mix:complete",
+                serde_json::json!({ "sessionId": &session_id_clone, "project": p }),
+            );
         } else {
-            let _ = app_clone.emit("auto-mix:complete", serde_json::json!({ "sessionId": &session_id_clone }));
+            let _ = app_clone.emit(
+                "auto-mix:complete",
+                serde_json::json!({ "sessionId": &session_id_clone }),
+            );
         }
     });
     Ok(())
-}
-
-/// Clone the underlying SessionStore (it's a thin handle around a data_dir).
-fn unsafe_clone_store(state: &State<'_, AppState>) -> SessionStore {
-    use crate::config::Config;
-    let cfg: &Config = &state.config;
-    SessionStore::new(cfg.data_dir.clone())
 }
 
 fn state_get_project(app: &tauri::AppHandle, session_id: &str) -> Result<MixProject, String> {
@@ -2021,7 +2493,7 @@ pub async fn analyze_master_structure(
         .store
         .lock()
         .map_err(|error| error.to_string())?
-        .renders_dir();
+        .renders_dir(&session_id)?;
     std::fs::create_dir_all(&renders_dir).map_err(|e| e.to_string())?;
     let render_path = renders_dir.join(format!("{session_id}.structure.wav"));
 
@@ -2029,7 +2501,10 @@ pub async fn analyze_master_structure(
     audio::render_mix(&project.session, &render_path)?;
 
     emit("connecting", "Waiting for audio sidecar…", 0.0);
-    if !audio_service.wait_ready(std::time::Duration::from_secs(60)).await {
+    if !audio_service
+        .wait_ready(std::time::Duration::from_secs(60))
+        .await
+    {
         return Err(format!(
             "Audio analysis sidecar at {} did not respond. Run `cd audio-service && uv sync` and check that `uv` is on PATH.",
             audio_service.base_url()
@@ -2092,7 +2567,9 @@ pub async fn analyze_master_structure(
         .sections
         .into_iter()
         .map(|s| MixSection {
-            analysis: rendered.as_ref().and_then(|r| analyze_section_window(r, s.start, s.end)),
+            analysis: rendered
+                .as_ref()
+                .and_then(|r| analyze_section_window(r, s.start, s.end)),
             start: s.start,
             end: s.end,
             label: s.label,
@@ -2124,13 +2601,20 @@ pub fn render_mix(
     // "wav" (default) or "mp3".
     format: Option<String>,
 ) -> Result<RenderResponse, String> {
-    let mut project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let mut project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
 
     // Stems: keep only the requested tracks (in their original order) when a non-empty
     // list is given; otherwise render the full mix.
     if let Some(ids) = track_ids.as_ref().filter(|v| !v.is_empty()) {
         let want: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
-        project.session.tracks.retain(|t| want.contains(t.id.as_str()));
+        project
+            .session
+            .tracks
+            .retain(|t| want.contains(t.id.as_str()));
         if project.session.tracks.is_empty() {
             return Err("None of the selected tracks were found to export.".into());
         }
@@ -2168,12 +2652,19 @@ pub fn render_mix(
             .map_err(|e| format!("Could not run ffmpeg for MP3 export. Install ffmpeg: {e}"))?;
         let _ = fs::remove_file(&wav_path);
         if !output.status.success() {
-            return Err(format!("ffmpeg MP3 encode failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+            return Err(format!(
+                "ffmpeg MP3 encode failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
-        return Ok(RenderResponse { path: mp3_path.to_string_lossy().to_string() });
+        return Ok(RenderResponse {
+            path: mp3_path.to_string_lossy().to_string(),
+        });
     }
 
-    Ok(RenderResponse { path: wav_path.to_string_lossy().to_string() })
+    Ok(RenderResponse {
+        path: wav_path.to_string_lossy().to_string(),
+    })
 }
 
 #[tauri::command]
@@ -2201,20 +2692,42 @@ pub fn save_video_recording(
         .store
         .lock()
         .map_err(|error| error.to_string())?
-        .videos_dir()
+        .videos_dir(&session_id)?
         .join(format!("incoming-{}.{}", uuid::Uuid::new_v4(), extension));
     if let Some(parent) = temp_path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    fs::write(&temp_path, bytes).map_err(|error| format!("Could not write video recording: {error}"))?;
+    fs::write(&temp_path, bytes)
+        .map_err(|error| format!("Could not write video recording: {error}"))?;
     let store = state.store.lock().map_err(|error| error.to_string())?;
     let source_offset_ms = source_offset_ms.min(duration_ms.saturating_sub(1));
-    let mut project = store.add_video_recording_clip(&session_id, &track_id, &temp_path, file_name.clone(), mime_type, start_sample, duration_ms, source_offset_ms)?;
+    let mut project = store.add_video_recording_clip(
+        &session_id,
+        &track_id,
+        &temp_path,
+        file_name.clone(),
+        mime_type,
+        start_sample,
+        duration_ms,
+        source_offset_ms,
+    )?;
     if create_audio_track {
-        let audio_path = store
-            .videos_dir()
-            .join(format!("{}-audio-{}.wav", Path::new(&file_name).file_stem().and_then(|item| item.to_str()).unwrap_or("camera"), uuid::Uuid::new_v4()));
-        if extract_video_audio(&temp_path, &audio_path, project.session.sample_rate, source_offset_ms).is_ok() {
+        let audio_path = store.videos_dir(&session_id)?.join(format!(
+            "{}-audio-{}.wav",
+            Path::new(&file_name)
+                .file_stem()
+                .and_then(|item| item.to_str())
+                .unwrap_or("camera"),
+            uuid::Uuid::new_v4()
+        ));
+        if extract_video_audio(
+            &temp_path,
+            &audio_path,
+            project.session.sample_rate,
+            source_offset_ms,
+        )
+        .is_ok()
+        {
             if let Ok(updated) = store.add_source_file_at(&session_id, &audio_path, start_sample) {
                 project = updated;
             }
@@ -2262,7 +2775,11 @@ pub async fn stretch_session_tempo(
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let mut project = store.get_project(&session_id)?;
     let session_rate = project.session.sample_rate;
-    let current = if project.session.tempo_percent > 0.0 { project.session.tempo_percent as f64 } else { 100.0 };
+    let current = if project.session.tempo_percent > 0.0 {
+        project.session.tempo_percent as f64
+    } else {
+        100.0
+    };
     if (percent - current).abs() < 0.5 {
         return Err(format!("The song is already at {percent:.0}%."));
     }
@@ -2272,7 +2789,12 @@ pub async fn stretch_session_tempo(
 
     // Every audio source referenced by a non-video track (track source + clips).
     let mut wanted: Vec<String> = Vec::new();
-    for track in project.session.tracks.iter().filter(|t| !matches!(t.kind, crate::model::TrackKind::Video)) {
+    for track in project
+        .session
+        .tracks
+        .iter()
+        .filter(|t| !matches!(t.kind, crate::model::TrackKind::Video))
+    {
         if !wanted.contains(&track.source_file_id) {
             wanted.push(track.source_file_id.clone());
         }
@@ -2294,9 +2816,19 @@ pub async fn stretch_session_tempo(
     let mut remap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut new_sources = Vec::new();
     for source_id in &wanted {
-        let Some(current_src) = project.session.source_files.iter().find(|s| &s.id == source_id) else { continue };
+        let Some(current_src) = project
+            .session
+            .source_files
+            .iter()
+            .find(|s| &s.id == source_id)
+        else {
+            continue;
+        };
         // Resolve the pristine origin (the source itself if it was never stretched).
-        let pristine_id = current_src.pristine_source_id.clone().unwrap_or_else(|| current_src.id.clone());
+        let pristine_id = current_src
+            .pristine_source_id
+            .clone()
+            .unwrap_or_else(|| current_src.id.clone());
         if reverting {
             if pristine_id != *source_id {
                 remap.insert(source_id.clone(), pristine_id);
@@ -2313,18 +2845,30 @@ pub async fn stretch_session_tempo(
         // NOT a decodable audio file. Read it and feed ffmpeg raw f32le samples.
         let cache = PathBuf::from(&source.cache_path);
         if !cache.exists() {
-            return Err(format!("Source audio missing on disk: {}", source.original_name));
+            return Err(format!(
+                "Source audio missing on disk: {}",
+                source.original_name
+            ));
         }
         let (header, samples) = crate::engine::source::cache::read_cache_all(&cache)
             .map_err(|e| format!("read {}: {e}", source.original_name))?;
         let tmp_dir = std::env::temp_dir();
         let raw = tmp_dir.join(format!("stretch-in-{}.f32le", uuid::Uuid::new_v4()));
-        let bytes = unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 4) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 4) };
         fs::write(&raw, bytes).map_err(|e| e.to_string())?;
         let out = tmp_dir.join(format!("stretch-{}.wav", uuid::Uuid::new_v4()));
         let output = Command::new("ffmpeg")
             .args(["-y", "-hide_banner", "-loglevel", "error"])
-            .args(["-f", "f32le", "-ar", &header.sample_rate.to_string(), "-ac", &header.channels.to_string(), "-i"])
+            .args([
+                "-f",
+                "f32le",
+                "-ar",
+                &header.sample_rate.to_string(),
+                "-ac",
+                &header.channels.to_string(),
+                "-i",
+            ])
             .arg(&raw)
             .args(["-filter:a", &filter, "-ar", &session_rate.to_string()])
             .arg(&out)
@@ -2333,10 +2877,17 @@ pub async fn stretch_session_tempo(
         let _ = fs::remove_file(&raw);
         if !output.status.success() {
             let _ = fs::remove_file(&out);
-            let err = String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or("").to_string();
-            return Err(format!("Time-stretch failed on {}: {err}", source.original_name));
+            let err = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
+                .to_string();
+            return Err(format!(
+                "Time-stretch failed on {}: {err}",
+                source.original_name
+            ));
         }
-        let mut stretched = store.import_source_standalone(&out, session_rate)?;
+        let mut stretched = store.import_source_standalone(&session_id, &out, session_rate)?;
         let _ = fs::remove_file(&out);
         let base = strip_wav_suffix(&source.original_name);
         stretched.original_name = format!("{base} ({percent_label}%)");
@@ -2356,7 +2907,10 @@ pub async fn stretch_session_tempo(
     let mut sources = old_sources.clone();
     sources.extend(new_sources);
     let mut tracks = old_tracks.clone();
-    for track in tracks.iter_mut().filter(|t| !matches!(t.kind, crate::model::TrackKind::Video)) {
+    for track in tracks
+        .iter_mut()
+        .filter(|t| !matches!(t.kind, crate::model::TrackKind::Video))
+    {
         if let Some(new_id) = remap.get(&track.source_file_id) {
             track.source_file_id = new_id.clone();
         }
@@ -2395,31 +2949,81 @@ pub async fn stretch_session_tempo(
     let bpm = old_bpm.map(|b| (b as f64 * (percent / current)) as f32);
     let old_tempo_percent = project.session.tempo_percent;
 
-    let jp = |path: &str, value: serde_json::Value| JsonPatchOp { op: "replace".into(), path: path.into(), value: Some(value) };
+    let jp = |path: &str, value: serde_json::Value| JsonPatchOp {
+        op: "replace".into(),
+        path: path.into(),
+        value: Some(value),
+    };
     let forward = vec![
-        jp("/sourceFiles", serde_json::to_value(&sources).map_err(|e| e.to_string())?),
-        jp("/tracks", serde_json::to_value(&tracks).map_err(|e| e.to_string())?),
-        jp("/regions", serde_json::to_value(&regions).map_err(|e| e.to_string())?),
-        jp("/markers", serde_json::to_value(&markers).map_err(|e| e.to_string())?),
-        jp("/sections", serde_json::to_value(&sections).map_err(|e| e.to_string())?),
-        jp("/bpm", serde_json::to_value(bpm).map_err(|e| e.to_string())?),
-        jp("/tempoPercent", serde_json::to_value(percent as f32).map_err(|e| e.to_string())?),
+        jp(
+            "/sourceFiles",
+            serde_json::to_value(&sources).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/tracks",
+            serde_json::to_value(&tracks).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/regions",
+            serde_json::to_value(&regions).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/markers",
+            serde_json::to_value(&markers).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/sections",
+            serde_json::to_value(&sections).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/bpm",
+            serde_json::to_value(bpm).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/tempoPercent",
+            serde_json::to_value(percent as f32).map_err(|e| e.to_string())?,
+        ),
     ];
     let inverse = vec![
-        jp("/sourceFiles", serde_json::to_value(&old_sources).map_err(|e| e.to_string())?),
-        jp("/tracks", serde_json::to_value(&old_tracks).map_err(|e| e.to_string())?),
-        jp("/regions", serde_json::to_value(&old_regions).map_err(|e| e.to_string())?),
-        jp("/markers", serde_json::to_value(&old_markers).map_err(|e| e.to_string())?),
-        jp("/sections", serde_json::to_value(&old_sections).map_err(|e| e.to_string())?),
-        jp("/bpm", serde_json::to_value(old_bpm).map_err(|e| e.to_string())?),
-        jp("/tempoPercent", serde_json::to_value(old_tempo_percent).map_err(|e| e.to_string())?),
+        jp(
+            "/sourceFiles",
+            serde_json::to_value(&old_sources).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/tracks",
+            serde_json::to_value(&old_tracks).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/regions",
+            serde_json::to_value(&old_regions).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/markers",
+            serde_json::to_value(&old_markers).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/sections",
+            serde_json::to_value(&old_sections).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/bpm",
+            serde_json::to_value(old_bpm).map_err(|e| e.to_string())?,
+        ),
+        jp(
+            "/tempoPercent",
+            serde_json::to_value(old_tempo_percent).map_err(|e| e.to_string())?,
+        ),
     ];
     record_patch(
         &mut project,
         forward,
         inverse,
         HistorySource::User,
-        Some(if reverting { "Tempo restored to original (100%)".to_string() } else { format!("Tempo {percent_label}% (pitch preserved)") }),
+        Some(if reverting {
+            "Tempo restored to original (100%)".to_string()
+        } else {
+            format!("Tempo {percent_label}% (pitch preserved)")
+        }),
     )?;
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
@@ -2430,7 +3034,9 @@ pub async fn stretch_session_tempo(
 }
 
 fn strip_wav_suffix(name: &str) -> String {
-    name.trim_end_matches(".wav").trim_end_matches(".WAV").to_string()
+    name.trim_end_matches(".wav")
+        .trim_end_matches(".WAV")
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2444,29 +3050,47 @@ fn track_onset_envelope(
     track: &crate::model::Track,
     hop: usize,
 ) -> Result<Vec<f32>, String> {
-    let by_id: std::collections::HashMap<&str, &crate::model::SourceFile> =
-        session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
+    let by_id: std::collections::HashMap<&str, &crate::model::SourceFile> = session
+        .source_files
+        .iter()
+        .map(|s| (s.id.as_str(), s))
+        .collect();
     // Synthetic clip list for clip-less tracks.
-    let clips: Vec<(String, u64, u64, u64)> = if track.clips.is_empty() && !track.clips_materialized {
-        let Some(src) = by_id.get(track.source_file_id.as_str()) else { return Err(format!("Track {} has no audio source", track.name)) };
-        vec![(src.id.clone(), track.start_sample, track.start_sample + src.duration_samples, 0)]
+    let clips: Vec<(String, u64, u64, u64)> = if track.clips.is_empty() && !track.clips_materialized
+    {
+        let Some(src) = by_id.get(track.source_file_id.as_str()) else {
+            return Err(format!("Track {} has no audio source", track.name));
+        };
+        vec![(
+            src.id.clone(),
+            track.start_sample,
+            track.start_sample + src.duration_samples,
+            0,
+        )]
     } else {
         track
             .clips
             .iter()
-            .map(|c| (
-                c.source_file_id.clone().unwrap_or_else(|| track.source_file_id.clone()),
-                c.start_sample,
-                c.end_sample,
-                c.source_offset_sample,
-            ))
+            .map(|c| {
+                (
+                    c.source_file_id
+                        .clone()
+                        .unwrap_or_else(|| track.source_file_id.clone()),
+                    c.start_sample,
+                    c.end_sample,
+                    c.source_offset_sample,
+                )
+            })
             .collect()
     };
     let max_end = clips.iter().map(|c| c.2).max().unwrap_or(0);
     let mut env = vec![0f32; (max_end as usize / hop) + 2];
     for (source_id, start, end, source_offset) in clips {
-        let Some(src) = by_id.get(source_id.as_str()) else { continue };
-        let (header, samples) = crate::engine::source::cache::read_cache_all(Path::new(&src.cache_path))?;
+        let Some(src) = by_id.get(source_id.as_str()) else {
+            continue;
+        };
+        let (header, samples) =
+            crate::engine::source::cache::read_cache_all(Path::new(&src.cache_path))?;
         let ch = header.channels.max(1) as usize;
         let clip_frames = (end.saturating_sub(start)) as usize;
         for frame in 0..clip_frames {
@@ -2568,10 +3192,20 @@ pub async fn sync_tracks_to_reference(
     let session_rate = project.session.sample_rate as i64;
     let hop = (project.session.sample_rate / 1000).max(1) as usize; // 1ms
 
-    let reference = project.session.tracks.iter().find(|t| t.id == reference_track_id)
-        .ok_or("Reference track not found")?.clone();
-    let guide = project.session.tracks.iter().find(|t| t.id == guide_track_id)
-        .ok_or("Guide track not found")?.clone();
+    let reference = project
+        .session
+        .tracks
+        .iter()
+        .find(|t| t.id == reference_track_id)
+        .ok_or("Reference track not found")?
+        .clone();
+    let guide = project
+        .session
+        .tracks
+        .iter()
+        .find(|t| t.id == guide_track_id)
+        .ok_or("Guide track not found")?
+        .clone();
     if reference.id == guide.id {
         return Err("Reference and guide must be different tracks.".into());
     }
@@ -2595,7 +3229,10 @@ pub async fn sync_tracks_to_reference(
     let mut tracks = old_tracks.clone();
     let ms_per_sample = 1000.0 / session_rate as f64;
     for track in tracks.iter_mut().filter(|t| move_ids.contains(&t.id)) {
-        if track.clips.is_empty() && !track.clips_materialized && !matches!(track.kind, crate::model::TrackKind::Video) {
+        if track.clips.is_empty()
+            && !track.clips_materialized
+            && !matches!(track.kind, crate::model::TrackKind::Video)
+        {
             let new_start = track.start_sample as i64 + delta_samples;
             if new_start >= 0 {
                 track.start_sample = new_start as u64;
@@ -2603,7 +3240,10 @@ pub async fn sync_tracks_to_reference(
                 // Head-trim: clips replace the base source in the engine, so wrap
                 // the trimmed remainder in a single clip starting at 0.
                 let cut = (-new_start) as u64;
-                let duration = project.session.source_files.iter()
+                let duration = project
+                    .session
+                    .source_files
+                    .iter()
                     .find(|s| s.id == track.source_file_id)
                     .map(|s| s.duration_samples)
                     .unwrap_or(0);
@@ -2665,15 +3305,30 @@ pub async fn sync_tracks_to_reference(
         }
     }
 
-    let jp = |path: &str, value: serde_json::Value| JsonPatchOp { op: "replace".into(), path: path.into(), value: Some(value) };
-    let forward = vec![jp("/tracks", serde_json::to_value(&tracks).map_err(|e| e.to_string())?)];
-    let inverse = vec![jp("/tracks", serde_json::to_value(&old_tracks).map_err(|e| e.to_string())?)];
+    let jp = |path: &str, value: serde_json::Value| JsonPatchOp {
+        op: "replace".into(),
+        path: path.into(),
+        value: Some(value),
+    };
+    let forward = vec![jp(
+        "/tracks",
+        serde_json::to_value(&tracks).map_err(|e| e.to_string())?,
+    )];
+    let inverse = vec![jp(
+        "/tracks",
+        serde_json::to_value(&old_tracks).map_err(|e| e.to_string())?,
+    )];
     record_patch(
         &mut project,
         forward,
         inverse,
         HistorySource::User,
-        Some(format!("Synced {} track(s) to \"{}\" (offset {:.0} ms)", move_ids.len(), reference.name, -offset_ms)),
+        Some(format!(
+            "Synced {} track(s) to \"{}\" (offset {:.0} ms)",
+            move_ids.len(),
+            reference.name,
+            -offset_ms
+        )),
     )?;
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
@@ -2689,13 +3344,20 @@ pub async fn sync_tracks_to_reference(
 #[tauri::command]
 pub async fn start_camera_captures(
     state: State<'_, AppState>,
+    session_id: String,
     specs: Vec<crate::camera_capture::CaptureSpec>,
 ) -> Result<(), String> {
-    let videos_dir = state.store.lock().map_err(|e| e.to_string())?.videos_dir();
-    // Spawning + readiness-waiting is blocking work; keep it off the async core.
-    tauri::async_runtime::spawn_blocking(move || crate::camera_capture::start_captures(videos_dir, specs))
-        .await
+    let videos_dir = state
+        .store
+        .lock()
         .map_err(|e| e.to_string())?
+        .recordings_dir(&session_id)?;
+    // Spawning + readiness-waiting is blocking work; keep it off the async core.
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::camera_capture::start_captures(videos_dir, specs)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Snapshot each capture's media clock at the instant the transport starts —
@@ -2716,7 +3378,10 @@ pub struct CameraPreviewInfo {
 #[tauri::command]
 pub fn get_camera_preview_info() -> Result<CameraPreviewInfo, String> {
     let info = crate::control::info().ok_or("control server not running")?;
-    Ok(CameraPreviewInfo { port: info.port, token: info.token.clone() })
+    Ok(CameraPreviewInfo {
+        port: info.port,
+        token: info.token.clone(),
+    })
 }
 
 /// Stop live previews (empty list = all). Used when preview windows close.
@@ -2742,12 +3407,16 @@ pub async fn stop_camera_captures(
         return Ok(None);
     }
     let track_ids: Vec<String> = specs.iter().map(|s| s.track_id.clone()).collect();
-    let finished = tauri::async_runtime::spawn_blocking(move || crate::camera_capture::stop_captures(&track_ids))
-        .await
-        .map_err(|e| e.to_string())??;
+    let finished = tauri::async_runtime::spawn_blocking(move || {
+        crate::camera_capture::stop_captures(&track_ids)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let mut latest: Option<MixProject> = None;
     for capture in finished {
-        let Some(spec) = specs.iter().find(|s| s.track_id == capture.track_id) else { continue };
+        let Some(spec) = specs.iter().find(|s| s.track_id == capture.track_id) else {
+            continue;
+        };
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let file_name = capture
             .path
@@ -2772,11 +3441,18 @@ pub async fn stop_camera_captures(
         // as an audio track aligned to the same timeline start.
         if spec.create_audio_track {
             if let Some((wav, audio_offset_ms)) = &capture.audio_wav {
-                let trimmed = store
-                    .videos_dir()
-                    .join(format!("{}-audio-{}.wav", Path::new(&file_name).file_stem().and_then(|i| i.to_str()).unwrap_or("camera"), uuid::Uuid::new_v4()));
+                let trimmed = store.recordings_dir(&session_id)?.join(format!(
+                    "{}-audio-{}.wav",
+                    Path::new(&file_name)
+                        .file_stem()
+                        .and_then(|i| i.to_str())
+                        .unwrap_or("camera"),
+                    uuid::Uuid::new_v4()
+                ));
                 if extract_video_audio(wav, &trimmed, sample_rate, *audio_offset_ms).is_ok() {
-                    if let Ok(updated) = store.add_source_file_at(&session_id, &trimmed, spec.start_sample) {
+                    if let Ok(updated) =
+                        store.add_source_file_at(&session_id, &trimmed, spec.start_sample)
+                    {
                         latest = Some(updated);
                     }
                     let _ = fs::remove_file(&trimmed);
@@ -2803,11 +3479,18 @@ pub fn render_video_mix(
     // "high" = `-preset slow -crf 17 -b:a 320k`; otherwise the previous fast defaults.
     quality: Option<String>,
 ) -> Result<RenderResponse, String> {
-    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
     let path = normalize_mp4_path(PathBuf::from(output_path));
     let full_end = session_duration_samples(&project.session);
     let range_start = start_sample.unwrap_or(0).min(full_end);
-    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let range_end = end_sample
+        .unwrap_or(full_end)
+        .min(full_end)
+        .max(range_start + 1);
     let selected_track_ids = track_ids
         .unwrap_or_default()
         .into_iter()
@@ -2816,31 +3499,56 @@ pub fn render_video_mix(
     if selected_track_ids.is_empty() {
         return Err("Select one or more video tracks in the canvas before exporting MP4.".into());
     }
-    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    let video_inputs = collect_video_inputs(
+        &project.session,
+        range_start,
+        range_end,
+        &selected_track_ids,
+    );
     if video_inputs.is_empty() {
         return Err("The selected video tracks have no recorded clips in the export range.".into());
     }
 
-    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    let renders_dir = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
     let audio_path = renders_dir.join(format!("{session_id}.video-export.wav"));
     audio::render_mix(&project.session, &audio_path)?;
 
     let mut command = Command::new("ffmpeg");
-    command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error");
 
     for clip in &video_inputs {
         command.arg("-i").arg(&clip.path);
     }
     if range_start > 0 {
-        command.arg("-ss").arg(format!("{:.3}", range_start as f64 / project.session.sample_rate as f64));
+        command.arg("-ss").arg(format!(
+            "{:.3}",
+            range_start as f64 / project.session.sample_rate as f64
+        ));
     }
     command
         .arg("-t")
-        .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64))
+        .arg(format!(
+            "{:.3}",
+            range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64
+        ))
         .arg("-i")
         .arg(&audio_path);
-    let filter = build_video_filter(&video_inputs, &project.session, range_start, range_end, aspect_ratio.as_deref());
+    let filter = build_video_filter(
+        &video_inputs,
+        &project.session,
+        range_start,
+        range_end,
+        aspect_ratio.as_deref(),
+    );
     command
         .arg("-filter_complex")
         .arg(filter)
@@ -2858,32 +3566,49 @@ pub fn render_video_mix(
         .arg("+faststart");
     if quality.as_deref() == Some("high") {
         command
-            .arg("-preset").arg("slow")
-            .arg("-crf").arg("17")
-            .arg("-c:a").arg("aac")
-            .arg("-b:a").arg("320k");
+            .arg("-preset")
+            .arg("slow")
+            .arg("-crf")
+            .arg("17")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("320k");
     } else {
         command
-            .arg("-preset").arg("veryfast")
-            .arg("-c:a").arg("aac");
+            .arg("-preset")
+            .arg("veryfast")
+            .arg("-c:a")
+            .arg("aac");
     }
     let output = command
         .arg("-shortest")
         .arg(&path)
         .output()
-        .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
+        .map_err(|error| {
+            format!("Could not run ffmpeg. Install ffmpeg to export video: {error}")
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg video export failed: {}", stderr.trim()));
     }
-    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+    Ok(RenderResponse {
+        path: path.to_string_lossy().to_string(),
+    })
 }
 
 #[tauri::command]
-pub fn export_rendered_video(source_path: String, output_path: String, aspect_ratio: Option<String>, quality: Option<String>) -> Result<RenderResponse, String> {
+pub fn export_rendered_video(
+    source_path: String,
+    output_path: String,
+    aspect_ratio: Option<String>,
+    quality: Option<String>,
+) -> Result<RenderResponse, String> {
     let source = PathBuf::from(source_path);
     if !source.exists() {
-        return Err("The Main video render is missing. Run Agent Edit again before exporting.".into());
+        return Err(
+            "The Main video render is missing. Run Agent Edit again before exporting.".into(),
+        );
     }
     let path = normalize_mp4_path(PathBuf::from(output_path));
     if let Some(parent) = path.parent() {
@@ -2900,24 +3625,39 @@ pub fn export_rendered_video(source_path: String, output_path: String, aspect_ra
                 "scale={t_w}:{t_h}:force_original_aspect_ratio=decrease,pad={t_w}:{t_h}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p"
             );
             let mut cmd = Command::new("ffmpeg");
-            cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
-                .arg("-i").arg(&source)
-                .arg("-vf").arg(&filter)
-                .arg("-c:v").arg("libx264")
-                .arg("-pix_fmt").arg("yuv420p")
-                .arg("-movflags").arg("+faststart");
+            cmd.arg("-y")
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-i")
+                .arg(&source)
+                .arg("-vf")
+                .arg(&filter)
+                .arg("-c:v")
+                .arg("libx264")
+                .arg("-pix_fmt")
+                .arg("yuv420p")
+                .arg("-movflags")
+                .arg("+faststart");
             if quality.as_deref() == Some("high") {
                 // Re-encode the padded video with the final-export quality knobs and
                 // re-encode audio at 320 kbps. Copying audio when re-encoding video at
                 // a different rate would risk container hiccups in some players.
-                cmd.arg("-preset").arg("slow").arg("-crf").arg("17")
-                    .arg("-c:a").arg("aac").arg("-b:a").arg("320k");
+                cmd.arg("-preset")
+                    .arg("slow")
+                    .arg("-crf")
+                    .arg("17")
+                    .arg("-c:a")
+                    .arg("aac")
+                    .arg("-b:a")
+                    .arg("320k");
             } else {
                 // Fast aspect transcode — keep audio bit-for-bit so we don't lose more.
-                cmd.arg("-preset").arg("veryfast")
-                    .arg("-c:a").arg("copy");
+                cmd.arg("-preset").arg("veryfast").arg("-c:a").arg("copy");
             }
-            let output = cmd.arg(&path).output()
+            let output = cmd
+                .arg(&path)
+                .output()
                 .map_err(|error| format!("Could not run ffmpeg: {error}"))?;
             if !output.status.success() {
                 return Err(format!(
@@ -2925,14 +3665,20 @@ pub fn export_rendered_video(source_path: String, output_path: String, aspect_ra
                     String::from_utf8_lossy(&output.stderr).trim()
                 ));
             }
-            return Ok(RenderResponse { path: path.to_string_lossy().to_string() });
+            return Ok(RenderResponse {
+                path: path.to_string_lossy().to_string(),
+            });
         }
     }
     if source == path {
-        return Ok(RenderResponse { path: path.to_string_lossy().to_string() });
+        return Ok(RenderResponse {
+            path: path.to_string_lossy().to_string(),
+        });
     }
     fs::copy(&source, &path).map_err(|error| format!("Could not export Main video: {error}"))?;
-    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+    Ok(RenderResponse {
+        path: path.to_string_lossy().to_string(),
+    })
 }
 
 /// Compute the output box (even dims) for a target aspect ratio + max long-edge size.
@@ -2943,19 +3689,30 @@ fn export_target_box(src_w: i32, src_h: i32, aspect: &str, max_dim: Option<u32>)
         (src_w.max(1) as f64, src_h.max(1) as f64)
     } else {
         let mut parts = aspect.split(&[':', 'x', '/'][..]);
-        let a = parts.next().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(16.0);
-        let b = parts.next().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(9.0);
+        let a = parts
+            .next()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(16.0);
+        let b = parts
+            .next()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(9.0);
         (a.max(0.01), b.max(0.01))
     };
     let ratio = aw / ah; // width / height
-    // Default long edge: the source's longer side, so "Source" resolution = no upscale.
-    let long = max_dim.map(|m| m as f64).unwrap_or_else(|| src_w.max(src_h) as f64);
+                         // Default long edge: the source's longer side, so "Source" resolution = no upscale.
+    let long = max_dim
+        .map(|m| m as f64)
+        .unwrap_or_else(|| src_w.max(src_h) as f64);
     let (w, h) = if ratio >= 1.0 {
         (long, long / ratio) // landscape or square
     } else {
         (long * ratio, long) // portrait
     };
-    (even_dimension(w.round() as i32).max(2), even_dimension(h.round() as i32).max(2))
+    (
+        even_dimension(w.round() as i32).max(2),
+        even_dimension(h.round() as i32).max(2),
+    )
 }
 
 /// Export a rendered video at an arbitrary aspect ratio + resolution.
@@ -2983,9 +3740,12 @@ pub async fn export_video(
     }
     // Run the (blocking) encode off the main thread so the UI stays responsive,
     // and stream ffmpeg's progress out as `video-export:progress` events.
-    let result = tokio::task::spawn_blocking(move || run_export_blocking(app, source.clone(), path, aspect, max_dimension, mode).map(|r| (r, source)))
-        .await
-        .map_err(|error| format!("export task failed: {error}"))?;
+    let result = tokio::task::spawn_blocking(move || {
+        run_export_blocking(app, source.clone(), path, aspect, max_dimension, mode)
+            .map(|r| (r, source))
+    })
+    .await
+    .map_err(|error| format!("export task failed: {error}"))?;
     match result {
         Ok((response, source)) => {
             // Two-stage exports pass an intermediate mix render as the source —
@@ -3002,14 +3762,24 @@ pub async fn export_video(
 /// Total duration in seconds via ffprobe (None if unavailable → indeterminate progress).
 fn probe_video_duration(path: &Path) -> Option<f64> {
     let out = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
         .arg(path)
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok()
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
 }
 
 fn run_export_blocking(
@@ -3036,26 +3806,46 @@ fn run_export_blocking(
     };
 
     let emit = |percent: f64, stage: &str| {
-        let _ = app.emit("video-export:progress", serde_json::json!({ "percent": percent, "stage": stage }));
+        let _ = app.emit(
+            "video-export:progress",
+            serde_json::json!({ "percent": percent, "stage": stage }),
+        );
     };
     emit(0.0, "start");
 
     let mut child = Command::new("ffmpeg")
-        .arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
-        .arg("-i").arg(&source)
-        .arg("-vf").arg(&filter)
-        .arg("-c:v").arg("libx264")
-        .arg("-preset").arg("slow")
-        .arg("-crf").arg("17")
-        .arg("-pix_fmt").arg("yuv420p")
-        .arg("-movflags").arg("+faststart")
-        .arg("-c:a").arg("aac").arg("-b:a").arg("320k")
-        .arg("-progress").arg("pipe:1").arg("-nostats")
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(&source)
+        .arg("-vf")
+        .arg(&filter)
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("slow")
+        .arg("-crf")
+        .arg("17")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("320k")
+        .arg("-progress")
+        .arg("pipe:1")
+        .arg("-nostats")
         .arg(&path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
+        .map_err(|error| {
+            format!("Could not run ffmpeg. Install ffmpeg to export video: {error}")
+        })?;
 
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
@@ -3077,7 +3867,9 @@ fn run_export_blocking(
         }
     }
 
-    let status = child.wait().map_err(|error| format!("ffmpeg wait failed: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("ffmpeg wait failed: {error}"))?;
     if !status.success() {
         let mut err = String::new();
         if let Some(mut se) = child.stderr.take() {
@@ -3087,7 +3879,9 @@ fn run_export_blocking(
         return Err(format!("ffmpeg export failed: {}", err.trim()));
     }
     emit(100.0, "done");
-    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+    Ok(RenderResponse {
+        path: path.to_string_lossy().to_string(),
+    })
 }
 
 #[tauri::command]
@@ -3100,11 +3894,18 @@ pub fn render_auto_video_edit(
     track_ids: Vec<String>,
     sample_interval_seconds: Option<f64>,
 ) -> Result<RenderResponse, String> {
-    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
     let path = normalize_mp4_path(PathBuf::from(output_path));
     let full_end = session_duration_samples(&project.session);
     let range_start = start_sample.unwrap_or(0).min(full_end);
-    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let range_end = end_sample
+        .unwrap_or(full_end)
+        .min(full_end)
+        .max(range_start + 1);
     let selected_track_ids = track_ids
         .into_iter()
         .filter(|id| !id.trim().is_empty())
@@ -3112,36 +3913,73 @@ pub fn render_auto_video_edit(
     if selected_track_ids.is_empty() {
         return Err("Select one or more video tracks before running Auto Video Edit.".into());
     }
-    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    let video_inputs = collect_video_inputs(
+        &project.session,
+        range_start,
+        range_end,
+        &selected_track_ids,
+    );
     if video_inputs.is_empty() {
         return Err("The selected video tracks have no recorded clips in the edit range.".into());
     }
-    let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0) * project.session.sample_rate as f64).round() as u64).max(1);
-    let segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
+    let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0)
+        * project.session.sample_rate as f64)
+        .round() as u64)
+        .max(1);
+    let segments = build_auto_edit_segments(
+        &video_inputs,
+        range_start,
+        range_end,
+        interval_samples,
+        project.session.sample_rate,
+    );
     if segments.is_empty() {
-        return Err("Auto Video Edit could not find visible selected clips in the edit range.".into());
+        return Err(
+            "Auto Video Edit could not find visible selected clips in the edit range.".into(),
+        );
     }
 
-    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    let renders_dir = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
     let audio_path = renders_dir.join(format!("{session_id}.auto-video-edit.wav"));
     audio::render_mix(&project.session, &audio_path)?;
 
     let mut command = Command::new("ffmpeg");
-    command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error");
     for clip in &video_inputs {
         command.arg("-i").arg(&clip.path);
     }
     if range_start > 0 {
-        command.arg("-ss").arg(format!("{:.3}", range_start as f64 / project.session.sample_rate as f64));
+        command.arg("-ss").arg(format!(
+            "{:.3}",
+            range_start as f64 / project.session.sample_rate as f64
+        ));
     }
     command
         .arg("-t")
-        .arg(format!("{:.3}", range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64))
+        .arg(format!(
+            "{:.3}",
+            range_end.saturating_sub(range_start) as f64 / project.session.sample_rate as f64
+        ))
         .arg("-i")
         .arg(&audio_path);
 
-    let filter = build_auto_edit_filter(&video_inputs, &segments, &project.session, range_start, range_end, None);
+    let filter = build_auto_edit_filter(
+        &video_inputs,
+        &segments,
+        &project.session,
+        range_start,
+        range_end,
+        None,
+    );
     command
         .arg("-filter_complex")
         .arg(filter)
@@ -3160,12 +3998,16 @@ pub fn render_auto_video_edit(
         .arg("-shortest")
         .arg(&path)
         .output()
-        .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
+        .map_err(|error| {
+            format!("Could not run ffmpeg. Install ffmpeg to export video: {error}")
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg auto video edit failed: {}", stderr.trim()));
     }
-    Ok(RenderResponse { path: path.to_string_lossy().to_string() })
+    Ok(RenderResponse {
+        path: path.to_string_lossy().to_string(),
+    })
 }
 
 /// Direct-edit path for a single video clip. Takes the user's chat text, extracts a
@@ -3185,16 +4027,30 @@ pub async fn apply_clip_effects(
     vision_model: Option<String>,
 ) -> Result<ApplyClipEffectsResponse, String> {
     assistant::reset_agent_cancel();
-    let project = state.store.lock().map_err(|e| e.to_string())?.get_project(&session_id)?;
-    let track = project.session.tracks.iter().find(|t| t.id == track_id)
+    let project = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get_project(&session_id)?;
+    let track = project
+        .session
+        .tracks
+        .iter()
+        .find(|t| t.id == track_id)
         .ok_or("Track not found")?;
     if !matches!(track.kind, crate::model::TrackKind::Video) {
         return Err("Selected track is not a video track.".into());
     }
-    let clip = track.video_clips.iter().find(|c| c.id == clip_id)
+    let clip = track
+        .video_clips
+        .iter()
+        .find(|c| c.id == clip_id)
         .ok_or("Clip not found on the selected track")?
         .clone();
-    let source = project.session.video_source_files.iter()
+    let source = project
+        .session
+        .video_source_files
+        .iter()
         .find(|s| s.id == clip.video_source_file_id)
         .ok_or("Clip's video source file is missing")?
         .clone();
@@ -3217,15 +4073,28 @@ pub async fn apply_clip_effects(
     // 2. LLM refinement: extract one frame at the clip's midpoint, ask the vision
     //    model to refine. Best-effort — failures are silent and the keyword baseline
     //    still ships, so the user always sees a change.
-    let temp_dir = state.config.data_dir.join("clip-edit").join(uuid::Uuid::new_v4().to_string());
+    let temp_dir = state
+        .config
+        .data_dir
+        .join("clip-edit")
+        .join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&temp_dir).map_err(|e| format!("Could not prepare temp dir: {e}"))?;
     let frame_path = temp_dir.join("frame.jpg");
     let frame_time_in_source = source_offset_s + (duration_s / 2.0);
     let _ = Command::new("ffmpeg")
         .args(["-y", "-hide_banner", "-loglevel", "error"])
-        .arg("-ss").arg(format!("{frame_time_in_source:.3}"))
-        .arg("-i").arg(&source_path)
-        .args(["-frames:v", "1", "-q:v", "8", "-vf", "scale=512:512:force_original_aspect_ratio=decrease"])
+        .arg("-ss")
+        .arg(format!("{frame_time_in_source:.3}"))
+        .arg("-i")
+        .arg(&source_path)
+        .args([
+            "-frames:v",
+            "1",
+            "-q:v",
+            "8",
+            "-vf",
+            "scale=512:512:force_original_aspect_ratio=decrease",
+        ])
         .arg(&frame_path)
         .status();
     let llm_choice: Option<ClipEffectsChoice> = if frame_path.exists() {
@@ -3240,22 +4109,53 @@ pub async fn apply_clip_effects(
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "qwen2.5vl:latest".to_string());
             let frame_b64 = BASE64_STANDARD.encode(bytes);
-            analyze_clip_effects(&base_url, &model, frame_b64, &instructions).await.ok()
-        } else { None }
-    } else { None };
+            analyze_clip_effects(&base_url, &model, frame_b64, &instructions)
+                .await
+                .ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let _ = fs::remove_dir_all(&temp_dir);
 
     // 3. Merge: LLM wins where present; keyword fallback per-field.
-    let llm_look = llm_choice.as_ref()
+    let llm_look = llm_choice
+        .as_ref()
         .and_then(|c| c.look_preset.as_deref())
         .and_then(parse_video_filter_preset);
-    let llm_grade = llm_choice.as_ref().and_then(|c| c.color_grade.clone())
+    let llm_grade = llm_choice
+        .as_ref()
+        .and_then(|c| c.color_grade.clone())
         .filter(|g| build_color_grade_filter(g).is_some());
-    let llm_effects = llm_choice.as_ref().and_then(|c| c.video_effects.clone())
-        .filter(|e| e.fade_in_seconds.is_some() || e.fade_out_seconds.is_some() || e.speed_factor.is_some());
-    let look_source = if llm_look.is_some() { "llm" } else if kw_look.is_some() { "keywords" } else { "none" };
-    let grade_source = if llm_grade.is_some() { "llm" } else if kw_grade.is_some() { "keywords" } else { "none" };
-    let effects_source = if llm_effects.is_some() { "llm" } else if kw_effects.is_some() { "keywords" } else { "none" };
+    let llm_effects = llm_choice
+        .as_ref()
+        .and_then(|c| c.video_effects.clone())
+        .filter(|e| {
+            e.fade_in_seconds.is_some() || e.fade_out_seconds.is_some() || e.speed_factor.is_some()
+        });
+    let look_source = if llm_look.is_some() {
+        "llm"
+    } else if kw_look.is_some() {
+        "keywords"
+    } else {
+        "none"
+    };
+    let grade_source = if llm_grade.is_some() {
+        "llm"
+    } else if kw_grade.is_some() {
+        "keywords"
+    } else {
+        "none"
+    };
+    let effects_source = if llm_effects.is_some() {
+        "llm"
+    } else if kw_effects.is_some() {
+        "keywords"
+    } else {
+        "none"
+    };
     let chosen_look = llm_look.or(kw_look);
     let chosen_grade = llm_grade.or(kw_grade);
     let chosen_effects = llm_effects.or(kw_effects);
@@ -3266,38 +4166,89 @@ pub async fn apply_clip_effects(
 
     // 4. Build filter chains and render only the clip's source range to a new mp4.
     let grade_filter = chosen_grade.as_ref().and_then(build_color_grade_filter);
-    let (veff_chain, aeff_chain, _speed) = chosen_effects.as_ref()
+    let (veff_chain, aeff_chain, _speed) = chosen_effects
+        .as_ref()
         .map(|e| build_effects_filters(e, duration_s))
         .unwrap_or((None, None, 1.0));
     let mut vparts: Vec<String> = Vec::new();
-    if let Some(g) = grade_filter { vparts.push(g); }
-    if let Some(v) = veff_chain { vparts.push(v); }
-    let vf = if vparts.is_empty() { None } else { Some(vparts.join(",")) };
+    if let Some(g) = grade_filter {
+        vparts.push(g);
+    }
+    if let Some(v) = veff_chain {
+        vparts.push(v);
+    }
+    let vf = if vparts.is_empty() {
+        None
+    } else {
+        Some(vparts.join(","))
+    };
 
-    let renders_dir = state.store.lock().map_err(|e| e.to_string())?.renders_dir();
+    let renders_dir = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|e| e.to_string())?;
     let output_path = renders_dir.join(format!("clip-edit-{}.mp4", uuid::Uuid::new_v4()));
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
-        .arg("-ss").arg(format!("{source_offset_s:.3}"))
-        .arg("-t").arg(format!("{duration_s:.3}"))
-        .arg("-i").arg(&source_path);
-    if let Some(filter) = vf { cmd.arg("-vf").arg(filter); }
-    if let Some(af) = aeff_chain { cmd.arg("-af").arg(af); }
+        .arg("-ss")
+        .arg(format!("{source_offset_s:.3}"))
+        .arg("-t")
+        .arg(format!("{duration_s:.3}"))
+        .arg("-i")
+        .arg(&source_path);
+    if let Some(filter) = vf {
+        cmd.arg("-vf").arg(filter);
+    }
+    if let Some(af) = aeff_chain {
+        cmd.arg("-af").arg(af);
+    }
     cmd.args([
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart", "-r", "30", "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
-        "-c:a", "aac", "-shortest",
-    ]).arg(&output_path);
-    let out = cmd.output().map_err(|e| format!("Could not run ffmpeg: {e}"))?;
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-r",
+        "30",
+        "-g",
+        "30",
+        "-keyint_min",
+        "30",
+        "-sc_threshold",
+        "0",
+        "-c:a",
+        "aac",
+        "-shortest",
+    ])
+    .arg(&output_path);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("Could not run ffmpeg: {e}"))?;
     if !out.status.success() {
-        return Err(format!("ffmpeg clip edit failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(format!(
+            "ffmpeg clip edit failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
 
     // 5. Swap the rendered file into the clip in place.
     let duration_ms = (duration_s * 1000.0).round() as u64;
-    let updated = state.store.lock().map_err(|e| e.to_string())?
-        .replace_track_video(&session_id, &track_id, &clip_id, &output_path, duration_ms.max(1))?;
+    let updated = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .replace_track_video(
+            &session_id,
+            &track_id,
+            &clip_id,
+            &output_path,
+            duration_ms.max(1),
+        )?;
     let _ = fs::remove_file(&output_path);
     if let Ok(mut audio) = state.audio.lock() {
         audio.bind_session_sources(&updated.session)?;
@@ -3324,7 +4275,10 @@ pub fn revert_clip_video(
     track_id: String,
     clip_id: String,
 ) -> Result<MixProject, String> {
-    let updated = state.store.lock().map_err(|e| e.to_string())?
+    let updated = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
         .revert_clip_to_pristine(&session_id, &track_id, &clip_id)?;
     if let Ok(mut audio) = state.audio.lock() {
         audio.bind_session_sources(&updated.session)?;
@@ -3356,35 +4310,78 @@ pub async fn render_agent_video_edit(
 ) -> Result<AgentVideoEditResponse, String> {
     assistant::reset_agent_cancel();
     let started = std::time::Instant::now();
-    emit_agent_progress(&app, &session_id, &started, "starting", "Preparing Agent Video Edit...", 0, 1);
-    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    emit_agent_progress(
+        &app,
+        &session_id,
+        &started,
+        "starting",
+        "Preparing Agent Video Edit...",
+        0,
+        1,
+    );
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
     // No save dialog by default — render straight to the renders folder. The frontend
     // adds the result as a new video track; the Download button lets the user export later.
     let path = match output_path.filter(|value| !value.trim().is_empty()) {
         Some(value) => normalize_mp4_path(PathBuf::from(value)),
         None => {
-            let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+            let renders_dir = state
+                .store
+                .lock()
+                .map_err(|error| error.to_string())?
+                .renders_dir(&session_id)?;
             std::fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
             renders_dir.join(format!("agent-edit-{}.mp4", uuid::Uuid::new_v4()))
         }
     };
     let full_end = session_duration_samples(&project.session);
     let range_start = start_sample.unwrap_or(0).min(full_end);
-    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let range_end = end_sample
+        .unwrap_or(full_end)
+        .min(full_end)
+        .max(range_start + 1);
     let selected_track_ids = track_ids
         .into_iter()
         .filter(|id| !id.trim().is_empty())
         .collect::<HashSet<_>>();
     if selected_track_ids.is_empty() {
-        emit_agent_progress(&app, &session_id, &started, "error", "No selected video tracks.", 0, 1);
+        emit_agent_progress(
+            &app,
+            &session_id,
+            &started,
+            "error",
+            "No selected video tracks.",
+            0,
+            1,
+        );
         return Err("Select one or more video tracks before running Agent Video Edit.".into());
     }
-    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    let video_inputs = collect_video_inputs(
+        &project.session,
+        range_start,
+        range_end,
+        &selected_track_ids,
+    );
     if video_inputs.is_empty() {
-        emit_agent_progress(&app, &session_id, &started, "error", "Selected tracks have no clips in range.", 0, 1);
+        emit_agent_progress(
+            &app,
+            &session_id,
+            &started,
+            "error",
+            "Selected tracks have no clips in range.",
+            0,
+            1,
+        );
         return Err("The selected video tracks have no recorded clips in the edit range.".into());
     }
-    let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0) * project.session.sample_rate as f64).round() as u64).max(1);
+    let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0)
+        * project.session.sample_rate as f64)
+        .round() as u64)
+        .max(1);
     let base_url = ollama_base_url
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| state.config.ollama_base_url.clone())
@@ -3400,16 +4397,39 @@ pub async fn render_agent_video_edit(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| fallback_model.clone());
     if base_url.is_empty() || vision_model.is_empty() || edit_model.is_empty() {
-        emit_agent_progress(&app, &session_id, &started, "error", "No model server configured.", 0, 1);
+        emit_agent_progress(
+            &app,
+            &session_id,
+            &started,
+            "error",
+            "No model server configured.",
+            0,
+            1,
+        );
         return Err("Configure the model server before running Agent Video Edit.".into());
     }
     let instructions = instructions
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let total_windows = range_end.saturating_sub(range_start).div_ceil(interval_samples).max(1) as u32;
-    emit_agent_progress(&app, &session_id, &started, "audio", "Rendering mix audio for agent analysis...", 0, total_windows);
-    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    let total_windows = range_end
+        .saturating_sub(range_start)
+        .div_ceil(interval_samples)
+        .max(1) as u32;
+    emit_agent_progress(
+        &app,
+        &session_id,
+        &started,
+        "audio",
+        "Rendering mix audio for agent analysis...",
+        0,
+        total_windows,
+    );
+    let renders_dir = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
     let audio_path = renders_dir.join(format!("{session_id}.agent-video-edit.wav"));
     // Render the audio mix only across the selected range, in memory — way faster than
@@ -3421,7 +4441,15 @@ pub async fn render_agent_video_edit(
         range_end,
     )
     .map_err(|error| {
-        emit_agent_progress(&app, &session_id, &started, "error", "Could not render mix audio for the video agent.", 0, total_windows);
+        emit_agent_progress(
+            &app,
+            &session_id,
+            &started,
+            "error",
+            "Could not render mix audio for the video agent.",
+            0,
+            total_windows,
+        );
         error
     })?;
     let audio_analysis = RenderedAudioAnalysis {
@@ -3441,65 +4469,186 @@ pub async fn render_agent_video_edit(
         &session_id,
         &started,
         "sampling",
-        &format!("Sampling frames from {} selected video tracks...", selected_track_ids.len()),
+        &format!(
+            "Sampling frames from {} selected video tracks...",
+            selected_track_ids.len()
+        ),
         0,
         total_windows,
     );
-    let temp_dir = state.config.data_dir.join("agent-video-edit").join(uuid::Uuid::new_v4().to_string());
-    fs::create_dir_all(&temp_dir).map_err(|error| format!("Could not prepare agent frame cache: {error}"))?;
-    let (segments, script, agent_look_preset, agent_color_grade, agent_effects) = build_agent_edit_segments(
-        &app,
-        &started,
-        &video_inputs,
-        &project.session,
-        range_start,
-        range_end,
-        interval_samples,
-        &base_url,
-        &vision_model,
-        &edit_model,
-        instructions.as_deref(),
-        Some(&audio_analysis),
-        &temp_dir,
-    )
-    .await
-    .unwrap_or_else(|error| {
-        emit_agent_progress(&app, &session_id, &started, "fallback", &format!("Vision agent failed; using automatic cuts. {error}"), 0, total_windows);
-        let segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
-        let script = build_fallback_agent_script(&video_inputs, &segments, range_start, range_end, total_windows, project.session.sample_rate, &error);
-        // Even on agent failure, honor explicit keyword effects from the instructions.
-        let kw_effects = instructions.as_deref().and_then(infer_effects_from_instructions);
-        let (kw_look, kw_grade) = instructions.as_deref().map(infer_look_from_instructions).unwrap_or((None, None));
-        (segments, script, kw_look, kw_grade, kw_effects)
-    });
+    let temp_dir = state
+        .config
+        .data_dir
+        .join("agent-video-edit")
+        .join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir_all(&temp_dir)
+        .map_err(|error| format!("Could not prepare agent frame cache: {error}"))?;
+    let (segments, script, agent_look_preset, agent_color_grade, agent_effects) =
+        build_agent_edit_segments(
+            &app,
+            &started,
+            &video_inputs,
+            &project.session,
+            range_start,
+            range_end,
+            interval_samples,
+            &base_url,
+            &vision_model,
+            &edit_model,
+            instructions.as_deref(),
+            Some(&audio_analysis),
+            &temp_dir,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            emit_agent_progress(
+                &app,
+                &session_id,
+                &started,
+                "fallback",
+                &format!("Vision agent failed; using automatic cuts. {error}"),
+                0,
+                total_windows,
+            );
+            let segments = build_auto_edit_segments(
+                &video_inputs,
+                range_start,
+                range_end,
+                interval_samples,
+                project.session.sample_rate,
+            );
+            let script = build_fallback_agent_script(
+                &video_inputs,
+                &segments,
+                range_start,
+                range_end,
+                total_windows,
+                project.session.sample_rate,
+                &error,
+            );
+            // Even on agent failure, honor explicit keyword effects from the instructions.
+            let kw_effects = instructions
+                .as_deref()
+                .and_then(infer_effects_from_instructions);
+            let (kw_look, kw_grade) = instructions
+                .as_deref()
+                .map(infer_look_from_instructions)
+                .unwrap_or((None, None));
+            (segments, script, kw_look, kw_grade, kw_effects)
+        });
     let _ = fs::remove_dir_all(&temp_dir);
     if segments.is_empty() {
-        emit_agent_progress(&app, &session_id, &started, "error", "No visible clips found in selected range.", 0, total_windows);
-        return Err("Agent Video Edit could not find visible selected clips in the edit range.".into());
+        emit_agent_progress(
+            &app,
+            &session_id,
+            &started,
+            "error",
+            "No visible clips found in selected range.",
+            0,
+            total_windows,
+        );
+        return Err(
+            "Agent Video Edit could not find visible selected clips in the edit range.".into(),
+        );
     }
 
     if plan_only.unwrap_or(false) {
-        emit_agent_progress(&app, &session_id, &started, "done", "Plan ready for review.", total_windows, total_windows);
-        return Ok(AgentVideoEditResponse { path: String::new(), script, look_preset: agent_look_preset, color_grade: agent_color_grade, video_effects: agent_effects });
+        emit_agent_progress(
+            &app,
+            &session_id,
+            &started,
+            "done",
+            "Plan ready for review.",
+            total_windows,
+            total_windows,
+        );
+        return Ok(AgentVideoEditResponse {
+            path: String::new(),
+            script,
+            look_preset: agent_look_preset,
+            color_grade: agent_color_grade,
+            video_effects: agent_effects,
+        });
     }
 
-    emit_agent_progress(&app, &session_id, &started, "audio", "Using analyzed mix audio for video export...", total_windows, total_windows);
+    emit_agent_progress(
+        &app,
+        &session_id,
+        &started,
+        "audio",
+        "Using analyzed mix audio for video export...",
+        total_windows,
+        total_windows,
+    );
     // Prefer the free-form color grade when present (richer than a named preset).
     // Fall back to the named preset if the model only voted that.
-    let grade_filter = agent_color_grade.as_ref().and_then(build_color_grade_filter);
+    let grade_filter = agent_color_grade
+        .as_ref()
+        .and_then(build_color_grade_filter);
     let look_label = if grade_filter.is_some() {
-        agent_color_grade.as_ref().and_then(|g| g.name.clone()).unwrap_or_else(|| "custom grade".to_string())
+        agent_color_grade
+            .as_ref()
+            .and_then(|g| g.name.clone())
+            .unwrap_or_else(|| "custom grade".to_string())
     } else {
-        agent_look_preset.as_ref().map(|preset| format!("{:?}", preset)).unwrap_or_else(|| "no grade".to_string())
+        agent_look_preset
+            .as_ref()
+            .map(|preset| format!("{:?}", preset))
+            .unwrap_or_else(|| "no grade".to_string())
     };
-    emit_agent_progress(&app, &session_id, &started, "rendering", &format!("Rendering {} selected cuts to MP4 ({look_label})...", segments.len()), total_windows, total_windows);
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &path, agent_look_preset.clone(), grade_filter, agent_effects.clone(), false)
-        .map_err(|error| {
-            emit_agent_progress(&app, &session_id, &started, "error", "ffmpeg failed while rendering the agent edit.", total_windows, total_windows);
-            error
-        })?;
-    emit_agent_progress(&app, &session_id, &started, "done", "Agent Video Edit complete.", total_windows, total_windows);
-    Ok(AgentVideoEditResponse { path: path.to_string_lossy().to_string(), script, look_preset: agent_look_preset, color_grade: agent_color_grade, video_effects: agent_effects })
+    emit_agent_progress(
+        &app,
+        &session_id,
+        &started,
+        "rendering",
+        &format!(
+            "Rendering {} selected cuts to MP4 ({look_label})...",
+            segments.len()
+        ),
+        total_windows,
+        total_windows,
+    );
+    render_segments_ffmpeg(
+        &project.session,
+        &video_inputs,
+        &segments,
+        &audio_path,
+        range_start,
+        range_end,
+        &path,
+        agent_look_preset.clone(),
+        grade_filter,
+        agent_effects.clone(),
+        false,
+    )
+    .map_err(|error| {
+        emit_agent_progress(
+            &app,
+            &session_id,
+            &started,
+            "error",
+            "ffmpeg failed while rendering the agent edit.",
+            total_windows,
+            total_windows,
+        );
+        error
+    })?;
+    emit_agent_progress(
+        &app,
+        &session_id,
+        &started,
+        "done",
+        "Agent Video Edit complete.",
+        total_windows,
+        total_windows,
+    );
+    Ok(AgentVideoEditResponse {
+        path: path.to_string_lossy().to_string(),
+        script,
+        look_preset: agent_look_preset,
+        color_grade: agent_color_grade,
+        video_effects: agent_effects,
+    })
 }
 
 /// Render a sequence of edit segments (each picking one source clip for a time span)
@@ -3525,21 +4674,36 @@ fn render_segments_ffmpeg(
     high_quality: bool,
 ) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
-    command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error");
     for clip in video_inputs {
         command.arg("-i").arg(&clip.path);
     }
     if range_start > 0 {
-        command.arg("-ss").arg(format!("{:.3}", range_start as f64 / session.sample_rate as f64));
+        command.arg("-ss").arg(format!(
+            "{:.3}",
+            range_start as f64 / session.sample_rate as f64
+        ));
     }
-    let range_duration_s = range_end.saturating_sub(range_start) as f64 / session.sample_rate as f64;
+    let range_duration_s =
+        range_end.saturating_sub(range_start) as f64 / session.sample_rate as f64;
     command
         .arg("-t")
         .arg(format!("{range_duration_s:.3}"))
         .arg("-i")
         .arg(audio_path);
 
-    let base_filter = build_auto_edit_filter(video_inputs, segments, session, range_start, range_end, look_override);
+    let base_filter = build_auto_edit_filter(
+        video_inputs,
+        segments,
+        session,
+        range_start,
+        range_end,
+        look_override,
+    );
     let (video_post_chain, audio_chain, _speed) = effects
         .as_ref()
         .map(|e| build_effects_filters(e, range_duration_s))
@@ -3553,7 +4717,11 @@ fn render_segments_ffmpeg(
     if let Some(v) = video_post_chain.as_ref().filter(|s| !s.is_empty()) {
         post_parts.push(v.clone());
     }
-    let combined_post = if post_parts.is_empty() { None } else { Some(post_parts.join(",")) };
+    let combined_post = if post_parts.is_empty() {
+        None
+    } else {
+        Some(post_parts.join(","))
+    };
     let audio_index = video_inputs.len();
     // Wrap the base filter with post-video chain when present.
     let filter_with_video = match combined_post {
@@ -3598,26 +4766,38 @@ fn render_segments_ffmpeg(
         // Longer GOP (60) for better compression — final output is for delivery,
         // not for the in-app scrubber.
         command
-            .arg("-preset").arg("slow")
-            .arg("-crf").arg("17")
-            .arg("-g").arg("60")
-            .arg("-c:a").arg("aac")
-            .arg("-b:a").arg("320k");
+            .arg("-preset")
+            .arg("slow")
+            .arg("-crf")
+            .arg("17")
+            .arg("-g")
+            .arg("60")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("320k");
     } else {
         // Fast preview render: short GOP so the in-app `<video>.currentTime = ...`
         // scrubber doesn't decode long GOPs to display one frame.
         command
-            .arg("-preset").arg("veryfast")
-            .arg("-g").arg("30")
-            .arg("-keyint_min").arg("30")
-            .arg("-sc_threshold").arg("0")
-            .arg("-c:a").arg("aac");
+            .arg("-preset")
+            .arg("veryfast")
+            .arg("-g")
+            .arg("30")
+            .arg("-keyint_min")
+            .arg("30")
+            .arg("-sc_threshold")
+            .arg("0")
+            .arg("-c:a")
+            .arg("aac");
     }
     let output = command
         .arg("-shortest")
         .arg(output_path)
         .output()
-        .map_err(|error| format!("Could not run ffmpeg. Install ffmpeg to export video: {error}"))?;
+        .map_err(|error| {
+            format!("Could not run ffmpeg. Install ffmpeg to export video: {error}")
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg video edit failed: {}", stderr.trim()));
@@ -3636,17 +4816,20 @@ fn build_segments_from_script(
 ) -> Vec<AutoEditSegment> {
     let mut segments = Vec::new();
     for entry in script {
-        let Some(track_index) = entry.chosen_track_index else { continue };
-        let window_start = ((entry.start_seconds * sample_rate as f64).round() as u64).max(range_start);
+        let Some(track_index) = entry.chosen_track_index else {
+            continue;
+        };
+        let window_start =
+            ((entry.start_seconds * sample_rate as f64).round() as u64).max(range_start);
         let window_end = ((entry.end_seconds * sample_rate as f64).round() as u64).min(range_end);
         if window_end <= window_start {
             continue;
         }
-        let Some((input_index, clip)) = clips
-            .iter()
-            .enumerate()
-            .find(|(_, clip)| clip.track_index == track_index && clip.start_sample < window_end && clip.end_sample > window_start)
-        else {
+        let Some((input_index, clip)) = clips.iter().enumerate().find(|(_, clip)| {
+            clip.track_index == track_index
+                && clip.start_sample < window_end
+                && clip.end_sample > window_start
+        }) else {
             continue;
         };
         let segment_start = window_start.max(clip.start_sample);
@@ -3655,7 +4838,9 @@ fn build_segments_from_script(
             continue;
         }
         let source_offset_ms = clip.source_offset_ms.saturating_add(
-            (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64) * 1000.0).round() as u64,
+            (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64)
+                * 1000.0)
+                .round() as u64,
         );
         segments.push(AutoEditSegment {
             input_index,
@@ -3692,10 +4877,17 @@ pub fn render_video_from_script(
     // (None / "fast" / "preview") = fast preview encoder.
     quality: Option<String>,
 ) -> Result<RenderFromScriptResponse, String> {
-    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
     let full_end = session_duration_samples(&project.session);
     let range_start = start_sample.unwrap_or(0).min(full_end);
-    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let range_end = end_sample
+        .unwrap_or(full_end)
+        .min(full_end)
+        .max(range_start + 1);
     let selected_track_ids = source_track_ids
         .into_iter()
         .filter(|id| !id.trim().is_empty())
@@ -3703,29 +4895,65 @@ pub fn render_video_from_script(
     if selected_track_ids.is_empty() {
         return Err("No source video tracks to render from.".into());
     }
-    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    let video_inputs = collect_video_inputs(
+        &project.session,
+        range_start,
+        range_end,
+        &selected_track_ids,
+    );
     if video_inputs.is_empty() {
         return Err("The source video tracks have no clips in the edit range.".into());
     }
-    let mut segments = build_segments_from_script(&video_inputs, &script, range_start, range_end, project.session.sample_rate);
+    let mut segments = build_segments_from_script(
+        &video_inputs,
+        &script,
+        range_start,
+        range_end,
+        project.session.sample_rate,
+    );
     if segments.is_empty() {
         let interval_samples = (project.session.sample_rate as u64).max(1);
-        segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
+        segments = build_auto_edit_segments(
+            &video_inputs,
+            range_start,
+            range_end,
+            interval_samples,
+            project.session.sample_rate,
+        );
     }
     if segments.is_empty() {
         return Err("No visible source clips in the edit range.".into());
     }
 
-    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    let renders_dir = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
     let audio_path = renders_dir.join(format!("{session_id}.video-edit.wav"));
     audio::render_mix(&project.session, &audio_path)?;
     let output_path = renders_dir.join(format!("agent-edit-{}.mp4", uuid::Uuid::new_v4()));
     let grade_filter = color_grade.as_ref().and_then(build_color_grade_filter);
     let high_quality = quality.as_deref() == Some("high");
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset, grade_filter, video_effects, high_quality)?;
+    render_segments_ffmpeg(
+        &project.session,
+        &video_inputs,
+        &segments,
+        &audio_path,
+        range_start,
+        range_end,
+        &output_path,
+        look_preset,
+        grade_filter,
+        video_effects,
+        high_quality,
+    )?;
 
-    let duration_ms = (((range_end.saturating_sub(range_start)) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64;
+    let duration_ms = (((range_end.saturating_sub(range_start)) as f64
+        / project.session.sample_rate as f64)
+        * 1000.0)
+        .round() as u64;
     Ok(RenderFromScriptResponse {
         path: output_path.to_string_lossy().to_string(),
         duration_ms: duration_ms.max(1),
@@ -3749,10 +4977,17 @@ pub fn rerender_agent_edit(
     color_grade: Option<AgentColorGrade>,
     video_effects: Option<AgentVideoEffects>,
 ) -> Result<MixProject, String> {
-    let project = state.store.lock().map_err(|error| error.to_string())?.get_project(&session_id)?;
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
     let full_end = session_duration_samples(&project.session);
     let range_start = start_sample.unwrap_or(0).min(full_end);
-    let range_end = end_sample.unwrap_or(full_end).min(full_end).max(range_start + 1);
+    let range_end = end_sample
+        .unwrap_or(full_end)
+        .min(full_end)
+        .max(range_start + 1);
     let selected_track_ids = source_track_ids
         .into_iter()
         .filter(|id| !id.trim().is_empty() && id != &track_id)
@@ -3760,21 +4995,42 @@ pub fn rerender_agent_edit(
     if selected_track_ids.is_empty() {
         return Err("No source video tracks to re-render from.".into());
     }
-    let video_inputs = collect_video_inputs(&project.session, range_start, range_end, &selected_track_ids);
+    let video_inputs = collect_video_inputs(
+        &project.session,
+        range_start,
+        range_end,
+        &selected_track_ids,
+    );
     if video_inputs.is_empty() {
         return Err("The source video tracks have no clips in the edit range.".into());
     }
-    let mut segments = build_segments_from_script(&video_inputs, &script, range_start, range_end, project.session.sample_rate);
+    let mut segments = build_segments_from_script(
+        &video_inputs,
+        &script,
+        range_start,
+        range_end,
+        project.session.sample_rate,
+    );
     if segments.is_empty() {
         // No usable per-window choices in the script; fall back to automatic 1s cuts.
         let interval_samples = (project.session.sample_rate as u64).max(1);
-        segments = build_auto_edit_segments(&video_inputs, range_start, range_end, interval_samples, project.session.sample_rate);
+        segments = build_auto_edit_segments(
+            &video_inputs,
+            range_start,
+            range_end,
+            interval_samples,
+            project.session.sample_rate,
+        );
     }
     if segments.is_empty() {
         return Err("No visible source clips in the edit range.".into());
     }
 
-    let renders_dir = state.store.lock().map_err(|error| error.to_string())?.renders_dir();
+    let renders_dir = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|error| error.to_string())?;
     let audio_path = renders_dir.join(format!("{session_id}.video-edit.wav"));
     audio::render_mix(&project.session, &audio_path)?;
@@ -3782,14 +5038,35 @@ pub fn rerender_agent_edit(
     let grade_filter = color_grade.as_ref().and_then(build_color_grade_filter);
     // Re-render path stays at preview quality — it's invoked from Look chip clicks
     // and similar quick iteration. Final export uses render_video_from_script(quality=high).
-    render_segments_ffmpeg(&project.session, &video_inputs, &segments, &audio_path, range_start, range_end, &output_path, look_preset, grade_filter, video_effects, false)?;
+    render_segments_ffmpeg(
+        &project.session,
+        &video_inputs,
+        &segments,
+        &audio_path,
+        range_start,
+        range_end,
+        &output_path,
+        look_preset,
+        grade_filter,
+        video_effects,
+        false,
+    )?;
 
-    let duration_ms = (((range_end.saturating_sub(range_start)) as f64 / project.session.sample_rate as f64) * 1000.0).round() as u64;
+    let duration_ms = (((range_end.saturating_sub(range_start)) as f64
+        / project.session.sample_rate as f64)
+        * 1000.0)
+        .round() as u64;
     let updated = state
         .store
         .lock()
         .map_err(|error| error.to_string())?
-        .replace_track_video(&session_id, &track_id, &clip_id, &output_path, duration_ms.max(1))?;
+        .replace_track_video(
+            &session_id,
+            &track_id,
+            &clip_id,
+            &output_path,
+            duration_ms.max(1),
+        )?;
     let _ = fs::remove_file(&output_path);
     if let Ok(mut audio) = state.audio.lock() {
         audio.bind_session_sources(&updated.session)?;
@@ -3803,22 +5080,35 @@ pub fn rerender_agent_edit(
 fn probe_video_dimensions(path: &Path) -> Result<(u32, u32), String> {
     let output = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0:s=x",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0:s=x",
         ])
         .arg(path)
         .output()
         .map_err(|error| format!("Could not run ffprobe. Install ffmpeg/ffprobe: {error}"))?;
     if !output.status.success() {
-        return Err(format!("ffprobe failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        return Err(format!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let line = text.lines().next().unwrap_or("").trim();
     let mut parts = line.split('x');
-    let width: u32 = parts.next().and_then(|value| value.trim().parse().ok()).ok_or("Could not read video width")?;
-    let height: u32 = parts.next().and_then(|value| value.trim().parse().ok()).ok_or("Could not read video height")?;
+    let width: u32 = parts
+        .next()
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or("Could not read video width")?;
+    let height: u32 = parts
+        .next()
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or("Could not read video height")?;
     if width == 0 || height == 0 {
         return Err("Video reported zero dimensions".into());
     }
@@ -3829,11 +5119,18 @@ fn probe_video_dimensions(path: &Path) -> Result<(u32, u32), String> {
 /// edits render close to 1:1 instead of upscaling a small camera into a huge frame.
 /// Uses the smallest-area source (the camera footage, not a previously rendered edit).
 #[tauri::command]
-pub fn fit_canvas_to_footage(state: State<'_, AppState>, session_id: String) -> Result<MixProject, String> {
+pub fn fit_canvas_to_footage(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<MixProject, String> {
     let store = state.store.lock().map_err(|error| error.to_string())?;
     let mut project = store.get_project(&session_id)?;
-    let by_id: std::collections::HashMap<&str, &crate::model::VideoSourceFile> =
-        project.session.video_source_files.iter().map(|source| (source.id.as_str(), source)).collect();
+    let by_id: std::collections::HashMap<&str, &crate::model::VideoSourceFile> = project
+        .session
+        .video_source_files
+        .iter()
+        .map(|source| (source.id.as_str(), source))
+        .collect();
     let mut best: Option<(u32, u32)> = None;
     for track in &project.session.tracks {
         if track.kind != crate::model::TrackKind::Video {
@@ -3842,7 +5139,9 @@ pub fn fit_canvas_to_footage(state: State<'_, AppState>, session_id: String) -> 
         for clip in &track.video_clips {
             if let Some(source) = by_id.get(clip.video_source_file_id.as_str()) {
                 if let Ok((width, height)) = probe_video_dimensions(Path::new(&source.path)) {
-                    if best.map_or(true, |(bw, bh)| (width as u64 * height as u64) < (bw as u64 * bh as u64)) {
+                    if best.map_or(true, |(bw, bh)| {
+                        (width as u64 * height as u64) < (bw as u64 * bh as u64)
+                    }) {
                         best = Some((width, height));
                     }
                 }
@@ -3900,8 +5199,20 @@ fn analyze_section_window(
     })
 }
 
-fn round1(x: f32) -> f32 { if x.is_finite() { (x * 10.0).round() / 10.0 } else { 0.0 } }
-fn round2(x: f32) -> f32 { if x.is_finite() { (x * 100.0).round() / 100.0 } else { 0.0 } }
+fn round1(x: f32) -> f32 {
+    if x.is_finite() {
+        (x * 10.0).round() / 10.0
+    } else {
+        0.0
+    }
+}
+fn round2(x: f32) -> f32 {
+    if x.is_finite() {
+        (x * 100.0).round() / 100.0
+    } else {
+        0.0
+    }
+}
 
 fn emit_agent_progress(
     app: &AppHandle,
@@ -3949,7 +5260,12 @@ fn video_extension(file_name: &str, mime_type: &str) -> &'static str {
     }
 }
 
-fn extract_video_audio(video_path: &Path, audio_path: &Path, sample_rate: u32, source_offset_ms: u64) -> Result<(), String> {
+fn extract_video_audio(
+    video_path: &Path,
+    audio_path: &Path,
+    sample_rate: u32,
+    source_offset_ms: u64,
+) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command
         .arg("-y")
@@ -3957,7 +5273,9 @@ fn extract_video_audio(video_path: &Path, audio_path: &Path, sample_rate: u32, s
         .arg("-loglevel")
         .arg("error");
     if source_offset_ms > 0 {
-        command.arg("-ss").arg(format!("{:.3}", source_offset_ms as f64 / 1000.0));
+        command
+            .arg("-ss")
+            .arg(format!("{:.3}", source_offset_ms as f64 / 1000.0));
     }
     let output = command
         .arg("-i")
@@ -3974,14 +5292,25 @@ fn extract_video_audio(video_path: &Path, audio_path: &Path, sample_rate: u32, s
         .map_err(|error| format!("Could not run ffmpeg to extract camera audio: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg camera audio extraction failed: {}", stderr.trim()));
+        return Err(format!(
+            "ffmpeg camera audio extraction failed: {}",
+            stderr.trim()
+        ));
     }
     Ok(())
 }
 
-fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, selected_track_ids: &HashSet<String>) -> Vec<VideoRenderClip> {
-    let by_id: std::collections::HashMap<&str, &crate::model::VideoSourceFile> =
-        session.video_source_files.iter().map(|source| (source.id.as_str(), source)).collect();
+fn collect_video_inputs(
+    session: &MixSession,
+    range_start: u64,
+    range_end: u64,
+    selected_track_ids: &HashSet<String>,
+) -> Vec<VideoRenderClip> {
+    let by_id: std::collections::HashMap<&str, &crate::model::VideoSourceFile> = session
+        .video_source_files
+        .iter()
+        .map(|source| (source.id.as_str(), source))
+        .collect();
     let any_solo = session.tracks.iter().any(|track| {
         track.kind == crate::model::TrackKind::Video
             && selected_track_ids.contains(&track.id)
@@ -4000,7 +5329,10 @@ fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, 
                 let trimmed_start = clip.start_sample.max(range_start);
                 let trimmed_end = clip.end_sample.min(range_end);
                 let offset_ms = clip.source_offset_ms.saturating_add(
-                    (((trimmed_start.saturating_sub(clip.start_sample)) as f64 / session.sample_rate as f64) * 1000.0).round() as u64
+                    (((trimmed_start.saturating_sub(clip.start_sample)) as f64
+                        / session.sample_rate as f64)
+                        * 1000.0)
+                        .round() as u64,
                 );
                 clips.push(VideoRenderClip {
                     track_id: track.id.clone(),
@@ -4010,7 +5342,10 @@ fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, 
                     start_sample: trimmed_start,
                     end_sample: trimmed_end,
                     source_offset_ms: offset_ms,
-                    layout: clip.layout.clone().unwrap_or_else(|| default_video_layout(track_index)),
+                    layout: clip
+                        .layout
+                        .clone()
+                        .unwrap_or_else(|| default_video_layout(track_index)),
                 });
             }
         }
@@ -4024,7 +5359,11 @@ fn collect_video_inputs(session: &MixSession, range_start: u64, range_end: u64, 
     clips
 }
 
-fn video_track_is_enabled(track: &crate::model::Track, selected_track_ids: &HashSet<String>, any_solo: bool) -> bool {
+fn video_track_is_enabled(
+    track: &crate::model::Track,
+    selected_track_ids: &HashSet<String>,
+    any_solo: bool,
+) -> bool {
     track.kind == crate::model::TrackKind::Video
         && selected_track_ids.contains(&track.id)
         && !track.muted
@@ -4051,7 +5390,12 @@ fn default_video_layout(index: usize) -> VideoLayout {
 /// The vision model can still override per-window. Match is case-insensitive and on
 /// whole-word boundaries via simple substring on a lowercase copy — good enough for
 /// chat-style prompts. Returns (preset, grade) where either may be None.
-pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFilterPreset>, Option<AgentColorGrade>) {
+pub fn infer_look_from_instructions(
+    text: &str,
+) -> (
+    Option<crate::model::VideoFilterPreset>,
+    Option<AgentColorGrade>,
+) {
     use crate::model::VideoFilterPreset;
     let t = text.to_lowercase();
     let has = |needle: &str| t.contains(needle);
@@ -4072,12 +5416,20 @@ pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFi
     let mut hue_shift: Option<f32> = None;
 
     // Macro looks (preset + grade defaults).
-    if has("cinema") || has("cinematic") || has("epic") || has("film") || has("movie") || has("blockbuster") {
+    if has("cinema")
+        || has("cinematic")
+        || has("epic")
+        || has("film")
+        || has("movie")
+        || has("blockbuster")
+    {
         preset = Some(VideoFilterPreset::Cinema);
         name_parts.push("epic cinema");
         contrast = Some(1.12);
         saturation = Some(1.04);
-        rr = Some(1.08); gg = Some(0.96); bb = Some(0.88); // mild teal-orange
+        rr = Some(1.08);
+        gg = Some(0.96);
+        bb = Some(0.88); // mild teal-orange
         vignette = Some(0.22);
         sharpen = Some(0.45);
         grain = Some(1.5);
@@ -4096,7 +5448,9 @@ pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFi
     }
     if has("golden") {
         preset = Some(VideoFilterPreset::Golden);
-        rr = Some(1.10); gg = Some(1.02); bb = Some(0.82);
+        rr = Some(1.10);
+        gg = Some(1.02);
+        bb = Some(0.82);
         saturation = Some(saturation.unwrap_or(1.0).max(1.10));
         name_parts.push("golden");
     }
@@ -4108,7 +5462,9 @@ pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFi
     }
     if has("cold") {
         preset = Some(VideoFilterPreset::Cold);
-        rr = Some(0.84); gg = Some(0.95); bb = Some(1.16);
+        rr = Some(0.84);
+        gg = Some(0.95);
+        bb = Some(1.16);
         name_parts.push("cold");
     }
     if has("mono") || has("black and white") || has("b&w") || has("grayscale") || has("greyscale") {
@@ -4190,14 +5546,26 @@ pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFi
         hue_shift = Some(20.0);
     }
 
-    let nothing_set =
-        brightness.is_none() && contrast.is_none() && saturation.is_none() && gamma.is_none()
-        && rr.is_none() && gg.is_none() && bb.is_none() && vignette.is_none()
-        && sharpen.is_none() && blur.is_none() && grain.is_none() && hue_shift.is_none();
+    let nothing_set = brightness.is_none()
+        && contrast.is_none()
+        && saturation.is_none()
+        && gamma.is_none()
+        && rr.is_none()
+        && gg.is_none()
+        && bb.is_none()
+        && vignette.is_none()
+        && sharpen.is_none()
+        && blur.is_none()
+        && grain.is_none()
+        && hue_shift.is_none();
     if nothing_set && preset.is_none() {
         return (None, None);
     }
-    let name = if name_parts.is_empty() { None } else { Some(name_parts.join(" + ")) };
+    let name = if name_parts.is_empty() {
+        None
+    } else {
+        Some(name_parts.join(" + "))
+    };
     let reason = if name_parts.is_empty() {
         None
     } else {
@@ -4208,15 +5576,28 @@ pub fn infer_look_from_instructions(text: &str) -> (Option<crate::model::VideoFi
     };
     let rgb_mix = if rr.is_some() || gg.is_some() || bb.is_some() {
         Some(RgbMix { rr, gg, bb })
-    } else { None };
+    } else {
+        None
+    };
     let grade = AgentColorGrade {
         name,
         reason,
-        brightness, contrast, saturation, gamma,
+        brightness,
+        contrast,
+        saturation,
+        gamma,
         rgb_mix,
-        hue_shift, vignette, blur, sharpen, grain,
+        hue_shift,
+        vignette,
+        blur,
+        sharpen,
+        grain,
     };
-    let grade = if build_color_grade_filter(&grade).is_some() { Some(grade) } else { None };
+    let grade = if build_color_grade_filter(&grade).is_some() {
+        Some(grade)
+    } else {
+        None
+    };
     (preset, grade)
 }
 
@@ -4233,7 +5614,9 @@ pub fn infer_effects_from_instructions(text: &str) -> Option<AgentVideoEffects> 
     // Tiny helper: find the first number (int or decimal) in a substring window
     // around the keyword. Returns seconds. Falls back to a default when missing.
     fn nearby_seconds(text: &str, anchor: &str, default_s: f32) -> f32 {
-        let Some(at) = text.find(anchor) else { return default_s; };
+        let Some(at) = text.find(anchor) else {
+            return default_s;
+        };
         // 30 chars on each side is plenty for "fade out at the end 1.5s".
         let lo = at.saturating_sub(30);
         let hi = (at + anchor.len() + 30).min(text.len());
@@ -4251,10 +5634,18 @@ pub fn infer_effects_from_instructions(text: &str) -> Option<AgentVideoEffects> 
         }
         if acc.is_empty() {
             // Word-number fallback for "half" / "one" / "two" / "three" near the anchor.
-            if window.contains("half") { return 0.5; }
-            if window.contains("one ") || window.ends_with("one") { return 1.0; }
-            if window.contains("two") { return 2.0; }
-            if window.contains("three") { return 3.0; }
+            if window.contains("half") {
+                return 0.5;
+            }
+            if window.contains("one ") || window.ends_with("one") {
+                return 1.0;
+            }
+            if window.contains("two") {
+                return 2.0;
+            }
+            if window.contains("three") {
+                return 3.0;
+            }
             return default_s;
         }
         acc.parse::<f32>().unwrap_or(default_s)
@@ -4271,7 +5662,10 @@ pub fn infer_effects_from_instructions(text: &str) -> Option<AgentVideoEffects> 
         hits.push(format!("fade out {s:.1}s"));
     }
     // Generic "fade" without direction = apply to both ends.
-    if (t.contains("fade") || t.contains("dissolve")) && effects.fade_in_seconds.is_none() && effects.fade_out_seconds.is_none() {
+    if (t.contains("fade") || t.contains("dissolve"))
+        && effects.fade_in_seconds.is_none()
+        && effects.fade_out_seconds.is_none()
+    {
         effects.fade_in_seconds = Some(1.0);
         effects.fade_out_seconds = Some(1.5);
         hits.push("fade in/out".to_string());
@@ -4293,7 +5687,9 @@ pub fn infer_effects_from_instructions(text: &str) -> Option<AgentVideoEffects> 
                     }
                 }
                 acc.parse::<f32>().ok()
-            } else { None };
+            } else {
+                None
+            };
             f.unwrap_or(1.5)
         };
         effects.speed_factor = Some(factor.clamp(1.0, 4.0));
@@ -4304,7 +5700,9 @@ pub fn infer_effects_from_instructions(text: &str) -> Option<AgentVideoEffects> 
         hits.push("slow down 0.50x".to_string());
     }
 
-    if hits.is_empty() { return None; }
+    if hits.is_empty() {
+        return None;
+    }
     effects.reason = Some(format!(
         "Inferred from instruction keywords ({}) — applied to the final video.",
         hits.join(", ")
@@ -4316,10 +5714,15 @@ pub fn infer_effects_from_instructions(text: &str) -> Option<AgentVideoEffects> 
 /// the video and audio streams. Returns `(video_chain, audio_chain, applied_speed)`.
 /// `total_duration_s` is the unscaled length of the source range; the returned chain
 /// places the fade-out at the post-speed final duration so it lands at the very end.
-pub fn build_effects_filters(effects: &AgentVideoEffects, total_duration_s: f64) -> (Option<String>, Option<String>, f32) {
+pub fn build_effects_filters(
+    effects: &AgentVideoEffects,
+    total_duration_s: f64,
+) -> (Option<String>, Option<String>, f32) {
     fn clamp_finite(v: Option<f32>, lo: f32, hi: f32) -> Option<f32> {
         let x = v?;
-        if !x.is_finite() { return None; }
+        if !x.is_finite() {
+            return None;
+        }
         Some(x.clamp(lo, hi))
     }
     let speed = clamp_finite(effects.speed_factor, 0.25, 4.0).unwrap_or(1.0);
@@ -4340,7 +5743,11 @@ pub fn build_effects_filters(effects: &AgentVideoEffects, total_duration_s: f64)
         let st = ((final_duration as f32) - s).max(0.0);
         vparts.push(format!("fade=t=out:st={st:.3}:d={s:.3}"));
     }
-    let video_chain = if vparts.is_empty() { None } else { Some(vparts.join(",")) };
+    let video_chain = if vparts.is_empty() {
+        None
+    } else {
+        Some(vparts.join(","))
+    };
 
     let mut aparts: Vec<String> = Vec::new();
     if (speed - 1.0).abs() > 0.001 {
@@ -4367,7 +5774,11 @@ pub fn build_effects_filters(effects: &AgentVideoEffects, total_duration_s: f64)
         let st = ((final_duration as f32) - s).max(0.0);
         aparts.push(format!("afade=t=out:st={st:.3}:d={s:.3}"));
     }
-    let audio_chain = if aparts.is_empty() { None } else { Some(aparts.join(",")) };
+    let audio_chain = if aparts.is_empty() {
+        None
+    } else {
+        Some(aparts.join(","))
+    };
     (video_chain, audio_chain, speed)
 }
 
@@ -4378,7 +5789,9 @@ pub fn build_effects_filters(effects: &AgentVideoEffects, total_duration_s: f64)
 pub fn build_color_grade_filter(grade: &AgentColorGrade) -> Option<String> {
     fn clamp_finite(value: Option<f32>, lo: f32, hi: f32) -> Option<f32> {
         let v = value?;
-        if !v.is_finite() { return None; }
+        if !v.is_finite() {
+            return None;
+        }
         Some(v.clamp(lo, hi))
     }
     let brightness = clamp_finite(grade.brightness, -0.5, 0.5);
@@ -4390,42 +5803,69 @@ pub fn build_color_grade_filter(grade: &AgentColorGrade) -> Option<String> {
     let blur = clamp_finite(grade.blur, 0.0, 8.0);
     let sharpen = clamp_finite(grade.sharpen, 0.0, 2.0);
     let grain = clamp_finite(grade.grain, 0.0, 30.0);
-    let rgb = grade.rgb_mix.as_ref().map(|m| (
-        clamp_finite(m.rr, 0.4, 1.6),
-        clamp_finite(m.gg, 0.4, 1.6),
-        clamp_finite(m.bb, 0.4, 1.6),
-    ));
+    let rgb = grade.rgb_mix.as_ref().map(|m| {
+        (
+            clamp_finite(m.rr, 0.4, 1.6),
+            clamp_finite(m.gg, 0.4, 1.6),
+            clamp_finite(m.bb, 0.4, 1.6),
+        )
+    });
     let mut parts: Vec<String> = Vec::new();
     // eq: only emit fields that actually move the picture.
-    let has_eq = brightness.is_some() || contrast.is_some() || saturation.is_some() || gamma.is_some();
+    let has_eq =
+        brightness.is_some() || contrast.is_some() || saturation.is_some() || gamma.is_some();
     if has_eq {
         let b = brightness.unwrap_or(0.0);
         let c = contrast.unwrap_or(1.0);
         let s = saturation.unwrap_or(1.0);
         let g = gamma.unwrap_or(1.0);
-        parts.push(format!("eq=brightness={b:.3}:contrast={c:.3}:saturation={s:.3}:gamma={g:.3}"));
+        parts.push(format!(
+            "eq=brightness={b:.3}:contrast={c:.3}:saturation={s:.3}:gamma={g:.3}"
+        ));
     }
     if let Some((rr, gg, bb)) = rgb {
         if rr.is_some() || gg.is_some() || bb.is_some() {
             parts.push(format!(
                 "colorchannelmixer=rr={:.3}:gg={:.3}:bb={:.3}",
-                rr.unwrap_or(1.0), gg.unwrap_or(1.0), bb.unwrap_or(1.0)
+                rr.unwrap_or(1.0),
+                gg.unwrap_or(1.0),
+                bb.unwrap_or(1.0)
             ));
         }
     }
-    if let Some(h) = hue_shift { if h.abs() >= 0.5 { parts.push(format!("hue=h={h:.2}")); } }
-    if let Some(v) = vignette { if v >= 0.05 {
-        // Map 0..1 to ffmpeg's angle param 0..PI/3 — gentle range.
-        let angle = (v as f64) * std::f64::consts::FRAC_PI_3;
-        parts.push(format!("vignette=angle={angle:.4}"));
-    }}
-    if let Some(b) = blur { if b >= 0.5 { parts.push(format!("gblur=sigma={b:.2}")); } }
-    if let Some(s) = sharpen { if s >= 0.05 {
-        // unsharp: positive amount sharpens. 5x5 luma matrix, mild chroma.
-        parts.push(format!("unsharp=5:5:{:.2}:5:5:0.0", s));
-    }}
-    if let Some(g) = grain { if g >= 0.5 { parts.push(format!("noise=alls={g:.1}:allf=t")); } }
-    if parts.is_empty() { None } else { Some(parts.join(",")) }
+    if let Some(h) = hue_shift {
+        if h.abs() >= 0.5 {
+            parts.push(format!("hue=h={h:.2}"));
+        }
+    }
+    if let Some(v) = vignette {
+        if v >= 0.05 {
+            // Map 0..1 to ffmpeg's angle param 0..PI/3 — gentle range.
+            let angle = (v as f64) * std::f64::consts::FRAC_PI_3;
+            parts.push(format!("vignette=angle={angle:.4}"));
+        }
+    }
+    if let Some(b) = blur {
+        if b >= 0.5 {
+            parts.push(format!("gblur=sigma={b:.2}"));
+        }
+    }
+    if let Some(s) = sharpen {
+        if s >= 0.05 {
+            // unsharp: positive amount sharpens. 5x5 luma matrix, mild chroma.
+            parts.push(format!("unsharp=5:5:{:.2}:5:5:0.0", s));
+        }
+    }
+    if let Some(g) = grain {
+        if g >= 0.5 {
+            parts.push(format!("noise=alls={g:.1}:allf=t"));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
 }
 
 /// Map a preset name string (as returned by the agent vision model) to a
@@ -4489,7 +5929,9 @@ fn color_grade_suffix(layout: &VideoLayout) -> String {
     let exposure = layout.exposure.clamp(-1.0, 1.0);
     if exposure.abs() >= 0.005 {
         let gain = 2f32.powf(exposure);
-        suffix.push_str(&format!(",colorchannelmixer=rr={gain:.4}:gg={gain:.4}:bb={gain:.4}"));
+        suffix.push_str(&format!(
+            ",colorchannelmixer=rr={gain:.4}:gg={gain:.4}:bb={gain:.4}"
+        ));
     }
     let temp = layout.temperature.clamp(-1.0, 1.0);
     let tint = layout.tint.clamp(-1.0, 1.0);
@@ -4523,13 +5965,22 @@ fn color_grade_suffix(layout: &VideoLayout) -> String {
         VideoFilterPreset::None => {}
     }
     if layout.blur >= 0.5 {
-        suffix.push_str(&format!(",boxblur={}:1", layout.blur.round().clamp(1.0, 10.0)));
+        suffix.push_str(&format!(
+            ",boxblur={}:1",
+            layout.blur.round().clamp(1.0, 10.0)
+        ));
     }
     if layout.sharpen.clamp(0.0, 2.0) >= 0.02 {
-        suffix.push_str(&format!(",unsharp=5:5:{:.3}:5:5:0.0", layout.sharpen.clamp(0.0, 2.0)));
+        suffix.push_str(&format!(
+            ",unsharp=5:5:{:.3}:5:5:0.0",
+            layout.sharpen.clamp(0.0, 2.0)
+        ));
     }
     if layout.grain.clamp(0.0, 1.0) >= 0.02 {
-        suffix.push_str(&format!(",noise=alls={}:allf=t", (layout.grain.clamp(0.0, 1.0) * 30.0).round() as i32));
+        suffix.push_str(&format!(
+            ",noise=alls={}:allf=t",
+            (layout.grain.clamp(0.0, 1.0) * 30.0).round() as i32
+        ));
     }
     if layout.vignette.clamp(0.0, 1.0) >= 0.02 {
         let ang = (layout.vignette.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_3) as f64;
@@ -4538,22 +5989,35 @@ fn color_grade_suffix(layout: &VideoLayout) -> String {
     suffix
 }
 
-fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_start: u64, range_end: u64, aspect: Option<&str>) -> String {
+fn build_video_filter(
+    clips: &[VideoRenderClip],
+    session: &MixSession,
+    range_start: u64,
+    range_end: u64,
+    aspect: Option<&str>,
+) -> String {
     let sample_rate = session.sample_rate;
     let canvas = &session.video_canvas;
     let reference_w = canvas.width.clamp(240, 3840) as i32;
     let reference_h = canvas.height.clamp(240, 3840) as i32;
-    let layouts: Vec<VideoLayout> = clips.iter().map(|clip| normalized_video_layout(&clip.layout)).collect();
+    let layouts: Vec<VideoLayout> = clips
+        .iter()
+        .map(|clip| normalized_video_layout(&clip.layout))
+        .collect();
     let (min_x, min_y, max_x, max_y) = content_bounds(&layouts);
-    let output_w = even_dimension(pct_to_px((max_x - min_x).max(1.0), reference_w).clamp(240, 7680));
-    let output_h = even_dimension(pct_to_px((max_y - min_y).max(1.0), reference_h).clamp(240, 7680));
+    let output_w =
+        even_dimension(pct_to_px((max_x - min_x).max(1.0), reference_w).clamp(240, 7680));
+    let output_h =
+        even_dimension(pct_to_px((max_y - min_y).max(1.0), reference_h).clamp(240, 7680));
     let background = ffmpeg_color(&canvas.background);
-    let duration = ((range_end.saturating_sub(range_start) as f64 / sample_rate as f64).max(0.1)) + 0.1;
+    let duration =
+        ((range_end.saturating_sub(range_start) as f64 / sample_rate as f64).max(0.1)) + 0.1;
     let mut filter = format!("color=c={background}:s={output_w}x{output_h}:d={duration:.3}[base0]");
     for (index, clip) in clips.iter().enumerate() {
         let layout = layouts[index].clone();
         let start = clip.start_sample.saturating_sub(range_start) as f64 / sample_rate as f64;
-        let clip_duration = clip.end_sample.saturating_sub(clip.start_sample) as f64 / sample_rate as f64;
+        let clip_duration =
+            clip.end_sample.saturating_sub(clip.start_sample) as f64 / sample_rate as f64;
         let source_offset = clip.source_offset_ms as f64 / 1000.0;
         let out_w = even_dimension(pct_to_px(layout.width, reference_w).max(2));
         let out_h = even_dimension(pct_to_px(layout.height, reference_h).max(2));
@@ -4571,7 +6035,10 @@ fn build_video_filter(clips: &[VideoRenderClip], session: &MixSession, range_sta
             chain.push_str(&format!(",rotate={radians:.6}:c=none:ow=rotw(iw):oh=roth(ih),scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black@0"));
         }
         if layout.opacity < 0.999 {
-            chain.push_str(&format!(",format=rgba,colorchannelmixer=aa={:.3}", layout.opacity.clamp(0.0, 1.0)));
+            chain.push_str(&format!(
+                ",format=rgba,colorchannelmixer=aa={:.3}",
+                layout.opacity.clamp(0.0, 1.0)
+            ));
         } else {
             chain.push_str(",format=rgba");
         }
@@ -4620,7 +6087,9 @@ fn layout_processing_suffix(layout: &VideoLayout, reference_w: i32, reference_h:
     let exposure = layout.exposure.clamp(-1.0, 1.0);
     if exposure.abs() >= 0.005 {
         let gain = 2f32.powf(exposure);
-        suffix.push_str(&format!(",colorchannelmixer=rr={gain:.4}:gg={gain:.4}:bb={gain:.4}"));
+        suffix.push_str(&format!(
+            ",colorchannelmixer=rr={gain:.4}:gg={gain:.4}:bb={gain:.4}"
+        ));
     }
     let temp = layout.temperature.clamp(-1.0, 1.0);
     let tint = layout.tint.clamp(-1.0, 1.0);
@@ -4654,13 +6123,22 @@ fn layout_processing_suffix(layout: &VideoLayout, reference_w: i32, reference_h:
         VideoFilterPreset::None => {}
     }
     if layout.blur >= 0.5 {
-        suffix.push_str(&format!(",boxblur={}:1", layout.blur.round().clamp(1.0, 10.0)));
+        suffix.push_str(&format!(
+            ",boxblur={}:1",
+            layout.blur.round().clamp(1.0, 10.0)
+        ));
     }
     if layout.sharpen.clamp(0.0, 2.0) >= 0.02 {
-        suffix.push_str(&format!(",unsharp=5:5:{:.3}:5:5:0.0", layout.sharpen.clamp(0.0, 2.0)));
+        suffix.push_str(&format!(
+            ",unsharp=5:5:{:.3}:5:5:0.0",
+            layout.sharpen.clamp(0.0, 2.0)
+        ));
     }
     if layout.grain.clamp(0.0, 1.0) >= 0.02 {
-        suffix.push_str(&format!(",noise=alls={}:allf=t", (layout.grain.clamp(0.0, 1.0) * 30.0).round() as i32));
+        suffix.push_str(&format!(
+            ",noise=alls={}:allf=t",
+            (layout.grain.clamp(0.0, 1.0) * 30.0).round() as i32
+        ));
     }
     if layout.vignette.clamp(0.0, 1.0) >= 0.02 {
         let ang = (layout.vignette.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_3) as f64;
@@ -4671,7 +6149,10 @@ fn layout_processing_suffix(layout: &VideoLayout, reference_w: i32, reference_h:
         suffix.push_str(&format!(",rotate={radians:.6}:c=none:ow=rotw(iw):oh=roth(ih),scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black@0"));
     }
     if layout.opacity < 0.999 {
-        suffix.push_str(&format!(",format=rgba,colorchannelmixer=aa={:.3}", layout.opacity.clamp(0.0, 1.0)));
+        suffix.push_str(&format!(
+            ",format=rgba,colorchannelmixer=aa={:.3}",
+            layout.opacity.clamp(0.0, 1.0)
+        ));
     } else {
         suffix.push_str(",format=rgba");
     }
@@ -4686,7 +6167,11 @@ fn layout_output_size(layout: &VideoLayout, reference_w: i32, reference_h: i32) 
     )
 }
 
-fn centered_layout_position(layout: &VideoLayout, reference_w: i32, reference_h: i32) -> (i32, i32) {
+fn centered_layout_position(
+    layout: &VideoLayout,
+    reference_w: i32,
+    reference_h: i32,
+) -> (i32, i32) {
     let (out_w, out_h) = layout_output_size(layout, reference_w, reference_h);
     ((reference_w - out_w) / 2, (reference_h - out_h) / 2)
 }
@@ -4746,7 +6231,9 @@ fn build_auto_edit_segments(
         let segment_end = next.min(clip.end_sample);
         if segment_end > segment_start {
             let source_offset_ms = clip.source_offset_ms.saturating_add(
-                (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64) * 1000.0).round() as u64
+                (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64)
+                    * 1000.0)
+                    .round() as u64,
             );
             segments.push(AutoEditSegment {
                 input_index,
@@ -4852,26 +6339,39 @@ fn build_fallback_agent_script(
 
 #[allow(dead_code)] // Kept as a fallback path that reads the rendered WAV from disk.
 fn load_rendered_audio_analysis(path: &Path) -> Result<RenderedAudioAnalysis, String> {
-    let mut reader = hound::WavReader::open(path).map_err(|error| format!("Could not open rendered mix audio: {error}"))?;
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|error| format!("Could not open rendered mix audio: {error}"))?;
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
     let samples = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
-            .map(|sample| sample.map(|value| value.clamp(-1.0, 1.0)).map_err(|error| error.to_string()))
+            .map(|sample| {
+                sample
+                    .map(|value| value.clamp(-1.0, 1.0))
+                    .map_err(|error| error.to_string())
+            })
             .collect::<Result<Vec<_>, _>>()?,
         hound::SampleFormat::Int if spec.bits_per_sample <= 16 => {
             let scale = ((1_i32 << spec.bits_per_sample.saturating_sub(1)) - 1).max(1) as f32;
             reader
                 .samples::<i16>()
-                .map(|sample| sample.map(|value| (value as f32 / scale).clamp(-1.0, 1.0)).map_err(|error| error.to_string()))
+                .map(|sample| {
+                    sample
+                        .map(|value| (value as f32 / scale).clamp(-1.0, 1.0))
+                        .map_err(|error| error.to_string())
+                })
                 .collect::<Result<Vec<_>, _>>()?
         }
         hound::SampleFormat::Int => {
             let scale = ((1_i64 << spec.bits_per_sample.saturating_sub(1)) - 1).max(1) as f32;
             reader
                 .samples::<i32>()
-                .map(|sample| sample.map(|value| (value as f32 / scale).clamp(-1.0, 1.0)).map_err(|error| error.to_string()))
+                .map(|sample| {
+                    sample
+                        .map(|value| (value as f32 / scale).clamp(-1.0, 1.0))
+                        .map_err(|error| error.to_string())
+                })
                 .collect::<Result<Vec<_>, _>>()?
         }
     };
@@ -4905,7 +6405,8 @@ fn audio_features_for_window(
     let offset = analysis.timeline_start_sample;
     let local_start = window_start.saturating_sub(offset);
     let local_end = window_end.saturating_sub(offset);
-    let start_frame = ((local_start as f64 / session_sample_rate as f64) * analysis.sample_rate as f64)
+    let start_frame = ((local_start as f64 / session_sample_rate as f64)
+        * analysis.sample_rate as f64)
         .round()
         .clamp(0.0, frame_count as f64) as usize;
     let end_frame = ((local_end as f64 / session_sample_rate as f64) * analysis.sample_rate as f64)
@@ -4931,7 +6432,11 @@ fn audio_features_for_window(
         let offset = frame * analysis.channels;
         let mut mono = 0.0_f32;
         for channel in 0..analysis.channels {
-            mono += analysis.samples.get(offset + channel).copied().unwrap_or(0.0);
+            mono += analysis
+                .samples
+                .get(offset + channel)
+                .copied()
+                .unwrap_or(0.0);
         }
         mono /= analysis.channels as f32;
         let abs = mono.abs();
@@ -5004,7 +6509,16 @@ async fn build_agent_edit_segments(
     instructions: Option<&str>,
     audio_analysis: Option<&RenderedAudioAnalysis>,
     temp_dir: &Path,
-) -> Result<(Vec<AutoEditSegment>, Vec<AgentVideoScriptEntry>, Option<crate::model::VideoFilterPreset>, Option<AgentColorGrade>, Option<AgentVideoEffects>), String> {
+) -> Result<
+    (
+        Vec<AutoEditSegment>,
+        Vec<AgentVideoScriptEntry>,
+        Option<crate::model::VideoFilterPreset>,
+        Option<AgentColorGrade>,
+        Option<AgentVideoEffects>,
+    ),
+    String,
+> {
     let sample_rate = session.sample_rate;
     let mut segments: Vec<AutoEditSegment> = Vec::new();
     let mut script = Vec::new();
@@ -5024,7 +6538,9 @@ async fn build_agent_edit_segments(
         _ => (None, None),
     };
     if let Some(preset) = keyword_look.as_ref() {
-        *look_votes.entry(format!("{:?}", preset).to_lowercase()).or_insert(0) += 1;
+        *look_votes
+            .entry(format!("{:?}", preset).to_lowercase())
+            .or_insert(0) += 1;
     }
     // Same idea for whole-edit effects (fade in/out, speed). LLM can override per
     // window via the `video_effects` field; otherwise the keyword detector wins.
@@ -5034,7 +6550,10 @@ async fn build_agent_edit_segments(
     };
     let mut first_video_effects: Option<AgentVideoEffects> = None;
     let mut cursor = range_start;
-    let total_windows = range_end.saturating_sub(range_start).div_ceil(interval_samples).max(1) as u32;
+    let total_windows = range_end
+        .saturating_sub(range_start)
+        .div_ceil(interval_samples)
+        .max(1) as u32;
     let mut window_index = 0_u32;
     let mut previous_input_index: Option<usize> = None;
     let mut consecutive_same = 0_u32;
@@ -5060,7 +6579,15 @@ async fn build_agent_edit_segments(
             .filter(|(_, clip)| clip.start_sample < next && clip.end_sample > cursor)
             .collect::<Vec<_>>();
         if active.is_empty() {
-            emit_agent_progress(app, &session.id, started, "sampling", "No active selected clip in this window; skipping.", window_index, total_windows);
+            emit_agent_progress(
+                app,
+                &session.id,
+                started,
+                "sampling",
+                "No active selected clip in this window; skipping.",
+                window_index,
+                total_windows,
+            );
             script.push(AgentVideoScriptEntry {
                 window_index,
                 total_windows,
@@ -5185,12 +6712,18 @@ async fn build_agent_edit_segments(
             &session.id,
             started,
             "vision",
-            &format!("Analyzing frames and deciding edit for window {window_index}/{total_windows}..."),
+            &format!(
+                "Analyzing frames and deciding edit for window {window_index}/{total_windows}..."
+            ),
             window_index,
             total_windows,
         );
         let previous_label = previous_input_index
-            .and_then(|previous| labels.iter().position(|(input_index, _)| *input_index == previous))
+            .and_then(|previous| {
+                labels
+                    .iter()
+                    .position(|(input_index, _)| *input_index == previous)
+            })
             .map(|index| index + 1);
         // Merged describe+decide call: one HTTP roundtrip per window instead of two.
         // We still skip the LLM entirely when there's only one readable angle.
@@ -5241,7 +6774,9 @@ async fn build_agent_edit_segments(
                 window_summary: Some("Single available angle.".into()),
                 choice: 1,
                 decision: Some("cut".into()),
-                reason: Some("Only one readable camera angle was available for this window.".into()),
+                reason: Some(
+                    "Only one readable camera angle was available for this window.".into(),
+                ),
                 edit_intent: Some("single available angle".into()),
                 continuity_plan: Some("Use the only available readable shot.".into()),
                 look_preset: None,
@@ -5345,13 +6880,17 @@ async fn build_agent_edit_segments(
                                 .map(|note| !candidate_note_rejects_dynamic_cut(note))
                                 .unwrap_or(true)
                         })
-                        .min_by_key(|(_, (input_index, _))| usage_counts.get(input_index).copied().unwrap_or(0))
+                        .min_by_key(|(_, (input_index, _))| {
+                            usage_counts.get(input_index).copied().unwrap_or(0)
+                        })
                         .or_else(|| {
                             labels
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, (input_index, _))| *input_index != previous)
-                                .min_by_key(|(_, (input_index, _))| usage_counts.get(input_index).copied().unwrap_or(0))
+                                .min_by_key(|(_, (input_index, _))| {
+                                    usage_counts.get(input_index).copied().unwrap_or(0)
+                                })
                         });
                     if let Some((alternate_index, _)) = alternate {
                         chosen_label_index = alternate_index;
@@ -5360,7 +6899,11 @@ async fn build_agent_edit_segments(
                 }
             }
         }
-        if model_choice.is_none() && !variety_override && labels.len() > 1 && window_index >= MIN_WINDOWS_BEFORE_COVERAGE_CUT {
+        if model_choice.is_none()
+            && !variety_override
+            && labels.len() > 1
+            && window_index >= MIN_WINDOWS_BEFORE_COVERAGE_CUT
+        {
             let chosen_input_index = labels[chosen_label_index].0;
             let chosen_usage = usage_counts.get(&chosen_input_index).copied().unwrap_or(0);
             let alternate = labels
@@ -5374,9 +6917,14 @@ async fn build_agent_edit_segments(
                         .map(|note| !candidate_note_rejects_dynamic_cut(note))
                         .unwrap_or(true)
                 })
-                .min_by_key(|(_, (input_index, _))| usage_counts.get(input_index).copied().unwrap_or(0));
+                .min_by_key(|(_, (input_index, _))| {
+                    usage_counts.get(input_index).copied().unwrap_or(0)
+                });
             if let Some((alternate_index, (alternate_input_index, _))) = alternate {
-                let alternate_usage = usage_counts.get(alternate_input_index).copied().unwrap_or(0);
+                let alternate_usage = usage_counts
+                    .get(alternate_input_index)
+                    .copied()
+                    .unwrap_or(0);
                 let usage_gap = chosen_usage.saturating_sub(alternate_usage);
                 if alternate_usage == 0 || usage_gap >= MIN_USAGE_GAP_FOR_COVERAGE_CUT {
                     chosen_label_index = alternate_index;
@@ -5391,12 +6939,13 @@ async fn build_agent_edit_segments(
         let segment_end = next.min(clip.end_sample);
         if segment_end > segment_start {
             let source_offset_ms = clip.source_offset_ms.saturating_add(
-                (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64) * 1000.0).round() as u64
+                (((segment_start.saturating_sub(clip.start_sample)) as f64 / sample_rate as f64)
+                    * 1000.0)
+                    .round() as u64,
             );
-            if let Some(previous_segment) = segments
-                .last_mut()
-                .filter(|segment| segment.input_index == input_index && segment.timeline_end == segment_start)
-            {
+            if let Some(previous_segment) = segments.last_mut().filter(|segment| {
+                segment.input_index == input_index && segment.timeline_end == segment_start
+            }) {
                 previous_segment.timeline_end = segment_end;
             } else {
                 segments.push(AutoEditSegment {
@@ -5424,7 +6973,9 @@ async fn build_agent_edit_segments(
                 .and_then(|choice| choice.reason.as_deref())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .unwrap_or("The model selected this as the strongest readable shot for this edit window.");
+                .unwrap_or(
+                    "The model selected this as the strongest readable shot for this edit window.",
+                );
             let edit_intent = model_choice
                 .as_ref()
                 .and_then(|choice| choice.edit_intent.as_deref())
@@ -5451,7 +7002,12 @@ async fn build_agent_edit_segments(
             // Append to the rolling editorial history (kept short) so later windows see
             // what's already on screen and how the sequence is developing.
             let history_what = selected_note
-                .or_else(|| candidates.iter().find(|c| c.image_number == chosen_image_number).and_then(|c| c.angle_label.as_deref()))
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .find(|c| c.image_number == chosen_image_number)
+                        .and_then(|c| c.angle_label.as_deref())
+                })
                 .unwrap_or("shot");
             edit_history.push(format!(
                 "t={:.0}s {} cam{}: {}",
@@ -5469,15 +7025,24 @@ async fn build_agent_edit_segments(
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
             let reason = if coverage_override {
-                let model_pick = model_choice.as_ref().map(|choice| choice.choice).unwrap_or(chosen_image_number);
-                let selected_note = selected_note.unwrap_or("the underused alternate angle was readable and active in this window");
+                let model_pick = model_choice
+                    .as_ref()
+                    .map(|choice| choice.choice)
+                    .unwrap_or(chosen_image_number);
+                let selected_note = selected_note.unwrap_or(
+                    "the underused alternate angle was readable and active in this window",
+                );
                 format!(
                     "Decision coverage-cut. Image {chosen_image_number} ({}) was selected because this camera had been underused while other active angles were already used. The model's raw pick was image {model_pick}; alternate evidence: {selected_note}",
                     clip.track_name
                 )
             } else if variety_override {
-                let model_pick = model_choice.as_ref().map(|choice| choice.choice).unwrap_or(chosen_image_number);
-                let selected_note = selected_note.unwrap_or("the alternate angle was readable and active in this window");
+                let model_pick = model_choice
+                    .as_ref()
+                    .map(|choice| choice.choice)
+                    .unwrap_or(chosen_image_number);
+                let selected_note = selected_note
+                    .unwrap_or("the alternate angle was readable and active in this window");
                 format!(
                     "Decision dynamic-cut. Image {chosen_image_number} ({}) was selected to add needed camera movement after holding the previous angle for {held_count_before_update} window(s). The model's raw pick was image {model_pick}; alternate evidence: {selected_note}",
                     clip.track_name
@@ -5485,7 +7050,10 @@ async fn build_agent_edit_segments(
             } else if let Some(edit_intent) = edit_intent {
                 format!("Decision {model_decision}. Image {chosen_image_number} ({}) for {edit_intent}: {model_reason}", clip.track_name)
             } else {
-                format!("Decision {model_decision}. Image {chosen_image_number} ({}): {model_reason}", clip.track_name)
+                format!(
+                    "Decision {model_decision}. Image {chosen_image_number} ({}): {model_reason}",
+                    clip.track_name
+                )
             };
             let reason = if let Some(plan) = continuity_plan {
                 format!("{reason} Continuity plan: {plan}")
@@ -5523,7 +7091,10 @@ async fn build_agent_edit_segments(
             data_provided.extend(candidates.iter().map(|candidate| {
                 let layout = active
                     .iter()
-                    .find(|(_, clip)| clip.track_index == candidate.track_index && clip.track_name == candidate.track_name)
+                    .find(|(_, clip)| {
+                        clip.track_index == candidate.track_index
+                            && clip.track_name == candidate.track_name
+                    })
                     .map(|(_, clip)| layout_summary(&clip.layout))
                     .unwrap_or_else(|| "unavailable".into());
                 format!(
@@ -5599,7 +7170,12 @@ async fn build_agent_edit_segments(
     Ok((segments, script, chosen_look, chosen_grade, chosen_effects))
 }
 
-fn extract_video_frame(clip: &VideoRenderClip, sample: u64, session: &MixSession, output_path: &Path) -> Result<(), String> {
+fn extract_video_frame(
+    clip: &VideoRenderClip,
+    sample: u64,
+    session: &MixSession,
+    output_path: &Path,
+) -> Result<(), String> {
     let sample_rate = session.sample_rate;
     let source_offset = clip.source_offset_ms as f64 / 1000.0
         + sample.saturating_sub(clip.start_sample) as f64 / sample_rate as f64;
@@ -5689,7 +7265,8 @@ async fn analyze_agent_window_frames(
          {{\"window_summary\":\"one sentence summarizing the available visual choices\", \"candidate_labels\":[\"overhead/top-down\", \"face/profile\"], \"candidate_notes\":[\"Image 1: visible framing/action/quality in 8-14 words\", \"Image 2: visible framing/action/quality in 8-14 words\"]}}"
     );
     let parsed = call_ollama_chat(base_url, model, prompt, Some(images)).await?;
-    let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
+    let extracted = crate::assistant::extract_json_object(&parsed.message.content)
+        .unwrap_or(parsed.message.content);
     serde_json::from_str::<AgentWindowFrameAnalysis>(&extracted)
         .map_err(|error| format!("Could not parse frame analysis response: {error}"))
 }
@@ -5754,7 +7331,8 @@ async fn decide_agent_shot(
          {{\"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"hold continuity | wide context | hands detail | face/reaction | motion accent | pacing variation\", \"reason\": \"one specific sentence explaining why this is a hold or cut using visual + audio data\", \"continuity_plan\": \"how this decision supports the surrounding edit\", \"confidence\": \"low|medium|high\"}}"
     );
     let parsed = call_ollama_chat(base_url, model, prompt, None).await?;
-    let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
+    let extracted = crate::assistant::extract_json_object(&parsed.message.content)
+        .unwrap_or(parsed.message.content);
     let choice = serde_json::from_str::<AgentShotChoice>(&extracted)
         .map_err(|error| format!("Could not parse agent edit choice: {error}"))?;
     Ok(choice)
@@ -5827,7 +7405,8 @@ async fn analyze_and_decide_window(
          Reply ONLY as compact JSON (no prose) with this exact shape:\n{json_shape}"
     );
     let parsed = call_ollama_chat(base_url, model, prompt, Some(images)).await?;
-    let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
+    let extracted = crate::assistant::extract_json_object(&parsed.message.content)
+        .unwrap_or(parsed.message.content);
     serde_json::from_str::<AgentMergedChoice>(&extracted)
         .map_err(|error| format!("Could not parse merged agent decision: {error}"))
 }
@@ -5854,7 +7433,8 @@ async fn analyze_clip_effects(
          {{\"look_preset\": \"cinema\", \"color_grade\": {{\"name\": \"epic cinema\", \"reason\": \"...\", \"contrast\": 1.12, \"rgbMix\": {{\"rr\": 1.10, \"bb\": 0.85}}, \"vignette\": 0.25, \"sharpen\": 0.4, \"grain\": 1.5}}, \"video_effects\": {{\"reason\": \"...\", \"fadeInSeconds\": 1, \"fadeOutSeconds\": 2}}}}"
     );
     let parsed = call_ollama_chat(base_url, model, prompt, Some(vec![frame_b64])).await?;
-    let extracted = crate::assistant::extract_json_object(&parsed.message.content).unwrap_or(parsed.message.content);
+    let extracted = crate::assistant::extract_json_object(&parsed.message.content)
+        .unwrap_or(parsed.message.content);
     serde_json::from_str::<ClipEffectsChoice>(&extracted)
         .map_err(|error| format!("Could not parse clip-effects response: {error}"))
 }
@@ -5878,8 +7458,12 @@ async fn call_ollama_chat(
     // than the `chat_template_kwargs` body flag, which some endpoints silently drop.
     let prompt = format!("/no_think\n{prompt}");
     match assistant::detect_provider(base_url).await? {
-        assistant::LlmProvider::Ollama => call_ollama_chat_native(base_url, model, prompt, images).await,
-        assistant::LlmProvider::OpenAiCompat => call_openai_chat(base_url, model, prompt, images).await,
+        assistant::LlmProvider::Ollama => {
+            call_ollama_chat_native(base_url, model, prompt, images).await
+        }
+        assistant::LlmProvider::OpenAiCompat => {
+            call_openai_chat(base_url, model, prompt, images).await
+        }
     }
 }
 
@@ -5981,7 +7565,9 @@ async fn call_openai_chat(
         .next()
         .and_then(|choice| choice.message.content)
         .ok_or("The model server returned no content")?;
-    Ok(OllamaChatResponse { message: OllamaChatResponseMessage { content } })
+    Ok(OllamaChatResponse {
+        message: OllamaChatResponseMessage { content },
+    })
 }
 
 fn build_auto_edit_filter(
@@ -6018,8 +7604,10 @@ fn build_auto_edit_filter(
             continue;
         }
         let clip = &clips[segment.input_index];
-        let timeline_offset = (segment_start.saturating_sub(range_start) as f64 / sample_rate).max(0.0);
-        let duration = (segment_end.saturating_sub(segment_start) as f64 / sample_rate).max(1.0 / 30.0);
+        let timeline_offset =
+            (segment_start.saturating_sub(range_start) as f64 / sample_rate).max(0.0);
+        let duration =
+            (segment_end.saturating_sub(segment_start) as f64 / sample_rate).max(1.0 / 30.0);
         let source_offset = segment.source_offset_ms as f64 / 1000.0
             + (segment_start.saturating_sub(segment.timeline_start) as f64 / sample_rate);
         // A cut-style edit shows one camera at a time, so each shot fills the whole canvas.
@@ -6114,7 +7702,11 @@ fn content_bounds(layouts: &[VideoLayout]) -> (f32, f32, f32, f32) {
 
 fn even_dimension(value: i32) -> i32 {
     let value = value.max(2);
-    if value % 2 == 0 { value } else { value + 1 }
+    if value % 2 == 0 {
+        value
+    } else {
+        value + 1
+    }
 }
 
 fn ffmpeg_color(value: &str) -> String {
@@ -6137,22 +7729,39 @@ fn ffmpeg_color(value: &str) -> String {
 }
 
 fn track_slot(session: &MixSession, track_id: &str) -> Option<u32> {
-    session.tracks.iter().position(|t| t.id == track_id).map(|i| i as u32)
+    session
+        .tracks
+        .iter()
+        .position(|t| t.id == track_id)
+        .map(|i| i as u32)
 }
 
 fn session_duration_samples(session: &MixSession) -> u64 {
-    let by_id: std::collections::HashMap<&str, &crate::model::SourceFile> =
-        session.source_files.iter().map(|source| (source.id.as_str(), source)).collect();
-    session.tracks.iter().map(|track| {
-        if track.clips.is_empty() && !track.clips_materialized {
-            by_id
-                .get(track.source_file_id.as_str())
-                .map(|source| track.start_sample + source.duration_samples)
-                .unwrap_or(0)
-        } else {
-            track.clips.iter().map(|clip| clip.end_sample).max().unwrap_or(0)
-        }
-    }).max().unwrap_or(0)
+    let by_id: std::collections::HashMap<&str, &crate::model::SourceFile> = session
+        .source_files
+        .iter()
+        .map(|source| (source.id.as_str(), source))
+        .collect();
+    session
+        .tracks
+        .iter()
+        .map(|track| {
+            if track.clips.is_empty() && !track.clips_materialized {
+                by_id
+                    .get(track.source_file_id.as_str())
+                    .map(|source| track.start_sample + source.duration_samples)
+                    .unwrap_or(0)
+            } else {
+                track
+                    .clips
+                    .iter()
+                    .map(|clip| clip.end_sample)
+                    .max()
+                    .unwrap_or(0)
+            }
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAction]) {
@@ -6171,7 +7780,10 @@ fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAc
                     track_slot(session, track_id),
                     session.tracks.iter().find(|t| &t.id == track_id),
                 ) {
-                    audio.send(EngineCommand::SetTrackGainDb { slot, db: track.gain_db });
+                    audio.send(EngineCommand::SetTrackGainDb {
+                        slot,
+                        db: track.gain_db,
+                    });
                 }
             }
             MixAction::SetTrackPan { track_id, pan } => {
@@ -6181,7 +7793,10 @@ fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAc
             }
             MixAction::MuteTrack { track_id, muted } => {
                 if let Some(slot) = track_slot(session, track_id) {
-                    audio.send(EngineCommand::SetTrackMuted { slot, muted: *muted });
+                    audio.send(EngineCommand::SetTrackMuted {
+                        slot,
+                        muted: *muted,
+                    });
                 }
             }
             MixAction::SoloTrack { track_id, solo } => {
@@ -6195,7 +7810,11 @@ fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAc
                     });
                 }
             }
-            MixAction::SetHighPass { track_id, frequency_hz, slope_db_oct } => {
+            MixAction::SetHighPass {
+                track_id,
+                frequency_hz,
+                slope_db_oct,
+            } => {
                 if let Some(slot) = track_slot(session, track_id) {
                     audio.send(EngineCommand::SetTrackHighPass {
                         slot,
@@ -6205,7 +7824,11 @@ fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAc
                     });
                 }
             }
-            MixAction::SetLowPass { track_id, frequency_hz, slope_db_oct } => {
+            MixAction::SetLowPass {
+                track_id,
+                frequency_hz,
+                slope_db_oct,
+            } => {
                 if let Some(slot) = track_slot(session, track_id) {
                     audio.send(EngineCommand::SetTrackLowPass {
                         slot,
@@ -6215,7 +7838,13 @@ fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAc
                     });
                 }
             }
-            MixAction::SetEqBand { track_id, band, frequency_hz, gain_db, q } => {
+            MixAction::SetEqBand {
+                track_id,
+                band,
+                frequency_hz,
+                gain_db,
+                q,
+            } => {
                 if let Some(slot) = track_slot(session, track_id) {
                     audio.send(EngineCommand::SetTrackEqBand {
                         slot,
@@ -6250,12 +7879,18 @@ fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAc
             }
             MixAction::SetReverbSend { track_id, level_db } => {
                 if let Some(slot) = track_slot(session, track_id) {
-                    audio.send(EngineCommand::SetTrackReverbSendDb { slot, db: *level_db });
+                    audio.send(EngineCommand::SetTrackReverbSendDb {
+                        slot,
+                        db: *level_db,
+                    });
                 }
             }
             MixAction::SetDelaySend { track_id, level_db } => {
                 if let Some(slot) = track_slot(session, track_id) {
-                    audio.send(EngineCommand::SetTrackDelaySendDb { slot, db: *level_db });
+                    audio.send(EngineCommand::SetTrackDelaySendDb {
+                        slot,
+                        db: *level_db,
+                    });
                 }
             }
             MixAction::SetMasterGain { .. } | MixAction::AdjustMasterGain { .. } => {
@@ -6271,19 +7906,36 @@ fn push_engine_commands(state: &AppState, session: &MixSession, actions: &[MixAc
 /// session without needing to replay every individual action.
 pub fn sync_session_to_engine(audio: &mut crate::engine::AudioEngine, session: &MixSession) {
     audio.send(EngineCommand::SetMasterGainDb(session.master.gain_db));
-    audio.send(EngineCommand::SetMasterCeilingDb(session.master.limiter.ceiling_db));
+    audio.send(EngineCommand::SetMasterCeilingDb(
+        session.master.limiter.ceiling_db,
+    ));
     for (index, track) in session.tracks.iter().enumerate() {
         let slot = index as u32;
         audio.send(EngineCommand::SetTrackActive { slot, active: true });
-        audio.send(EngineCommand::SetTrackGainDb { slot, db: track.gain_db });
-        audio.send(EngineCommand::SetTrackPan { slot, pan: track.pan });
-        audio.send(EngineCommand::SetTrackMuted { slot, muted: track.muted });
+        audio.send(EngineCommand::SetTrackGainDb {
+            slot,
+            db: track.gain_db,
+        });
+        audio.send(EngineCommand::SetTrackPan {
+            slot,
+            pan: track.pan,
+        });
+        audio.send(EngineCommand::SetTrackMuted {
+            slot,
+            muted: track.muted,
+        });
         audio.send(EngineCommand::SetTrackSolo {
             slot,
             solo: track.solo && track.kind != crate::model::TrackKind::Video,
         });
-        audio.send(EngineCommand::SetTrackReverbSendDb { slot, db: track.sends.reverb_db });
-        audio.send(EngineCommand::SetTrackDelaySendDb { slot, db: track.sends.delay_db });
+        audio.send(EngineCommand::SetTrackReverbSendDb {
+            slot,
+            db: track.sends.reverb_db,
+        });
+        audio.send(EngineCommand::SetTrackDelaySendDb {
+            slot,
+            db: track.sends.delay_db,
+        });
         audio.send(EngineCommand::SetTrackHighPass {
             slot,
             enabled: track.chain.high_pass.enabled,
@@ -6318,7 +7970,10 @@ pub fn sync_session_to_engine(audio: &mut crate::engine::AudioEngine, session: &
         });
     }
     for slot in (session.tracks.len() as u32)..(crate::engine::mixer::MAX_TRACKS as u32) {
-        audio.send(EngineCommand::SetTrackActive { slot, active: false });
+        audio.send(EngineCommand::SetTrackActive {
+            slot,
+            active: false,
+        });
     }
 }
 

@@ -469,9 +469,9 @@ pub struct MixSession {
     pub video_canvas: VideoCanvas,
 }
 
-/// An album (project): a named, ordered collection of songs (sessions). Stored as
-/// a lightweight manifest at albums/{id}/album.json; the songs live alongside it
-/// in albums/{id}/songs/{session-id}.json.
+/// An album document: a named, ordered collection of songs. The chosen album
+/// directory contains `album.json`; each direct child song directory contains its
+/// own `song.json` plus portable Audio, Peaks, Recordings, Video, and Renders data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MixAlbum {
@@ -544,28 +544,79 @@ pub struct MixProject {
 // Musical defaults for optional processor params, so the agent can specify just the
 // intent (e.g. threshold + ratio) and a partial action still deserializes & applies
 // instead of failing the whole batch with a 422.
-fn default_slope_db_oct() -> u16 { 12 }
-fn default_q() -> f32 { 1.0 }
-fn default_threshold_db() -> f32 { -18.0 }
-fn default_ratio() -> f32 { 3.0 }
-fn default_attack_ms() -> f32 { 15.0 }
-fn default_release_ms() -> f32 { 150.0 }
-fn default_knee_db() -> f32 { 6.0 }
-fn default_makeup_db() -> f32 { 0.0 }
+fn default_slope_db_oct() -> u16 {
+    12
+}
+fn default_q() -> f32 {
+    1.0
+}
+fn default_threshold_db() -> f32 {
+    -18.0
+}
+fn default_ratio() -> f32 {
+    3.0
+}
+fn default_attack_ms() -> f32 {
+    15.0
+}
+fn default_release_ms() -> f32 {
+    150.0
+}
+fn default_knee_db() -> f32 {
+    6.0
+}
+fn default_makeup_db() -> f32 {
+    0.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "tool", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "tool",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum MixAction {
-    CreateRegion { name: String, start_sample: u64, end_sample: u64, track_ids: Option<Vec<Id>> },
-    DeleteTrack { track_id: Id },
-    RenameTrack { track_id: Id, name: String },
-    SetTrackRole { track_id: Id, role: Option<String> },
-    SetTrackGain { track_id: Id, gain_db: f32 },
-    AdjustTrackGain { track_id: Id, delta_db: f32 },
-    SetTrackPan { track_id: Id, pan: f32 },
-    MuteTrack { track_id: Id, muted: bool },
-    SoloTrack { track_id: Id, solo: bool },
-    SetTrackAiGenerated { track_id: Id, ai_generated: bool },
+    CreateRegion {
+        name: String,
+        start_sample: u64,
+        end_sample: u64,
+        track_ids: Option<Vec<Id>>,
+    },
+    DeleteTrack {
+        track_id: Id,
+    },
+    RenameTrack {
+        track_id: Id,
+        name: String,
+    },
+    SetTrackRole {
+        track_id: Id,
+        role: Option<String>,
+    },
+    SetTrackGain {
+        track_id: Id,
+        gain_db: f32,
+    },
+    AdjustTrackGain {
+        track_id: Id,
+        delta_db: f32,
+    },
+    SetTrackPan {
+        track_id: Id,
+        pan: f32,
+    },
+    MuteTrack {
+        track_id: Id,
+        muted: bool,
+    },
+    SoloTrack {
+        track_id: Id,
+        solo: bool,
+    },
+    SetTrackAiGenerated {
+        track_id: Id,
+        ai_generated: bool,
+    },
     SetHighPass {
         track_id: Id,
         #[serde(
@@ -578,7 +629,13 @@ pub enum MixAction {
             alias = "hz"
         )]
         frequency_hz: f32,
-        #[serde(default = "default_slope_db_oct", alias = "slope", alias = "slope_db_oct", alias = "slopeDbPerOctave", alias = "slopeDbOctave")]
+        #[serde(
+            default = "default_slope_db_oct",
+            alias = "slope",
+            alias = "slope_db_oct",
+            alias = "slopeDbPerOctave",
+            alias = "slopeDbOctave"
+        )]
         slope_db_oct: u16,
     },
     SetLowPass {
@@ -593,7 +650,13 @@ pub enum MixAction {
             alias = "hz"
         )]
         frequency_hz: f32,
-        #[serde(default = "default_slope_db_oct", alias = "slope", alias = "slope_db_oct", alias = "slopeDbPerOctave", alias = "slopeDbOctave")]
+        #[serde(
+            default = "default_slope_db_oct",
+            alias = "slope",
+            alias = "slope_db_oct",
+            alias = "slopeDbPerOctave",
+            alias = "slopeDbOctave"
+        )]
         slope_db_oct: u16,
     },
     SetEqBand {
@@ -631,13 +694,37 @@ pub enum MixAction {
         #[serde(default = "default_makeup_db")]
         makeup_db: f32,
     },
-    SetReverbSend { track_id: Id, level_db: f32 },
-    SetDelaySend { track_id: Id, level_db: f32 },
-    SetMasterGain { gain_db: f32 },
-    AdjustMasterGain { delta_db: f32 },
-    SetProcessorParam { target_id: Id, processor_id: String, param_id: String, value: f32 },
-    SetRegionGain { region_id: Id, track_id: Id, gain_db: f32 },
-    ApplySectionAutomation { region_id: Id, track_id: Id, param: AutomatableParam, value: f32 },
+    SetReverbSend {
+        track_id: Id,
+        level_db: f32,
+    },
+    SetDelaySend {
+        track_id: Id,
+        level_db: f32,
+    },
+    SetMasterGain {
+        gain_db: f32,
+    },
+    AdjustMasterGain {
+        delta_db: f32,
+    },
+    SetProcessorParam {
+        target_id: Id,
+        processor_id: String,
+        param_id: String,
+        value: f32,
+    },
+    SetRegionGain {
+        region_id: Id,
+        track_id: Id,
+        gain_db: f32,
+    },
+    ApplySectionAutomation {
+        region_id: Id,
+        track_id: Id,
+        param: AutomatableParam,
+        value: f32,
+    },
     Undo,
     Redo,
     RenderMix,
@@ -791,10 +878,7 @@ pub enum AssistantResponse {
         tokens: Option<TurnTokens>,
     },
     #[serde(rename_all = "camelCase")]
-    Clarification {
-        question: String,
-        reason: String,
-    },
+    Clarification { question: String, reason: String },
     #[serde(rename_all = "camelCase")]
     Critique {
         critique: MixCritique,

@@ -81,7 +81,11 @@ impl Compressor {
 
         // Stereo-linked detector: max of |L|, |R| in dB.
         let peak = l.abs().max(r.abs());
-        let level_db = if peak <= 1.0e-7 { -140.0 } else { 20.0 * peak.log10() };
+        let level_db = if peak <= 1.0e-7 {
+            -140.0
+        } else {
+            20.0 * peak.log10()
+        };
 
         // Smooth the detector with attack/release.
         let coef = if level_db > self.env_db {

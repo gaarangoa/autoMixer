@@ -72,7 +72,8 @@ pub fn get_selection(session_id: &str) -> Vec<String> {
 
 /// True while a background video edit is rendering. Guards against launching a second
 /// concurrent edit (they'd fight over the single model slot and the agent-edit track).
-static VIDEO_EDIT_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIDEO_EDIT_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// RAII guard that releases VIDEO_EDIT_RUNNING on drop — including if the render task
 /// PANICS or is dropped mid-flight. Without this, a panic would leave the flag stuck
@@ -112,7 +113,10 @@ fn check_auth(state: &ControlState, headers: &HeaderMap) -> Result<(), (StatusCo
     if ok {
         Ok(())
     } else {
-        Err((StatusCode::UNAUTHORIZED, "missing or invalid bearer token".into()))
+        Err((
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token".into(),
+        ))
     }
 }
 
@@ -120,26 +124,52 @@ fn check_auth(state: &ControlState, headers: &HeaderMap) -> Result<(), (StatusCo
 /// Tauri async runtime. Stores the resulting `ControlInfo` in the process-wide cell.
 pub fn spawn(app: AppHandle) -> Result<&'static ControlInfo, String> {
     let token = uuid::Uuid::new_v4().to_string();
-    let state = ControlState { app, token: token.clone() };
+    let state = ControlState {
+        app,
+        token: token.clone(),
+    };
 
     // Bind on the std listener first so we can read back the assigned port before
     // handing control to the async server.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
-    listener.set_nonblocking(true).map_err(|error| error.to_string())?;
-    let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
 
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/control/session/{session_id}", get(get_session))
-        .route("/control/session/{session_id}/selection", get(get_session_selection).post(post_session_selection))
+        .route(
+            "/control/session/{session_id}/selection",
+            get(get_session_selection).post(post_session_selection),
+        )
         .route("/control/session/{session_id}/actions", post(post_actions))
         .route("/control/session/{session_id}/undo", post(post_undo))
         .route("/control/session/{session_id}/redo", post(post_redo))
-        .route("/control/session/{session_id}/video-edit", post(post_video_edit))
-        .route("/control/session/{session_id}/auto-mix", post(post_auto_mix))
-        .route("/control/session/{session_id}/clip-layout", post(post_clip_layout))
-        .route("/control/session/{session_id}/clip-effects", post(post_clip_effects))
-        .route("/control/session/{session_id}/auto-crop", post(post_auto_crop))
+        .route(
+            "/control/session/{session_id}/video-edit",
+            post(post_video_edit),
+        )
+        .route(
+            "/control/session/{session_id}/auto-mix",
+            post(post_auto_mix),
+        )
+        .route(
+            "/control/session/{session_id}/clip-layout",
+            post(post_clip_layout),
+        )
+        .route(
+            "/control/session/{session_id}/clip-effects",
+            post(post_clip_effects),
+        )
+        .route(
+            "/control/session/{session_id}/auto-crop",
+            post(post_auto_crop),
+        )
         // Live MJPEG camera previews (single-owner camera service). Token comes as a
         // query param because <img> tags can't set Authorization headers.
         .route("/camera/preview/{device_label}", get(get_camera_preview))
@@ -156,7 +186,10 @@ pub fn spawn(app: AppHandle) -> Result<&'static ControlInfo, String> {
         }
     });
 
-    let _ = CONTROL.set(ControlInfo { port, token: token.clone() });
+    let _ = CONTROL.set(ControlInfo {
+        port,
+        token: token.clone(),
+    });
     // Publish port+token to ~/.automixer/control.json so the Hermes MCP shim (and
     // local tooling) can discover how to reach the control surface. Rewritten every
     // launch because the port and token rotate.
@@ -221,7 +254,9 @@ async fn post_session_selection(
         "selection:set",
         serde_json::json!({ "sessionId": session_id, "trackIds": body.track_ids }),
     );
-    Ok(Json(serde_json::json!({ "ok": true, "trackIds": body.track_ids })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "trackIds": body.track_ids }),
+    ))
 }
 
 async fn post_actions(
@@ -236,7 +271,10 @@ async fn post_actions(
     // ("action 9 (set_compressor): missing field `releaseMs`") rather than a bare 422.
     let mut actions: Vec<MixAction> = Vec::with_capacity(body.actions.len());
     for (i, raw) in body.actions.iter().enumerate() {
-        let tool = raw.get("tool").and_then(|t| t.as_str()).unwrap_or("(no tool)");
+        let tool = raw
+            .get("tool")
+            .and_then(|t| t.as_str())
+            .unwrap_or("(no tool)");
         match serde_json::from_value::<MixAction>(raw.clone()) {
             Ok(action) => actions.push(action),
             Err(error) => {
@@ -335,12 +373,15 @@ async fn post_video_edit(
 
         // Source cameras only — never the agent's own rendered output, or edit_video
         // would re-cut its previous result instead of the real footage.
-        let is_agent_output = |name: &str| name == "Agent video edit" || name.starts_with("Agent Edit");
+        let is_agent_output =
+            |name: &str| name == "Agent video edit" || name.starts_with("Agent Edit");
         let video_ids: Vec<String> = project
             .session
             .tracks
             .iter()
-            .filter(|t| matches!(t.kind, crate::model::TrackKind::Video) && !is_agent_output(&t.name))
+            .filter(|t| {
+                matches!(t.kind, crate::model::TrackKind::Video) && !is_agent_output(&t.name)
+            })
             .map(|t| t.id.clone())
             .collect();
 
@@ -351,7 +392,11 @@ async fn post_video_edit(
                     .into_iter()
                     .filter(|id| video_ids.contains(id))
                     .collect();
-                if selected_video.is_empty() { video_ids.clone() } else { selected_video }
+                if selected_video.is_empty() {
+                    video_ids.clone()
+                } else {
+                    selected_video
+                }
             }
         };
 
@@ -365,12 +410,19 @@ async fn post_video_edit(
                 }
             }
         }
-        let region = if max_end > min_start { (Some(min_start), Some(max_end)) } else { (None, None) };
+        let region = if max_end > min_start {
+            (Some(min_start), Some(max_end))
+        } else {
+            (None, None)
+        };
         (chosen, region.0, region.1)
     };
 
     if track_ids.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "This session has no video tracks to edit.".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "This session has no video tracks to edit.".into(),
+        ));
     }
     let start_sample = body.start_sample.or(region_start);
     let end_sample = body.end_sample.or(region_end);
@@ -493,9 +545,10 @@ async fn post_auto_mix(
 ) -> CtlResult<crate::commands::AutoMixSummary> {
     check_auth(&state, &headers)?;
     let app = state.app.clone();
-    let summary = crate::commands::run_auto_mix_blocking(&app, &session_id, body.stages.unwrap_or_default())
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let summary =
+        crate::commands::run_auto_mix_blocking(&app, &session_id, body.stages.unwrap_or_default())
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Refresh the live UI/engine with the mixed result.
     let app_state = app.state::<AppState>();
@@ -503,10 +556,17 @@ async fn post_auto_mix(
         .store
         .lock()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-        .and_then(|store| store.get_project(&session_id).map_err(|e| (StatusCode::BAD_REQUEST, e)))
+        .and_then(|store| {
+            store
+                .get_project(&session_id)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))
+        })
     {
         emit_updated(&app, &session_id, &project);
-        let _ = app.emit("auto-mix:complete", serde_json::json!({ "sessionId": session_id, "project": project }));
+        let _ = app.emit(
+            "auto-mix:complete",
+            serde_json::json!({ "sessionId": session_id, "project": project }),
+        );
     }
     Ok(Json(summary))
 }
@@ -536,20 +596,34 @@ fn probe_duration_ms(path: &str) -> u64 {
 struct ClipLayoutBody {
     track_id: String,
     clip_id: String,
-    #[serde(default)] crop_top: Option<f32>,
-    #[serde(default)] crop_right: Option<f32>,
-    #[serde(default)] crop_bottom: Option<f32>,
-    #[serde(default)] crop_left: Option<f32>,
-    #[serde(default)] x: Option<f32>,
-    #[serde(default)] y: Option<f32>,
-    #[serde(default)] width: Option<f32>,
-    #[serde(default)] height: Option<f32>,
-    #[serde(default)] rotation: Option<f32>,
-    #[serde(default)] opacity: Option<f32>,
-    #[serde(default)] brightness: Option<f32>,
-    #[serde(default)] contrast: Option<f32>,
-    #[serde(default)] saturation: Option<f32>,
-    #[serde(default)] blur: Option<f32>,
+    #[serde(default)]
+    crop_top: Option<f32>,
+    #[serde(default)]
+    crop_right: Option<f32>,
+    #[serde(default)]
+    crop_bottom: Option<f32>,
+    #[serde(default)]
+    crop_left: Option<f32>,
+    #[serde(default)]
+    x: Option<f32>,
+    #[serde(default)]
+    y: Option<f32>,
+    #[serde(default)]
+    width: Option<f32>,
+    #[serde(default)]
+    height: Option<f32>,
+    #[serde(default)]
+    rotation: Option<f32>,
+    #[serde(default)]
+    opacity: Option<f32>,
+    #[serde(default)]
+    brightness: Option<f32>,
+    #[serde(default)]
+    contrast: Option<f32>,
+    #[serde(default)]
+    saturation: Option<f32>,
+    #[serde(default)]
+    blur: Option<f32>,
 }
 
 /// Parametric crop/reframe: merge the supplied fields into a clip's layout. Takes
@@ -567,7 +641,9 @@ async fn post_clip_layout(
         .store
         .lock()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mut project = store.get_project(&session_id).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let mut project = store
+        .get_project(&session_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Locate the clip and snapshot its current layout so the change is reversible.
     let ti = project
@@ -581,23 +657,54 @@ async fn post_clip_layout(
         .iter()
         .position(|c| c.id == body.clip_id)
         .ok_or((StatusCode::BAD_REQUEST, "clip not found".to_string()))?;
-    let old_layout = project.session.tracks[ti].video_clips[ci].layout.clone().unwrap_or_default();
+    let old_layout = project.session.tracks[ti].video_clips[ci]
+        .layout
+        .clone()
+        .unwrap_or_default();
 
     let mut layout = old_layout.clone();
-    if let Some(v) = body.crop_top { layout.crop_top = v; }
-    if let Some(v) = body.crop_right { layout.crop_right = v; }
-    if let Some(v) = body.crop_bottom { layout.crop_bottom = v; }
-    if let Some(v) = body.crop_left { layout.crop_left = v; }
-    if let Some(v) = body.x { layout.x = v; }
-    if let Some(v) = body.y { layout.y = v; }
-    if let Some(v) = body.width { layout.width = v; }
-    if let Some(v) = body.height { layout.height = v; }
-    if let Some(v) = body.rotation { layout.rotation = v; }
-    if let Some(v) = body.opacity { layout.opacity = v; }
-    if let Some(v) = body.brightness { layout.brightness = v; }
-    if let Some(v) = body.contrast { layout.contrast = v; }
-    if let Some(v) = body.saturation { layout.saturation = v; }
-    if let Some(v) = body.blur { layout.blur = v; }
+    if let Some(v) = body.crop_top {
+        layout.crop_top = v;
+    }
+    if let Some(v) = body.crop_right {
+        layout.crop_right = v;
+    }
+    if let Some(v) = body.crop_bottom {
+        layout.crop_bottom = v;
+    }
+    if let Some(v) = body.crop_left {
+        layout.crop_left = v;
+    }
+    if let Some(v) = body.x {
+        layout.x = v;
+    }
+    if let Some(v) = body.y {
+        layout.y = v;
+    }
+    if let Some(v) = body.width {
+        layout.width = v;
+    }
+    if let Some(v) = body.height {
+        layout.height = v;
+    }
+    if let Some(v) = body.rotation {
+        layout.rotation = v;
+    }
+    if let Some(v) = body.opacity {
+        layout.opacity = v;
+    }
+    if let Some(v) = body.brightness {
+        layout.brightness = v;
+    }
+    if let Some(v) = body.contrast {
+        layout.contrast = v;
+    }
+    if let Some(v) = body.saturation {
+        layout.saturation = v;
+    }
+    if let Some(v) = body.blur {
+        layout.blur = v;
+    }
     let new_layout = crate::commands::normalized_video_layout(&layout);
 
     // Record as a reversible history entry (so ⌘Z / Undo restores the prior layout)
@@ -606,12 +713,28 @@ async fn post_clip_layout(
     let to_value = |l: &crate::model::VideoLayout| {
         serde_json::to_value(l).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
     };
-    let forward = vec![crate::model::JsonPatchOp { op: "replace".into(), path: path.clone(), value: Some(to_value(&new_layout)?) }];
-    let inverse = vec![crate::model::JsonPatchOp { op: "replace".into(), path, value: Some(to_value(&old_layout)?) }];
-    crate::actions::record_patch(&mut project, forward, inverse, HistorySource::Assistant, Some("Video layout change".to_string()))
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let forward = vec![crate::model::JsonPatchOp {
+        op: "replace".into(),
+        path: path.clone(),
+        value: Some(to_value(&new_layout)?),
+    }];
+    let inverse = vec![crate::model::JsonPatchOp {
+        op: "replace".into(),
+        path,
+        value: Some(to_value(&old_layout)?),
+    }];
+    crate::actions::record_patch(
+        &mut project,
+        forward,
+        inverse,
+        HistorySource::Assistant,
+        Some("Video layout change".to_string()),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    store.save(&project).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    store
+        .save(&project)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     drop(store);
     emit_updated(&app, &session_id, &project);
     Ok(Json(project))
@@ -678,7 +801,9 @@ async fn post_auto_crop(
         &session_id,
         &body.track_id,
         &body.clip_id,
-        body.instructions.as_deref().unwrap_or("Crop to a tight, well-composed frame around the main subject."),
+        body.instructions
+            .as_deref()
+            .unwrap_or("Crop to a tight, well-composed frame around the main subject."),
     )
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -712,14 +837,23 @@ async fn get_camera_preview(
     let rx = match crate::camera_capture::subscribe_preview(&device_label) {
         Ok(rx) => rx,
         Err(message) => {
-            let status = if message == "recording" { StatusCode::CONFLICT } else { StatusCode::NOT_FOUND };
-            return Response::builder().status(status).body(Body::from(message)).unwrap();
+            let status = if message == "recording" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            return Response::builder()
+                .status(status)
+                .body(Body::from(message))
+                .unwrap();
         }
     };
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok(chunk) => return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)), rx)),
+                Ok(chunk) => {
+                    return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)), rx))
+                }
                 // Lagged: this client fell behind the broadcast — skip ahead.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,

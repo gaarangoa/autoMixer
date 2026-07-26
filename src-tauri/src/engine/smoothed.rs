@@ -13,7 +13,11 @@ impl SmoothedParam {
     pub fn new(initial: f32, sample_rate: f32, time_constant_ms: f32) -> Self {
         let tau = (time_constant_ms.max(0.01)) * 0.001;
         let coef = (-1.0 / (sample_rate * tau)).exp();
-        Self { target: initial, current: initial, coef }
+        Self {
+            target: initial,
+            current: initial,
+            coef,
+        }
     }
 
     pub fn set_target(&mut self, target: f32) {

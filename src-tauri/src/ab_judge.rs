@@ -163,7 +163,9 @@ pub async fn judge_session(
         .api_key
         .filter(|key| !key.trim().is_empty())
         .or_else(|| env::var("GEMINI_API_KEY").ok())
-        .ok_or_else(|| "Missing Gemini API key. Enter one in settings or set GEMINI_API_KEY.".to_string())?;
+        .ok_or_else(|| {
+            "Missing Gemini API key. Enter one in settings or set GEMINI_API_KEY.".to_string()
+        })?;
 
     let before = render_session_to_buffer_with_bypass(session, true)?;
     let after = render_session_to_buffer_with_bypass(session, false)?;
@@ -214,7 +216,8 @@ pub async fn judge_session(
         }
     });
 
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
+    let url =
+        format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
     let response = reqwest::Client::new()
         .post(url)
         .header("X-goog-api-key", api_key)
@@ -233,7 +236,13 @@ pub async fn judge_session(
     let raw = envelope
         .candidates
         .first()
-        .and_then(|candidate| candidate.content.parts.iter().find_map(|part| part.text.clone()))
+        .and_then(|candidate| {
+            candidate
+                .content
+                .parts
+                .iter()
+                .find_map(|part| part.text.clone())
+        })
         .ok_or_else(|| "Gemini response did not include text output.".to_string())?;
     let extracted = extract_json_object(&raw).unwrap_or(raw);
     let mut payload: ModelJudgePayload = serde_json::from_str(&extracted)
@@ -253,8 +262,14 @@ pub async fn judge_session(
         recommended_next_moves: payload.recommended_next_moves,
         clip_start,
         clip_duration,
-        prompt_tokens: envelope.usage_metadata.as_ref().and_then(|u| u.prompt_token_count),
-        output_tokens: envelope.usage_metadata.as_ref().and_then(|u| u.candidates_token_count),
+        prompt_tokens: envelope
+            .usage_metadata
+            .as_ref()
+            .and_then(|u| u.prompt_token_count),
+        output_tokens: envelope
+            .usage_metadata
+            .as_ref()
+            .and_then(|u| u.candidates_token_count),
     })
 }
 
@@ -264,7 +279,13 @@ fn judge_session_local(session: &MixSession) -> Result<AbJudgeResponse, String> 
     let (clip_start, clip_duration) = choose_clip_window(session, &after);
     let before_metrics = LocalQcMetrics::from_render(&before, clip_start, clip_duration);
     let after_metrics = LocalQcMetrics::from_render(&after, clip_start, clip_duration);
-    let raw_like = session.tracks.len() >= 24 || session.tracks.iter().filter(|track| !track.clips.is_empty()).count() >= 8;
+    let raw_like = session.tracks.len() >= 24
+        || session
+            .tracks
+            .iter()
+            .filter(|track| !track.clips.is_empty())
+            .count()
+            >= 8;
 
     let mut before_issues = Vec::new();
     let mut after_issues = Vec::new();
@@ -277,43 +298,70 @@ fn judge_session_local(session: &MixSession) -> Result<AbJudgeResponse, String> 
 
     let lufs_delta = after_metrics.lufs - before_metrics.lufs;
     if after_metrics.peak_db > -0.3 {
-        regressions.push(format!("Processed mix peaks too close to clipping ({:.1} dBFS).", after_metrics.peak_db));
+        regressions.push(format!(
+            "Processed mix peaks too close to clipping ({:.1} dBFS).",
+            after_metrics.peak_db
+        ));
         score -= 2.0;
     } else if before_metrics.peak_db > -0.3 && after_metrics.peak_db < -1.0 {
-        improvements.push(format!("Processed mix improves peak headroom from {:.1} to {:.1} dBFS.", before_metrics.peak_db, after_metrics.peak_db));
+        improvements.push(format!(
+            "Processed mix improves peak headroom from {:.1} to {:.1} dBFS.",
+            before_metrics.peak_db, after_metrics.peak_db
+        ));
         score += 1.0;
     }
 
     if lufs_delta > 2.0 {
-        regressions.push(format!("Processed mix is {:.1} dB louder; local QC does not count loudness as quality.", lufs_delta));
+        regressions.push(format!(
+            "Processed mix is {:.1} dB louder; local QC does not count loudness as quality.",
+            lufs_delta
+        ));
         score -= 0.8;
     } else if lufs_delta < -4.0 {
-        regressions.push(format!("Processed mix is {:.1} dB quieter, which may undercut impact.", lufs_delta.abs()));
+        regressions.push(format!(
+            "Processed mix is {:.1} dB quieter, which may undercut impact.",
+            lufs_delta.abs()
+        ));
         score -= 0.5;
     }
 
     let high_delta = after_metrics.high_energy - before_metrics.high_energy;
     if high_delta > 0.08 || after_metrics.high_energy > 0.46 {
-        regressions.push(format!("Processed mix has more high-band energy ({:.2} -> {:.2}), possible harshness/fatigue.", before_metrics.high_energy, after_metrics.high_energy));
+        regressions.push(format!(
+            "Processed mix has more high-band energy ({:.2} -> {:.2}), possible harshness/fatigue.",
+            before_metrics.high_energy, after_metrics.high_energy
+        ));
         score -= 1.0;
-    } else if before_metrics.high_energy > 0.46 && after_metrics.high_energy < before_metrics.high_energy - 0.04 {
+    } else if before_metrics.high_energy > 0.46
+        && after_metrics.high_energy < before_metrics.high_energy - 0.04
+    {
         improvements.push("Processed mix reduces excessive high-band energy.".into());
         score += 0.8;
     }
 
     let low_delta = after_metrics.low_energy - before_metrics.low_energy;
     if low_delta > 0.10 || after_metrics.low_energy > 0.58 {
-        regressions.push(format!("Processed mix has heavier low-band concentration ({:.2} -> {:.2}), possible mud/boom.", before_metrics.low_energy, after_metrics.low_energy));
+        regressions.push(format!(
+            "Processed mix has heavier low-band concentration ({:.2} -> {:.2}), possible mud/boom.",
+            before_metrics.low_energy, after_metrics.low_energy
+        ));
         score -= 0.9;
-    } else if before_metrics.low_energy > 0.58 && after_metrics.low_energy < before_metrics.low_energy - 0.05 {
+    } else if before_metrics.low_energy > 0.58
+        && after_metrics.low_energy < before_metrics.low_energy - 0.05
+    {
         improvements.push("Processed mix reduces excessive low-band buildup.".into());
         score += 0.8;
     }
 
     if after_metrics.dynamic_range_db < before_metrics.dynamic_range_db - 4.0 {
-        regressions.push(format!("Processed mix loses dynamic range ({:.1} -> {:.1} dB), possible over-compression.", before_metrics.dynamic_range_db, after_metrics.dynamic_range_db));
+        regressions.push(format!(
+            "Processed mix loses dynamic range ({:.1} -> {:.1} dB), possible over-compression.",
+            before_metrics.dynamic_range_db, after_metrics.dynamic_range_db
+        ));
         score -= 1.2;
-    } else if before_metrics.dynamic_range_db > 18.0 && after_metrics.dynamic_range_db < before_metrics.dynamic_range_db - 1.5 {
+    } else if before_metrics.dynamic_range_db > 18.0
+        && after_metrics.dynamic_range_db < before_metrics.dynamic_range_db - 1.5
+    {
         improvements.push("Processed mix reins in excessive dynamic range.".into());
         score += 0.7;
     }
@@ -399,36 +447,103 @@ fn normalize_winner(winner: &str) -> String {
 
 fn push_metric_issues(label: &str, metrics: &LocalQcMetrics, issues: &mut Vec<AbJudgeIssue>) {
     if metrics.peak_db > -0.3 {
-        issues.push(issue("headroom", "high", format!("{label} peak is {:.1} dBFS, too close to clipping.", metrics.peak_db)));
+        issues.push(issue(
+            "headroom",
+            "high",
+            format!(
+                "{label} peak is {:.1} dBFS, too close to clipping.",
+                metrics.peak_db
+            ),
+        ));
     } else if metrics.peak_db > -1.0 {
-        issues.push(issue("headroom", "medium", format!("{label} peak is {:.1} dBFS; limited mastering headroom.", metrics.peak_db)));
+        issues.push(issue(
+            "headroom",
+            "medium",
+            format!(
+                "{label} peak is {:.1} dBFS; limited mastering headroom.",
+                metrics.peak_db
+            ),
+        ));
     }
     if metrics.low_energy > 0.58 {
-        issues.push(issue("tonality", "medium", format!("{label} low-band energy is high ({:.2}); possible mud or boom.", metrics.low_energy)));
+        issues.push(issue(
+            "tonality",
+            "medium",
+            format!(
+                "{label} low-band energy is high ({:.2}); possible mud or boom.",
+                metrics.low_energy
+            ),
+        ));
     }
     if metrics.mid_energy > 0.68 {
-        issues.push(issue("tonality", "medium", format!("{label} mid-band energy is concentrated ({:.2}); possible boxiness or masking.", metrics.mid_energy)));
+        issues.push(issue(
+            "tonality",
+            "medium",
+            format!(
+                "{label} mid-band energy is concentrated ({:.2}); possible boxiness or masking.",
+                metrics.mid_energy
+            ),
+        ));
     }
     if metrics.high_energy > 0.46 || metrics.spectral_centroid_hz > 5200.0 {
         issues.push(issue("tonality", "medium", format!("{label} high-band energy/centroid is elevated ({:.2}, {:.0} Hz); possible harshness.", metrics.high_energy, metrics.spectral_centroid_hz)));
     }
     if metrics.rms_db > -8.0 {
-        issues.push(issue("loudness", "medium", format!("{label} RMS is high ({:.1} dBFS); possible density or limited dynamics.", metrics.rms_db)));
+        issues.push(issue(
+            "loudness",
+            "medium",
+            format!(
+                "{label} RMS is high ({:.1} dBFS); possible density or limited dynamics.",
+                metrics.rms_db
+            ),
+        ));
     }
     if metrics.dynamic_range_db < 6.0 {
-        issues.push(issue("dynamics", "medium", format!("{label} dynamic range is only {:.1} dB; possible over-compression.", metrics.dynamic_range_db)));
+        issues.push(issue(
+            "dynamics",
+            "medium",
+            format!(
+                "{label} dynamic range is only {:.1} dB; possible over-compression.",
+                metrics.dynamic_range_db
+            ),
+        ));
     } else if metrics.dynamic_range_db > 24.0 {
-        issues.push(issue("dynamics", "medium", format!("{label} dynamic range is {:.1} dB; likely uneven or under-controlled.", metrics.dynamic_range_db)));
+        issues.push(issue(
+            "dynamics",
+            "medium",
+            format!(
+                "{label} dynamic range is {:.1} dB; likely uneven or under-controlled.",
+                metrics.dynamic_range_db
+            ),
+        ));
     }
     if metrics.correlation < 0.05 {
-        issues.push(issue("stereo", "high", format!("{label} stereo correlation is {:.2}; possible phase/image instability.", metrics.correlation)));
+        issues.push(issue(
+            "stereo",
+            "high",
+            format!(
+                "{label} stereo correlation is {:.2}; possible phase/image instability.",
+                metrics.correlation
+            ),
+        ));
     } else if metrics.stereo_width > 1.5 {
-        issues.push(issue("stereo", "medium", format!("{label} stereo width is high ({:.2}); verify width is not phasey or unfocused.", metrics.stereo_width)));
+        issues.push(issue(
+            "stereo",
+            "medium",
+            format!(
+                "{label} stereo width is high ({:.2}); verify width is not phasey or unfocused.",
+                metrics.stereo_width
+            ),
+        ));
     }
 }
 
 fn issue(category: &str, severity: &str, message: String) -> AbJudgeIssue {
-    AbJudgeIssue { category: category.into(), severity: severity.into(), message }
+    AbJudgeIssue {
+        category: category.into(),
+        severity: severity.into(),
+        message,
+    }
 }
 
 fn local_next_moves(metrics: &LocalQcMetrics) -> Vec<String> {
@@ -446,7 +561,9 @@ fn local_next_moves(metrics: &LocalQcMetrics) -> Vec<String> {
         moves.push("Use light compression or clip gain on uneven lead sources before pushing overall loudness.".into());
     }
     if metrics.correlation < 0.05 {
-        moves.push("Narrow or rebalance phasey stereo/room sources before adding more width.".into());
+        moves.push(
+            "Narrow or rebalance phasey stereo/room sources before adding more width.".into(),
+        );
     }
     if moves.is_empty() {
         moves.push("Use a listening pass to verify vocal hierarchy, groove impact, and masking; objective QC found no dominant metric failure.".into());
@@ -489,7 +606,11 @@ fn stereo_metrics(samples: &[f32], channels: u16) -> (f32, f32) {
         r_sq += r * r;
         lr += l * r;
     }
-    let width = if mid_sq > 1.0e-12 { (side_sq / mid_sq).sqrt() as f32 } else { 0.0 };
+    let width = if mid_sq > 1.0e-12 {
+        (side_sq / mid_sq).sqrt() as f32
+    } else {
+        0.0
+    };
     let corr = if l_sq > 1.0e-12 && r_sq > 1.0e-12 {
         (lr / (l_sq.sqrt() * r_sq.sqrt())) as f32
     } else {
@@ -500,16 +621,27 @@ fn stereo_metrics(samples: &[f32], channels: u16) -> (f32, f32) {
 
 fn enforce_strict_judgment(payload: &mut ModelJudgePayload) {
     let lower = payload.summary.to_ascii_lowercase();
-    let praise_words = ["amazing", "great", "much better", "professional", "polished", "excellent", "fantastic"];
+    let praise_words = [
+        "amazing",
+        "great",
+        "much better",
+        "professional",
+        "polished",
+        "excellent",
+        "fantastic",
+    ];
     let vague_praise = praise_words.iter().any(|word| lower.contains(word));
     if vague_praise && payload.regressions.is_empty() && payload.mix_issues_after.is_empty() {
         payload.winner = "tie".into();
         payload.confidence = payload.confidence.min(0.55);
-        payload.regressions.push("The judgment used vague praise without identifying concrete audible tradeoffs.".into());
+        payload.regressions.push(
+            "The judgment used vague praise without identifying concrete audible tradeoffs.".into(),
+        );
         payload.mix_issues_after.push(AbJudgeIssue {
             category: "qc".into(),
             severity: "medium".into(),
-            message: "Re-run judgment skeptically: no mix should pass on positive language alone.".into(),
+            message: "Re-run judgment skeptically: no mix should pass on positive language alone."
+                .into(),
         });
     }
     payload.summary = strip_vague_praise(&payload.summary);
@@ -523,7 +655,15 @@ fn enforce_strict_judgment(payload: &mut ModelJudgePayload) {
 
 fn strip_vague_praise(text: &str) -> String {
     let mut out = text.to_string();
-    for phrase in ["amazing", "great", "much better", "professional", "polished", "excellent", "fantastic"] {
+    for phrase in [
+        "amazing",
+        "great",
+        "much better",
+        "professional",
+        "polished",
+        "excellent",
+        "fantastic",
+    ] {
         out = replace_case_insensitive(&out, phrase, "specific");
     }
     out
@@ -548,16 +688,24 @@ fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> Str
 }
 
 fn choose_clip_window(session: &MixSession, render: &RenderedMix) -> (f32, f32) {
-    let duration = render.samples.len() as f32 / render.channels.max(1) as f32 / render.sample_rate.max(1) as f32;
+    let duration = render.samples.len() as f32
+        / render.channels.max(1) as f32
+        / render.sample_rate.max(1) as f32;
     let clip_duration = CLIP_SECONDS.min(duration.max(1.0));
     if let Some(section) = session
         .sections
         .iter()
         .find(|s| s.label.to_ascii_lowercase().contains("chorus"))
-        .or_else(|| session.sections.iter().max_by(|a, b| section_len(a).total_cmp(&section_len(b))))
+        .or_else(|| {
+            session
+                .sections
+                .iter()
+                .max_by(|a, b| section_len(a).total_cmp(&section_len(b)))
+        })
     {
         let midpoint = (section.start + section.end) * 0.5;
-        let start = (midpoint - clip_duration * 0.5).clamp(0.0, (duration - clip_duration).max(0.0));
+        let start =
+            (midpoint - clip_duration * 0.5).clamp(0.0, (duration - clip_duration).max(0.0));
         return (start, clip_duration);
     }
     (((duration - clip_duration) * 0.5).max(0.0), clip_duration)
@@ -567,7 +715,12 @@ fn section_len(section: &crate::model::MixSection) -> f32 {
     (section.end - section.start).max(0.0)
 }
 
-fn write_clip_wav(render: &RenderedMix, start_seconds: f32, duration_seconds: f32, path: &Path) -> Result<(), String> {
+fn write_clip_wav(
+    render: &RenderedMix,
+    start_seconds: f32,
+    duration_seconds: f32,
+    path: &Path,
+) -> Result<(), String> {
     let channels = render.channels.max(1) as usize;
     let sample_rate = render.sample_rate.max(1);
     let start_frame = (start_seconds.max(0.0) * sample_rate as f32).round() as usize;

@@ -17,9 +17,9 @@ const BASE_DELAY_MS: [f32; N] = [29.7, 37.1, 41.3, 43.7, 53.9, 59.3, 67.1, 73.9]
 
 pub struct Reverb {
     fs: f32,
-    pub mix: SmoothedParam,        // 0..1 wet level
-    pub size: SmoothedParam,       // 0..1 size scalar
-    pub damping: SmoothedParam,    // 0..1 high-frequency damping
+    pub mix: SmoothedParam,     // 0..1 wet level
+    pub size: SmoothedParam,    // 0..1 size scalar
+    pub damping: SmoothedParam, // 0..1 high-frequency damping
     delays: [Vec<f32>; N],
     write_idx: [usize; N],
     delay_samples: [usize; N],
@@ -29,7 +29,8 @@ pub struct Reverb {
 
 impl Reverb {
     pub fn new(fs: f32) -> Self {
-        let max_delay = (BASE_DELAY_MS.iter().cloned().fold(0.0_f32, f32::max) * 0.001 * fs) as usize + 64;
+        let max_delay =
+            (BASE_DELAY_MS.iter().cloned().fold(0.0_f32, f32::max) * 0.001 * fs) as usize + 64;
         let delays: [Vec<f32>; N] = std::array::from_fn(|_| vec![0.0; max_delay]);
         let mut r = Self {
             fs,
@@ -92,7 +93,14 @@ impl Reverb {
         // Inputs distributed across lines.
         let in_avg = (in_l + in_r) * 0.5;
         let inputs = [
-            in_l, in_r, in_avg, in_avg, in_l * 0.7, in_r * 0.7, in_avg * 0.7, in_avg * 0.7,
+            in_l,
+            in_r,
+            in_avg,
+            in_avg,
+            in_l * 0.7,
+            in_r * 0.7,
+            in_avg * 0.7,
+            in_avg * 0.7,
         ];
 
         // Write back: input + feedback.

@@ -21,7 +21,13 @@ pub struct BiquadCoefs {
 }
 
 impl BiquadCoefs {
-    pub const IDENTITY: Self = Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 };
+    pub const IDENTITY: Self = Self {
+        b0: 1.0,
+        b1: 0.0,
+        b2: 0.0,
+        a1: 0.0,
+        a2: 0.0,
+    };
 
     pub fn design(kind: BiquadKind, fs: f32, freq: f32, q: f32, gain_db: f32) -> Self {
         let freq = freq.clamp(10.0, fs * 0.49);
@@ -82,7 +88,13 @@ impl BiquadCoefs {
             }
         };
         let inv = 1.0 / a0;
-        Self { b0: b0 * inv, b1: b1 * inv, b2: b2 * inv, a1: a1 * inv, a2: a2 * inv }
+        Self {
+            b0: b0 * inv,
+            b1: b1 * inv,
+            b2: b2 * inv,
+            a1: a1 * inv,
+            a2: a2 * inv,
+        }
     }
 }
 

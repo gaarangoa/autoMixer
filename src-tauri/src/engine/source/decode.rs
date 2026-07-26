@@ -29,7 +29,12 @@ pub fn decode_file(path: &Path) -> Result<DecodedAudio, String> {
     }
 
     let probe = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| format!("probe: {e}"))?;
     let mut format = probe.format;
 
@@ -57,7 +62,11 @@ pub fn decode_file(path: &Path) -> Result<DecodedAudio, String> {
     loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
-            Err(SymphoniaError::IoError(ref io)) if io.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(SymphoniaError::IoError(ref io))
+                if io.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break
+            }
             Err(SymphoniaError::ResetRequired) => {
                 let _ = decoder.reset();
                 continue;
@@ -70,7 +79,11 @@ pub fn decode_file(path: &Path) -> Result<DecodedAudio, String> {
         match decoder.decode(&packet) {
             Ok(buf) => append_buffer(&buf, &mut samples, channels as usize),
             Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(SymphoniaError::IoError(ref io)) if io.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(SymphoniaError::IoError(ref io))
+                if io.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break
+            }
             Err(SymphoniaError::ResetRequired) => {
                 let _ = decoder.reset();
                 continue;
@@ -79,18 +92,32 @@ pub fn decode_file(path: &Path) -> Result<DecodedAudio, String> {
         }
     }
 
-    Ok(DecodedAudio { samples, channels, sample_rate })
+    Ok(DecodedAudio {
+        samples,
+        channels,
+        sample_rate,
+    })
 }
 
 fn append_buffer(buf: &AudioBufferRef<'_>, out: &mut Vec<f32>, channels: usize) {
     match buf {
         AudioBufferRef::F32(b) => interleave(b.frames(), channels, out, |c, f| b.chan(c)[f]),
         AudioBufferRef::F64(b) => interleave(b.frames(), channels, out, |c, f| b.chan(c)[f] as f32),
-        AudioBufferRef::S8(b) => interleave(b.frames(), channels, out, |c, f| b.chan(c)[f] as f32 / i8::MAX as f32),
-        AudioBufferRef::S16(b) => interleave(b.frames(), channels, out, |c, f| b.chan(c)[f] as f32 / i16::MAX as f32),
-        AudioBufferRef::S24(b) => interleave(b.frames(), channels, out, |c, f| b.chan(c)[f].inner() as f32 / 8_388_607.0),
-        AudioBufferRef::S32(b) => interleave(b.frames(), channels, out, |c, f| b.chan(c)[f] as f32 / i32::MAX as f32),
-        AudioBufferRef::U8(b) => interleave(b.frames(), channels, out, |c, f| (b.chan(c)[f] as f32 - 128.0) / 128.0),
+        AudioBufferRef::S8(b) => interleave(b.frames(), channels, out, |c, f| {
+            b.chan(c)[f] as f32 / i8::MAX as f32
+        }),
+        AudioBufferRef::S16(b) => interleave(b.frames(), channels, out, |c, f| {
+            b.chan(c)[f] as f32 / i16::MAX as f32
+        }),
+        AudioBufferRef::S24(b) => interleave(b.frames(), channels, out, |c, f| {
+            b.chan(c)[f].inner() as f32 / 8_388_607.0
+        }),
+        AudioBufferRef::S32(b) => interleave(b.frames(), channels, out, |c, f| {
+            b.chan(c)[f] as f32 / i32::MAX as f32
+        }),
+        AudioBufferRef::U8(b) => interleave(b.frames(), channels, out, |c, f| {
+            (b.chan(c)[f] as f32 - 128.0) / 128.0
+        }),
         AudioBufferRef::U16(b) => interleave(b.frames(), channels, out, |c, f| {
             (b.chan(c)[f] as f32 - 32_768.0) / 32_768.0
         }),
@@ -103,7 +130,12 @@ fn append_buffer(buf: &AudioBufferRef<'_>, out: &mut Vec<f32>, channels: usize) 
     }
 }
 
-fn interleave<F: Fn(usize, usize) -> f32>(frames: usize, channels: usize, out: &mut Vec<f32>, sample: F) {
+fn interleave<F: Fn(usize, usize) -> f32>(
+    frames: usize,
+    channels: usize,
+    out: &mut Vec<f32>,
+    sample: F,
+) {
     out.reserve(frames * channels);
     for f in 0..frames {
         for c in 0..channels {

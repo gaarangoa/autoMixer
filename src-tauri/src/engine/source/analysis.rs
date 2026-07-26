@@ -58,7 +58,11 @@ pub fn analyze(samples: &[f32], channels: u16, sample_rate: u32) -> AudioAnalysi
     // We approximate by applying a 1st-order high-pass and a high-shelf via
     // simple recursive filters on the mono signal, then compute mean-square.
     let kw = k_weighted_mean_square(&mono, sample_rate as f32);
-    let lufs = if kw > 0.0 { (-0.691 + 10.0 * kw.log10()) as f32 } else { -120.0 };
+    let lufs = if kw > 0.0 {
+        (-0.691 + 10.0 * kw.log10()) as f32
+    } else {
+        -120.0
+    };
 
     let (centroid, low, mid, high) = spectral_features(&mono, sample_rate as f32);
 
@@ -169,7 +173,11 @@ fn spectral_features(mono: &[f32], fs: f32) -> (f32, f32, f32, f32) {
         }
     }
 
-    let centroid = if total > 0.0 { weighted_sum / total } else { 0.0 };
+    let centroid = if total > 0.0 {
+        weighted_sum / total
+    } else {
+        0.0
+    };
     let denom = (low + mid + high).max(1.0e-6);
     (centroid, low / denom, mid / denom, high / denom)
 }

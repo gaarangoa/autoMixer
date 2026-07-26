@@ -40,7 +40,8 @@ impl StereoDelay {
     }
 
     pub fn set(&mut self, time_ms: f32, feedback: f32, mix: f32) {
-        self.time_ms.set_target(time_ms.clamp(1.0, MAX_DELAY_SECONDS * 1000.0));
+        self.time_ms
+            .set_target(time_ms.clamp(1.0, MAX_DELAY_SECONDS * 1000.0));
         self.feedback.set_target(feedback.clamp(0.0, 0.95));
         self.mix.set_target(mix.clamp(0.0, 1.0));
     }

@@ -77,7 +77,12 @@ pub fn build_snapshot(session: &MixSession) -> AutomationSnapshot {
                 let e = lane.points.last().map(|p| p.sample).unwrap_or(s);
                 (s, e)
             };
-            entries.push(AutoEntry { start_sample: start, end_sample: end, target, value });
+            entries.push(AutoEntry {
+                start_sample: start,
+                end_sample: end,
+                target,
+                value,
+            });
         }
         by_slot.push(TrackAutomation { entries });
     }

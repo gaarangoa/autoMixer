@@ -15,3 +15,6 @@ src-tauri/resources/
 # Audio sidecar runtime scratch
 audio-service/demix/
 audio-service/spec/
+
+# Machine-specific external model-server overrides
+model-service/config.env

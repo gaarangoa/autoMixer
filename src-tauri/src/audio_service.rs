@@ -97,9 +97,7 @@ impl AudioService {
             .and_then(|h| h.try_clone().ok())
             .map(Stdio::from)
             .unwrap_or_else(Stdio::null);
-        let stderr_target = log_handle
-            .map(Stdio::from)
-            .unwrap_or_else(Stdio::null);
+        let stderr_target = log_handle.map(Stdio::from).unwrap_or_else(Stdio::null);
 
         let child = match service_dir() {
             Some(dir) if dir.exists() => Command::new(uv_path())

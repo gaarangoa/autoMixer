@@ -52,14 +52,13 @@ export const api = {
   sessions: (albumId: string) => tauriInvoke<MixSession[]>("list_sessions", { albumId }),
   createSession: (albumId: string, name: string) => tauriInvoke<MixProject>("create_session", { albumId, name }),
   albums: () => tauriInvoke<MixAlbum[]>("list_albums"),
-  recents: () => tauriInvoke<{ id: string; name: string; path: string }[]>("list_recents"),
-  // Document model: createAlbum saves a new album folder inside `dir`; openAlbum loads one from disk.
+  // Document model: createAlbum saves a new album folder inside `dir`; openAlbum
+  // activates exactly one folder for the current app run.
   createAlbum: (name: string, dir: string) => tauriInvoke<MixAlbum>("create_album", { name, dir }),
   openAlbum: (path: string) => tauriInvoke<MixAlbum>("open_album", { path }),
-  createDefaultSession: (name: string) => tauriInvoke<MixProject>("create_default_session", { name }),
   getAlbum: (albumId: string) => tauriInvoke<MixAlbum>("get_album", { albumId }),
   renameAlbum: (albumId: string, name: string) => tauriInvoke<MixAlbum>("rename_album", { albumId, name }),
-  deleteAlbum: (albumId: string) => tauriInvoke<void>("delete_album", { albumId }),
+  closeAlbum: (albumId: string) => tauriInvoke<void>("close_album", { albumId }),
   setFileMenu: (albums: { id: string; name: string }[], sessions: { id: string; name: string }[], currentAlbumId: string, currentSessionId: string) =>
     tauriInvoke<void>("set_file_menu", { albums, sessions, currentAlbumId, currentSessionId }),
   getSession: (id: string) => tauriInvoke<MixProject>("get_project", { sessionId: id }),
@@ -127,8 +126,8 @@ export const api = {
   saveVideoRecording: (sessionId: string, trackId: string, fileName: string, mimeType: string, startSample: number, durationMs: number, dataBase64: string, createAudioTrack = false, sourceOffsetMs = 0) =>
     tauriInvoke<MixProject>("save_video_recording", { sessionId, trackId, fileName, mimeType, startSample, durationMs, dataBase64, createAudioTrack, sourceOffsetMs }),
   // Native multicam capture: one ffmpeg process per camera (no webview media stack).
-  startCameraCaptures: (specs: { trackId: string; deviceLabel: string; includeAudio: boolean }[]) =>
-    tauriInvoke<void>("start_camera_captures", { specs }),
+  startCameraCaptures: (sessionId: string, specs: { trackId: string; deviceLabel: string; includeAudio: boolean }[]) =>
+    tauriInvoke<void>("start_camera_captures", { sessionId, specs }),
   markCameraTransportStart: () => tauriInvoke<void>("mark_camera_transport_start"),
   // Live MJPEG previews served by the Rust camera service (single camera owner).
   getCameraPreviewInfo: () => tauriInvoke<{ port: number; token: string }>("get_camera_preview_info"),

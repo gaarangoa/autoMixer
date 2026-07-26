@@ -110,7 +110,9 @@ impl HermesService {
     fn spawn_child(port: u16) -> Option<Child> {
         Self::free_stale_port(port);
         let log_path = log_path();
-        let log_handle = log_path.as_ref().and_then(|p| std::fs::File::create(p).ok());
+        let log_handle = log_path
+            .as_ref()
+            .and_then(|p| std::fs::File::create(p).ok());
         let stdout_target = log_handle
             .as_ref()
             .and_then(|h| h.try_clone().ok())
@@ -198,9 +200,16 @@ impl HermesService {
         let body = resp.text().await.unwrap_or_default();
         let detail = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
-            .and_then(|value| value.get("detail").and_then(|detail| detail.as_str()).map(str::to_string))
+            .and_then(|value| {
+                value
+                    .get("detail")
+                    .and_then(|detail| detail.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or(body);
-        Err(format!("hermes-service model probe failed ({status}): {detail}"))
+        Err(format!(
+            "hermes-service model probe failed ({status}): {detail}"
+        ))
     }
 
     /// Forget the agent's conversation for a session (Clear chat). The next chat turn
@@ -457,7 +466,10 @@ fn repair_hermes_config(cfg: &PathBuf) {
         let replacement = if in_agent && indent == 2 && trimmed.starts_with("gateway_timeout:") {
             Some(format!("  gateway_timeout: {AUTOMIXER_LONG_TIMEOUT_SECS}"))
         } else if in_agent && indent == 2 && trimmed.starts_with("gateway_timeout_warning:") {
-            Some(format!("  gateway_timeout_warning: {}", AUTOMIXER_LONG_TIMEOUT_SECS / 2))
+            Some(format!(
+                "  gateway_timeout_warning: {}",
+                AUTOMIXER_LONG_TIMEOUT_SECS / 2
+            ))
         } else if in_title_generation && indent == 4 && trimmed.starts_with("enabled:") {
             title_generation_has_enabled = true;
             Some("    enabled: false".to_string())
@@ -555,9 +567,18 @@ fn resolve_bundled_source(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent().map(PathBuf::from);
     let candidates = [
-        exe_dir.as_ref().and_then(|d| d.parent()).map(|c| c.join("Resources").join(name)),
+        exe_dir
+            .as_ref()
+            .and_then(|d| d.parent())
+            .map(|c| c.join("Resources").join(name)),
         exe_dir.as_ref().map(|d| d.join(name)),
-        exe_dir.as_ref().and_then(|d| d.parent()).map(|c| c.join(name)),
+        exe_dir
+            .as_ref()
+            .and_then(|d| d.parent())
+            .map(|c| c.join(name)),
     ];
-    candidates.into_iter().flatten().find(|c| c.join("pyproject.toml").exists())
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|c| c.join("pyproject.toml").exists())
 }

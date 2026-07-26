@@ -55,13 +55,20 @@ pub fn render_session_range_to_buffer(
     let (mut mixer, total_with_tail, channels, _sample_rate) = build_render_mixer(session, false)?;
     let safe_end = range_end.min(total_with_tail);
     if safe_end <= range_start {
-        return Ok(RenderedMix { samples: Vec::new(), channels, sample_rate: session.sample_rate });
+        return Ok(RenderedMix {
+            samples: Vec::new(),
+            channels,
+            sample_rate: session.sample_rate,
+        });
     }
     // Seek before rendering. The Play command pushed in build_render_mixer doesn't
     // touch playhead, so setting it directly here is safe; the first mixer.render
     // call will drain the queue (processing Play) and then render from this point.
     mixer.playhead = range_start as f64;
-    mixer.shared.playhead.store(range_start, std::sync::atomic::Ordering::Relaxed);
+    mixer
+        .shared
+        .playhead
+        .store(range_start, std::sync::atomic::Ordering::Relaxed);
     let frames_needed = (safe_end - range_start) as usize;
     let mut block = vec![0.0_f32; RENDER_BLOCK * channels as usize];
     let mut produced: usize = 0;
@@ -73,7 +80,11 @@ pub fn render_session_range_to_buffer(
         out.extend_from_slice(&block[..to_write * channels as usize]);
         produced += to_write;
     }
-    Ok(RenderedMix { samples: out, channels, sample_rate: session.sample_rate })
+    Ok(RenderedMix {
+        samples: out,
+        channels,
+        sample_rate: session.sample_rate,
+    })
 }
 
 /// Render using the same source-only bypass path as the live MIX/ORIG toggle.
@@ -81,7 +92,8 @@ pub fn render_session_to_buffer_with_bypass(
     session: &MixSession,
     master_bypass: bool,
 ) -> Result<RenderedMix, String> {
-    let (mut mixer, total_with_tail, channels, _sample_rate) = build_render_mixer(session, master_bypass)?;
+    let (mut mixer, total_with_tail, channels, _sample_rate) =
+        build_render_mixer(session, master_bypass)?;
     let mut block = vec![0.0_f32; RENDER_BLOCK * channels as usize];
     let mut produced: u64 = 0;
     let mut out: Vec<f32> = Vec::with_capacity((total_with_tail as usize) * channels as usize);
@@ -92,13 +104,23 @@ pub fn render_session_to_buffer_with_bypass(
         out.extend_from_slice(&block[..to_write * channels as usize]);
         produced += to_write as u64;
     }
-    Ok(RenderedMix { samples: out, channels, sample_rate: session.sample_rate })
+    Ok(RenderedMix {
+        samples: out,
+        channels,
+        sample_rate: session.sample_rate,
+    })
 }
 
-fn build_render_mixer(session: &MixSession, master_bypass: bool) -> Result<(Mixer, u64, u16, f32), String> {
+fn build_render_mixer(
+    session: &MixSession,
+    master_bypass: bool,
+) -> Result<(Mixer, u64, u16, f32), String> {
     // Load all source caches up front.
-    let by_id: HashMap<&str, &SourceFile> =
-        session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
+    let by_id: HashMap<&str, &SourceFile> = session
+        .source_files
+        .iter()
+        .map(|s| (s.id.as_str(), s))
+        .collect();
 
     let shared = Arc::new(EngineShared::new());
     let mut total_frames: u64 = 0;
@@ -124,12 +146,16 @@ fn build_render_mixer(session: &MixSession, master_bypass: bool) -> Result<(Mixe
             }
         } else {
             for clip in &track.clips {
-                let source_id = clip.source_file_id.as_deref().unwrap_or(track.source_file_id.as_str());
+                let source_id = clip
+                    .source_file_id
+                    .as_deref()
+                    .unwrap_or(track.source_file_id.as_str());
                 let Some(src) = by_id.get(source_id) else {
                     continue;
                 };
                 let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
-                let duration = header.frames
+                let duration = header
+                    .frames
                     .saturating_sub(clip.source_offset_sample)
                     .min(clip.end_sample.saturating_sub(clip.start_sample));
                 total_frames = total_frames.max(clip.start_sample + duration);
@@ -162,17 +188,30 @@ fn build_render_mixer(session: &MixSession, master_bypass: bool) -> Result<(Mixe
 
     // Push session state.
     let _ = producer.push(EngineCommand::SetMasterGainDb(session.master.gain_db));
-    let _ = producer.push(EngineCommand::SetMasterCeilingDb(session.master.limiter.ceiling_db));
-    let _ = producer.push(EngineCommand::SetMasterBypass { enabled: master_bypass });
+    let _ = producer.push(EngineCommand::SetMasterCeilingDb(
+        session.master.limiter.ceiling_db,
+    ));
+    let _ = producer.push(EngineCommand::SetMasterBypass {
+        enabled: master_bypass,
+    });
     for (i, track) in session.tracks.iter().enumerate() {
         if i >= MAX_TRACKS {
             break;
         }
         let slot = i as u32;
         let _ = producer.push(EngineCommand::SetTrackActive { slot, active: true });
-        let _ = producer.push(EngineCommand::SetTrackGainDb { slot, db: track.gain_db });
-        let _ = producer.push(EngineCommand::SetTrackPan { slot, pan: track.pan });
-        let _ = producer.push(EngineCommand::SetTrackMuted { slot, muted: track.muted });
+        let _ = producer.push(EngineCommand::SetTrackGainDb {
+            slot,
+            db: track.gain_db,
+        });
+        let _ = producer.push(EngineCommand::SetTrackPan {
+            slot,
+            pan: track.pan,
+        });
+        let _ = producer.push(EngineCommand::SetTrackMuted {
+            slot,
+            muted: track.muted,
+        });
         let _ = producer.push(EngineCommand::SetTrackSolo {
             slot,
             solo: track.solo && track.kind != crate::model::TrackKind::Video,
@@ -251,7 +290,10 @@ pub fn render_session_range(
     let mut writer = WavWriter::create(&path, spec).map_err(|e| e.to_string())?;
     // Seek to the region start (the Play command is drained on the first render call).
     mixer.playhead = start as f64;
-    mixer.shared.playhead.store(start, std::sync::atomic::Ordering::Relaxed);
+    mixer
+        .shared
+        .playhead
+        .store(start, std::sync::atomic::Ordering::Relaxed);
     let frames_needed = safe_end.saturating_sub(start) as usize;
     let mut block = vec![0.0_f32; RENDER_BLOCK * channels as usize];
     let mut produced: usize = 0;

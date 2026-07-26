@@ -69,8 +69,20 @@ impl AutoMixStage {
     }
     fn skills(&self) -> &'static [&'static str] {
         match self {
-            Self::RawSessionPrep => &["session_prep", "balance", "tonal_eq", "dynamics", "space_depth"],
-            Self::PrepIntent => &["balance", "tonal_eq", "dynamics", "space_depth", "mastering"],
+            Self::RawSessionPrep => &[
+                "session_prep",
+                "balance",
+                "tonal_eq",
+                "dynamics",
+                "space_depth",
+            ],
+            Self::PrepIntent => &[
+                "balance",
+                "tonal_eq",
+                "dynamics",
+                "space_depth",
+                "mastering",
+            ],
             Self::StaticBalance => &["balance"],
             Self::CleanupFilters => &["tonal_eq"],
             Self::SubtractiveEq => &["tonal_eq"],
@@ -282,7 +294,11 @@ pub async fn run_stage(
         });
     }
 
-    let base_url = config.ollama_base_url.trim().trim_end_matches('/').to_string();
+    let base_url = config
+        .ollama_base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     let model = config.ollama_model.trim().to_string();
     if base_url.is_empty() || model.is_empty() {
         return Err("Model server URL or model not configured.".into());
@@ -306,14 +322,28 @@ pub async fn run_stage(
 
     let phase = stage.id();
     // No token cap for production auto-mix: let the model reason and answer fully.
-    let call = match llm_generate(&base_url, &model, &aliased_prompt, ACTION_TIMEOUT_MS, phase, observer.as_ref(), None).await {
+    let call = match llm_generate(
+        &base_url,
+        &model,
+        &aliased_prompt,
+        ACTION_TIMEOUT_MS,
+        phase,
+        observer.as_ref(),
+        None,
+    )
+    .await
+    {
         Some(c) => c,
         None => {
             let cancelled = crate::assistant::agent_cancelled();
             return Ok(StageReport {
                 stage_id: stage.id().into(),
                 display_name: stage.display_name().into(),
-                status: if cancelled { "cancelled".into() } else { "error".into() },
+                status: if cancelled {
+                    "cancelled".into()
+                } else {
+                    "error".into()
+                },
                 action_count: 0,
                 explanation: None,
                 warnings: Vec::new(),
@@ -333,7 +363,10 @@ pub async fn run_stage(
     let env = match parse_stage_envelope(&project.session, &extracted) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("[auto-mix:{}] could not parse stage output: {e}\n{extracted}", stage.id());
+            eprintln!(
+                "[auto-mix:{}] could not parse stage output: {e}\n{extracted}",
+                stage.id()
+            );
             return Ok(StageReport {
                 stage_id: stage.id().into(),
                 display_name: stage.display_name().into(),
@@ -368,14 +401,22 @@ pub async fn run_stage(
             elapsed_ms: 0,
         });
     }
-    let _ = expand_skills_from_actions(stage.skills().iter().map(|s| s.to_string()).collect(), &actions);
+    let _ = expand_skills_from_actions(
+        stage.skills().iter().map(|s| s.to_string()).collect(),
+        &actions,
+    );
 
     let n = actions.len();
     let explanation = env
         .rationale
         .unwrap_or_else(|| format!("Auto-mix stage: {}.", stage.display_name()));
     if n > 0 {
-        apply_actions(&mut project, &actions, HistorySource::Assistant, Some(format!("[auto] {explanation}")))?;
+        apply_actions(
+            &mut project,
+            &actions,
+            HistorySource::Assistant,
+            Some(format!("[auto] {explanation}")),
+        )?;
     }
     store.lock().map_err(|e| e.to_string())?.save(&project)?;
 
@@ -386,7 +427,10 @@ pub async fn run_stage(
         status: if n == 0 { "skipped" } else { "complete" }.into(),
         action_count: n,
         explanation: Some(if actions_total > n {
-            format!("{explanation} (truncated {} → {} actions)", actions_total, n)
+            format!(
+                "{explanation} (truncated {} → {} actions)",
+                actions_total, n
+            )
         } else {
             explanation
         }),
@@ -445,7 +489,11 @@ fn limit_ai_stem_moves(session: &MixSession, actions: &mut [MixAction]) -> Vec<S
     if session.tracks.is_empty() {
         return Vec::new();
     }
-    let ai_count = session.tracks.iter().filter(|track| track.ai_generated).count();
+    let ai_count = session
+        .tracks
+        .iter()
+        .filter(|track| track.ai_generated)
+        .count();
     if ai_count * 2 < session.tracks.len() {
         return Vec::new();
     }
@@ -489,7 +537,13 @@ fn limit_ai_stem_moves(session: &MixSession, actions: &mut [MixAction]) -> Vec<S
                     ));
                 }
             }
-            MixAction::SetCompressor { track_id, ratio, attack_ms, release_ms, .. } => {
+            MixAction::SetCompressor {
+                track_id,
+                ratio,
+                attack_ms,
+                release_ms,
+                ..
+            } => {
                 let Some(track) = session.tracks.iter().find(|track| track.id == *track_id) else {
                     continue;
                 };
@@ -501,7 +555,10 @@ fn limit_ai_stem_moves(session: &MixSession, actions: &mut [MixAction]) -> Vec<S
                 *attack_ms = attack_ms.max(20.0);
                 *release_ms = release_ms.max(150.0);
                 if before != (*ratio, *attack_ms, *release_ms) {
-                    warnings.push(format!("softened compressor on AI-derived stem '{}'", track.name));
+                    warnings.push(format!(
+                        "softened compressor on AI-derived stem '{}'",
+                        track.name
+                    ));
                 }
             }
             _ => {}
@@ -568,8 +625,14 @@ fn strip_invalid_numeric_closing_quotes(raw: &str) -> String {
 
         if ch == '"' {
             let prev = out.chars().rev().find(|c| !c.is_whitespace());
-            let next = chars.iter().skip(idx + 1).find(|c| !c.is_whitespace()).copied();
-            if prev.is_some_and(|c| c.is_ascii_digit()) && matches!(next, Some(',') | Some('}') | Some(']')) {
+            let next = chars
+                .iter()
+                .skip(idx + 1)
+                .find(|c| !c.is_whitespace())
+                .copied();
+            if prev.is_some_and(|c| c.is_ascii_digit())
+                && matches!(next, Some(',') | Some('}') | Some(']'))
+            {
                 continue;
             }
             in_string = true;
@@ -657,7 +720,8 @@ fn normalize_action(session: &MixSession, action: &mut Value) {
     match tool {
         "set_eq_band" => normalize_eq_action(session, obj),
         "set_high_pass" | "set_low_pass" => {
-            obj.entry("slopeDbOct".to_string()).or_insert(Value::from(12));
+            obj.entry("slopeDbOct".to_string())
+                .or_insert(Value::from(12));
         }
         "set_compressor" => normalize_compressor_action(session, obj),
         _ => {}
@@ -718,7 +782,11 @@ fn normalize_object_map_keys(obj: &mut serde_json::Map<String, Value>) {
 }
 
 fn normalize_tool_name(obj: &mut serde_json::Map<String, Value>) {
-    if let Some(function) = obj.get("function").and_then(Value::as_str).map(str::to_string) {
+    if let Some(function) = obj
+        .get("function")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
         obj.insert("tool".to_string(), Value::from(function));
     }
     let Some(tool) = obj.get("tool").and_then(Value::as_str).map(str::to_string) else {
@@ -807,13 +875,18 @@ fn normalize_eq_action(session: &MixSession, obj: &mut serde_json::Map<String, V
         .and_then(|track| band.and_then(|b| track.chain.eq.get(b)));
 
     if !obj.contains_key("frequencyHz") {
-        let fallback = current_band.map(|b| b.frequency_hz).or_else(|| band.map(default_eq_frequency));
+        let fallback = current_band
+            .map(|b| b.frequency_hz)
+            .or_else(|| band.map(default_eq_frequency));
         if let Some(frequency) = fallback {
             obj.insert("frequencyHz".to_string(), Value::from(frequency));
         }
     }
     if !obj.contains_key("q") {
-        obj.insert("q".to_string(), Value::from(current_band.map(|b| b.q).unwrap_or(1.0)));
+        obj.insert(
+            "q".to_string(),
+            Value::from(current_band.map(|b| b.q).unwrap_or(1.0)),
+        );
     }
 }
 
@@ -834,25 +907,37 @@ fn normalize_compressor_action(session: &MixSession, obj: &mut serde_json::Map<S
         .and_then(|id| session.tracks.iter().find(|t| t.id == id))
         .map(|track| &track.chain.compressor);
     if !obj.contains_key("attackMs") {
-        obj.insert("attackMs".to_string(), Value::from(current.map(|c| c.attack_ms).unwrap_or(20.0)));
+        obj.insert(
+            "attackMs".to_string(),
+            Value::from(current.map(|c| c.attack_ms).unwrap_or(20.0)),
+        );
     }
     if !obj.contains_key("releaseMs") {
-        obj.insert("releaseMs".to_string(), Value::from(current.map(|c| c.release_ms).unwrap_or(160.0)));
+        obj.insert(
+            "releaseMs".to_string(),
+            Value::from(current.map(|c| c.release_ms).unwrap_or(160.0)),
+        );
     }
     if !obj.contains_key("kneeDb") {
-        obj.insert("kneeDb".to_string(), Value::from(current.map(|c| c.knee_db).unwrap_or(6.0)));
+        obj.insert(
+            "kneeDb".to_string(),
+            Value::from(current.map(|c| c.knee_db).unwrap_or(6.0)),
+        );
     }
     if !obj.contains_key("makeupDb") {
-        obj.insert("makeupDb".to_string(), Value::from(current.map(|c| c.makeup_db).unwrap_or(0.0)));
+        obj.insert(
+            "makeupDb".to_string(),
+            Value::from(current.map(|c| c.makeup_db).unwrap_or(0.0)),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defaults::{default_master, make_track};
     use crate::actions::{clamp_actions, validate_actions};
     use crate::assistant::{extract_json_object, LlmCallStats};
+    use crate::defaults::{default_master, make_track};
     use std::sync::Mutex;
 
     fn test_session() -> MixSession {
@@ -881,16 +966,39 @@ mod tests {
 
     fn rich_test_session() -> MixSession {
         let roles = [
-            ("kick", "Kick", -8.0, -18.0, 72.0, 0.82, 0.12, 0.06, 2.0, 14.0),
-            ("snare", "Snare", -7.0, -20.0, 2100.0, 0.22, 0.55, 0.23, 3.0, 13.0),
-            ("bass", "Bass", -6.5, -19.0, 130.0, 0.78, 0.18, 0.04, 1.0, 11.5),
-            ("lead_vocal", "Lead Vocal", -9.5, -22.0, 3100.0, 0.12, 0.62, 0.26, 4.0, 12.5),
-            ("guitar", "Guitar", -10.0, -24.0, 4200.0, 0.08, 0.66, 0.26, 6.0, 15.0),
-            ("keys", "Keys", -12.0, -25.0, 900.0, 0.38, 0.58, 0.04, 5.0, 14.0),
+            (
+                "kick", "Kick", -8.0, -18.0, 72.0, 0.82, 0.12, 0.06, 2.0, 14.0,
+            ),
+            (
+                "snare", "Snare", -7.0, -20.0, 2100.0, 0.22, 0.55, 0.23, 3.0, 13.0,
+            ),
+            (
+                "bass", "Bass", -6.5, -19.0, 130.0, 0.78, 0.18, 0.04, 1.0, 11.5,
+            ),
+            (
+                "lead_vocal",
+                "Lead Vocal",
+                -9.5,
+                -22.0,
+                3100.0,
+                0.12,
+                0.62,
+                0.26,
+                4.0,
+                12.5,
+            ),
+            (
+                "guitar", "Guitar", -10.0, -24.0, 4200.0, 0.08, 0.66, 0.26, 6.0, 15.0,
+            ),
+            (
+                "keys", "Keys", -12.0, -25.0, 900.0, 0.38, 0.58, 0.04, 5.0, 14.0,
+            ),
         ];
         let mut tracks = Vec::new();
         let mut source_files = Vec::new();
-        for (i, (role, name, peak, rms, centroid, low, mid, high, silence, dr)) in roles.iter().enumerate() {
+        for (i, (role, name, peak, rms, centroid, low, mid, high, silence, dr)) in
+            roles.iter().enumerate()
+        {
             let source_id = format!("source-{i}");
             let mut track = make_track(source_id.clone(), (*name).into(), i);
             track.id = format!("track-{i}");
@@ -947,7 +1055,9 @@ mod tests {
 
     impl TestObserver {
         fn new() -> Self {
-            Self { text: Mutex::new(String::new()) }
+            Self {
+                text: Mutex::new(String::new()),
+            }
         }
     }
 
@@ -965,7 +1075,12 @@ mod tests {
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
         assert_eq!(env.actions.len(), 1);
         match &env.actions[0] {
-            MixAction::SetEqBand { band, frequency_hz, gain_db, .. } => {
+            MixAction::SetEqBand {
+                band,
+                frequency_hz,
+                gain_db,
+                ..
+            } => {
                 assert_eq!(*band, 1);
                 assert_eq!(*frequency_hz, 400.0);
                 assert_eq!(*gain_db, -2.0);
@@ -979,7 +1094,9 @@ mod tests {
         let raw = r#"{"actions":[{"tool":"set_eq_band","trackId":"track-a","band":2,"gainDb":-2,"q":1.0}],"rationale":"cut"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
         match &env.actions[0] {
-            MixAction::SetEqBand { band, frequency_hz, .. } => {
+            MixAction::SetEqBand {
+                band, frequency_hz, ..
+            } => {
                 assert_eq!(*band, 2);
                 assert_eq!(*frequency_hz, 2500.0);
             }
@@ -992,7 +1109,11 @@ mod tests {
         let raw = r#"{"actions":[{"tool":"set_compressor","trackId":"track-a","thresholdDb":-18","ratio":2,"attackMs":100,"releaseMs":160,"kneeDb":6,"makeupDb":0}],"rationale":"compress"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
         match &env.actions[0] {
-            MixAction::SetCompressor { threshold_db, ratio, .. } => {
+            MixAction::SetCompressor {
+                threshold_db,
+                ratio,
+                ..
+            } => {
                 assert_eq!(*threshold_db, -18.0);
                 assert_eq!(*ratio, 2.0);
             }
@@ -1004,7 +1125,9 @@ mod tests {
     fn repairs_smart_json_quotes() {
         let raw = "{\"actions\":[{\"tool\":\"set_track_gain\",\"trackId\":\"track-a\",\"gainDb\":0.5}],\"rationale\":\"small move.”}";
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
-        assert!(matches!(&env.actions[0], MixAction::SetTrackGain { gain_db, .. } if *gain_db == 0.5));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetTrackGain { gain_db, .. } if *gain_db == 0.5)
+        );
     }
 
     #[test]
@@ -1012,15 +1135,21 @@ mod tests {
         let raw = r#"{"actions":[{"tool":"balance.set_track_gain","id":"track-a","gainDb":-7.0},{"tool":"balance.set_pan","id":"track-a","pan":0.4}],"rationale":"balance"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
         assert_eq!(env.actions.len(), 2);
-        assert!(matches!(&env.actions[0], MixAction::SetTrackGain { track_id, gain_db } if track_id == "track-a" && *gain_db == -7.0));
-        assert!(matches!(&env.actions[1], MixAction::SetTrackPan { track_id, pan } if track_id == "track-a" && *pan == 0.4));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetTrackGain { track_id, gain_db } if track_id == "track-a" && *gain_db == -7.0)
+        );
+        assert!(
+            matches!(&env.actions[1], MixAction::SetTrackPan { track_id, pan } if track_id == "track-a" && *pan == 0.4)
+        );
     }
 
     #[test]
     fn normalizes_balance_tool_and_numeric_strings() {
         let raw = r#"{"actions":[{"tool":"balance","trackId":"track-a","gainDb":"-11.7"},{"tool":"balance","trackId":"track-a","pan":"0.5"}],"rationale":"balance"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
-        assert!(matches!(&env.actions[0], MixAction::SetTrackGain { gain_db, .. } if *gain_db == -11.7));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetTrackGain { gain_db, .. } if *gain_db == -11.7)
+        );
         assert!(matches!(&env.actions[1], MixAction::SetTrackPan { pan, .. } if *pan == 0.5));
     }
 
@@ -1028,44 +1157,59 @@ mod tests {
     fn normalizes_skill_tool_function_and_band_id() {
         let raw = r#"{"actions":[{"tool":"tonal_eq","function":"set_eq_band","trackId":"track-a","bandId":1,"gainDb":-3,"q":1}],"rationale":"cut"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
-        assert!(matches!(&env.actions[0], MixAction::SetEqBand { band, frequency_hz, gain_db, .. } if *band == 1 && *frequency_hz == 400.0 && *gain_db == -3.0));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetEqBand { band, frequency_hz, gain_db, .. } if *band == 1 && *frequency_hz == 400.0 && *gain_db == -3.0)
+        );
     }
 
     #[test]
     fn flattens_nested_params() {
         let raw = r#"{"actions":[{"tool":"set_compressor","trackId":"track-a","params":{"enabled":true,"thresholdDb":-18.0,"ratio":2.0,"attackMs":200.0,"releaseMs":400.0,"kneeDb":6.0,"makeupDb":0.0}}],"rationale":"compress"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
-        assert!(matches!(&env.actions[0], MixAction::SetCompressor { threshold_db, attack_ms, release_ms, .. } if *threshold_db == -18.0 && *attack_ms == 200.0 && *release_ms == 400.0));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetCompressor { threshold_db, attack_ms, release_ms, .. } if *threshold_db == -18.0 && *attack_ms == 200.0 && *release_ms == 400.0)
+        );
     }
 
     #[test]
     fn normalizes_send_level_aliases() {
         let raw = r#"{"actions":[{"tool":"set_reverb_send","trackId":"track-a","reverbDb":-20},{"tool":"set_delay_send","trackId":"track-a","delayDb":-22}],"rationale":"space"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
-        assert!(matches!(&env.actions[0], MixAction::SetReverbSend { level_db, .. } if *level_db == -20.0));
-        assert!(matches!(&env.actions[1], MixAction::SetDelaySend { level_db, .. } if *level_db == -22.0));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetReverbSend { level_db, .. } if *level_db == -20.0)
+        );
+        assert!(
+            matches!(&env.actions[1], MixAction::SetDelaySend { level_db, .. } if *level_db == -22.0)
+        );
     }
 
     #[test]
     fn extracts_first_balanced_object_with_extra_closing_brace() {
-        let raw = r#"{"actions":[{"tool":"set_reverb_send","trackId":"track-a","levelDb":-22.0}]}}"#;
+        let raw =
+            r#"{"actions":[{"tool":"set_reverb_send","trackId":"track-a","levelDb":-22.0}]}}"#;
         let extracted = extract_json_object(raw).expect("balanced object extracted");
         let env = parse_stage_envelope(&test_session(), &extracted).expect("stage envelope parses");
-        assert!(matches!(&env.actions[0], MixAction::SetReverbSend { level_db, .. } if *level_db == -22.0));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetReverbSend { level_db, .. } if *level_db == -22.0)
+        );
     }
 
     #[test]
     fn normalizes_numeric_array_to_first_value() {
         let raw = r#"{"actions":[{"tool":"set_high_pass","trackId":"track-a","frequencyHz":80,"slopeDbOct":[12,24]}],"rationale":"filter"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
-        assert!(matches!(&env.actions[0], MixAction::SetHighPass { slope_db_oct, .. } if *slope_db_oct == 12));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetHighPass { slope_db_oct, .. } if *slope_db_oct == 12)
+        );
     }
 
     #[test]
     fn normalizes_camel_case_tool_names() {
         let raw = r#"{"actions":[{"tool":"setTrackGain","trackId":"track-a","gainDb":-7.0}],"rationale":"gain"}"#;
         let env = parse_stage_envelope(&test_session(), raw).expect("stage envelope parses");
-        assert!(matches!(&env.actions[0], MixAction::SetTrackGain { gain_db, .. } if *gain_db == -7.0));
+        assert!(
+            matches!(&env.actions[0], MixAction::SetTrackGain { gain_db, .. } if *gain_db == -7.0)
+        );
     }
 
     #[test]
@@ -1095,19 +1239,28 @@ mod tests {
             peak_preview: Vec::new(),
         });
         let mut actions = vec![
-            MixAction::SetTrackGain { track_id: "track-a".into(), gain_db: -7.0 },
-            MixAction::AdjustTrackGain { track_id: "track-a".into(), delta_db: 6.0 },
+            MixAction::SetTrackGain {
+                track_id: "track-a".into(),
+                gain_db: -7.0,
+            },
+            MixAction::AdjustTrackGain {
+                track_id: "track-a".into(),
+                delta_db: 6.0,
+            },
         ];
         let warnings = limit_ai_stem_moves(&session, &mut actions);
         assert_eq!(warnings.len(), 2);
         assert!(matches!(&actions[0], MixAction::SetTrackGain { gain_db, .. } if *gain_db == -2.0));
-        assert!(matches!(&actions[1], MixAction::AdjustTrackGain { delta_db, .. } if *delta_db == 2.0));
+        assert!(
+            matches!(&actions[1], MixAction::AdjustTrackGain { delta_db, .. } if *delta_db == 2.0)
+        );
     }
 
     #[tokio::test]
     #[ignore = "requires a local model server and intentionally calls the selected LLM"]
     async fn ollama_gpt_oss_20b_all_auto_mix_stages_smoke() {
-        let base_url = std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into());
+        let base_url =
+            std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into());
         let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gpt-oss:20b".into());
         let session = rich_test_session();
         let track_aliases: Vec<(String, String)> = session
@@ -1128,11 +1281,20 @@ mod tests {
             AutoMixStage::SectionAutomation,
             AutoMixStage::MixBusLoudness,
         ] {
-            let prompt = substitute_quoted(&build_stage_prompt(&session, stage), &track_aliases, true);
+            let prompt =
+                substitute_quoted(&build_stage_prompt(&session, stage), &track_aliases, true);
             let observer = TestObserver::new();
-            let call = llm_generate(&base_url, &model, &prompt, 600_000, stage.id(), &observer, Some(4000))
-                .await
-                .unwrap_or_else(|| panic!("{}: model server did not respond", stage.id()));
+            let call = llm_generate(
+                &base_url,
+                &model,
+                &prompt,
+                600_000,
+                stage.id(),
+                &observer,
+                Some(4000),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{}: model server did not respond", stage.id()));
             let raw_real = substitute_quoted(&call.response, &track_aliases, false);
             let extracted = extract_json_object(&raw_real).unwrap_or(raw_real);
             let env = parse_stage_envelope(&session, &extracted)
@@ -1142,8 +1304,12 @@ mod tests {
                 actions.truncate(stage.max_actions());
             }
             let warnings = clamp_actions(&mut actions);
-            validate_actions(&session, &actions)
-                .unwrap_or_else(|err| panic!("{}: validation failed: {err}\nwarnings: {warnings:?}\nactions: {actions:?}", stage.id()));
+            validate_actions(&session, &actions).unwrap_or_else(|err| {
+                panic!(
+                    "{}: validation failed: {err}\nwarnings: {warnings:?}\nactions: {actions:?}",
+                    stage.id()
+                )
+            });
             eprintln!(
                 "[auto-mix smoke] {} ok: {} actions, {} tokens",
                 stage.id(),

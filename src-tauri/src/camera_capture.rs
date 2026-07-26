@@ -106,8 +106,12 @@ fn record_pending() -> &'static Mutex<std::collections::HashSet<String>> {
 
 /// Kill helper/ffmpeg processes orphaned by a previous hard-killed app instance.
 pub fn cleanup_orphans() {
-    let _ = Command::new("pkill").args(["-f", "camera-helper --device"]).status();
-    let _ = Command::new("pkill").args(["-f", "avfoundation.*capture-audio-"]).status();
+    let _ = Command::new("pkill")
+        .args(["-f", "camera-helper --device"])
+        .status();
+    let _ = Command::new("pkill")
+        .args(["-f", "avfoundation.*capture-audio-"])
+        .status();
 }
 
 /// Background GC: previews nobody is watching (no HTTP subscribers) get reaped so
@@ -116,7 +120,9 @@ pub fn cleanup_orphans() {
 pub fn spawn_preview_gc() {
     std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_secs(15));
-        let Ok(mut guard) = procs().lock() else { continue };
+        let Ok(mut guard) = procs().lock() else {
+            continue;
+        };
         let idle: Vec<String> = guard
             .iter()
             .filter(|(_, p)| p.record.is_none() && p.tx.receiver_count() == 0)
@@ -144,11 +150,16 @@ pub fn spawn_preview_gc() {
 // ---------------------------------------------------------------------------
 
 fn helper_source() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/helpers/camera-helper.swift"))
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/helpers/camera-helper.swift"
+    ))
 }
 
 fn helper_bin() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".automixer/bin/camera-helper")
 }
 
@@ -177,7 +188,11 @@ pub fn ensure_helper() -> Result<PathBuf, String> {
         if !out.status.success() {
             return Err(format!(
                 "camera helper failed to compile: {}",
-                String::from_utf8_lossy(&out.stderr).lines().take(4).collect::<Vec<_>>().join(" | ")
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             ));
         }
         eprintln!("[camera] capture helper compiled");
@@ -192,7 +207,15 @@ pub fn ensure_helper() -> Result<PathBuf, String> {
 /// Parse `ffmpeg -f avfoundation -list_devices` output into (video, audio) name lists.
 fn list_avfoundation_devices() -> Result<(Vec<String>, Vec<String>), String> {
     let output = Command::new("ffmpeg")
-        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
+        .args([
+            "-hide_banner",
+            "-f",
+            "avfoundation",
+            "-list_devices",
+            "true",
+            "-i",
+            "",
+        ])
         .output()
         .map_err(|e| format!("Could not run ffmpeg: {e}"))?;
     let text = String::from_utf8_lossy(&output.stderr);
@@ -234,10 +257,12 @@ fn find_device_index(devices: &[String], label: &str) -> Option<usize> {
     devices
         .iter()
         .position(|d| d.trim().to_lowercase() == l)
-        .or_else(|| devices.iter().position(|d| {
-            let dl = d.trim().to_lowercase();
-            dl.contains(&l) || l.contains(&dl)
-        }))
+        .or_else(|| {
+            devices.iter().position(|d| {
+                let dl = d.trim().to_lowercase();
+                dl.contains(&l) || l.contains(&dl)
+            })
+        })
 }
 
 /// The audio device that belongs to this camera (e.g. "Gustavo's iPhone Camera" →
@@ -267,7 +292,11 @@ fn find_camera_audio_name(audio_devices: &[String], camera_label: &str) -> Optio
 
 /// Spawn a camera-helper for `device_label`. Preview always streams; when
 /// `record` is set the same process also writes the take.
-fn spawn_helper(device_label: &str, record: Option<&Path>, max_width: u32) -> Result<CameraProc, String> {
+fn spawn_helper(
+    device_label: &str,
+    record: Option<&Path>,
+    max_width: u32,
+) -> Result<CameraProc, String> {
     let bin = ensure_helper()?;
     let mut cmd = Command::new(bin);
     cmd.arg("--device").arg(device_label).arg("--preview");
@@ -277,8 +306,12 @@ fn spawn_helper(device_label: &str, record: Option<&Path>, max_width: u32) -> Re
     if max_width > 0 {
         cmd.arg("--max-width").arg(max_width.to_string());
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| format!("could not start camera helper: {e}"))?;
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start camera helper: {e}"))?;
 
     let (tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
     if let Some(stdout) = child.stdout.take() {
@@ -366,11 +399,17 @@ fn stop_proc(mut proc: CameraProc) -> CameraProc {
 
 /// Ensure a helper runs for this camera and subscribe to its MJPEG stream.
 /// Works during recording too — the recording helper streams preview as well.
-pub fn subscribe_preview(device_label: &str) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>, String> {
+pub fn subscribe_preview(
+    device_label: &str,
+) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>, String> {
     // A recorder is being started on this camera right now: do NOT spawn a
     // preview (it would steal the device mid-handoff). The tile keeps retrying
     // and connects to the recorder's own preview stream once it's registered.
-    if record_pending().lock().map(|p| p.contains(device_label)).unwrap_or(false) {
+    if record_pending()
+        .lock()
+        .map(|p| p.contains(device_label))
+        .unwrap_or(false)
+    {
         return Err("starting".into());
     }
     let mut guard = procs().lock().map_err(|e| e.to_string())?;
@@ -394,10 +433,15 @@ pub fn subscribe_preview(device_label: &str) -> Result<tokio::sync::broadcast::R
 
 /// Kill previews (empty list = all). Recording processes are left alone.
 pub fn stop_previews(device_labels: &[String]) {
-    let Ok(mut guard) = procs().lock() else { return };
+    let Ok(mut guard) = procs().lock() else {
+        return;
+    };
     let keys: Vec<String> = guard
         .iter()
-        .filter(|(k, p)| p.record.is_none() && (device_labels.is_empty() || device_labels.iter().any(|l| &l == k)))
+        .filter(|(k, p)| {
+            p.record.is_none()
+                && (device_labels.is_empty() || device_labels.iter().any(|l| &l == k))
+        })
         .map(|(k, _)| k.clone())
         .collect();
     for key in keys {
@@ -577,7 +621,9 @@ pub fn start_captures(videos_dir: PathBuf, specs: Vec<CaptureSpec>) -> Result<()
                     audio_started.push(a);
                 }
             }
-            Ok(Err(message)) => fail = Some(fail.map_or(message.clone(), |f: String| format!("{f} {message}"))),
+            Ok(Err(message)) => {
+                fail = Some(fail.map_or(message.clone(), |f: String| format!("{f} {message}")))
+            }
             Err(_) => fail = Some("camera worker thread panicked".into()),
         }
     }
@@ -619,14 +665,19 @@ fn spawn_audio_capture(audio_name: &str, wav: &Path) -> Result<AudioJob, String>
         .args(["-c:a", "pcm_s16le"])
         .arg("-y")
         .arg(wav);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let media_ms = Arc::new(AtomicU64::new(0));
     if let Some(stdout) = child.stdout.take() {
         let media = media_ms.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(v) = line.strip_prefix("out_time_us=").or_else(|| line.strip_prefix("out_time_ms=")) {
+                if let Some(v) = line
+                    .strip_prefix("out_time_us=")
+                    .or_else(|| line.strip_prefix("out_time_ms="))
+                {
                     if let Ok(us) = v.trim().parse::<i64>() {
                         media.store(us.max(0) as u64 / 1000, Ordering::Relaxed);
                     }
@@ -634,7 +685,12 @@ fn spawn_audio_capture(audio_name: &str, wav: &Path) -> Result<AudioJob, String>
             }
         });
     }
-    Ok(AudioJob { child, media_ms, offset_ms: 0, wav: wav.to_path_buf() })
+    Ok(AudioJob {
+        child,
+        media_ms,
+        offset_ms: 0,
+        wav: wav.to_path_buf(),
+    })
 }
 
 /// Snapshot every capture's media clock the instant the transport starts —
@@ -660,7 +716,11 @@ pub fn mark_transport_start() {
 pub fn stop_captures_discard() -> Result<(), String> {
     let recording_keys: Vec<String> = {
         let guard = procs().lock().map_err(|e| e.to_string())?;
-        guard.iter().filter(|(_, p)| p.record.is_some()).map(|(k, _)| k.clone()).collect()
+        guard
+            .iter()
+            .filter(|(_, p)| p.record.is_some())
+            .map(|(k, _)| k.clone())
+            .collect()
     };
     for key in recording_keys {
         let proc = procs().lock().ok().and_then(|mut g| g.remove(&key));
@@ -684,11 +744,21 @@ pub fn stop_captures_discard() -> Result<(), String> {
 
 fn probe_duration_ms(path: &PathBuf) -> Option<u64> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(path)
         .output()
         .ok()?;
-    let secs: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    let secs: f64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
     Some((secs * 1000.0).round().max(1.0) as u64)
 }
 
@@ -698,7 +768,11 @@ fn probe_duration_ms(path: &PathBuf) -> Option<u64> {
 pub fn stop_captures(track_ids: &[String]) -> Result<Vec<FinishedCapture>, String> {
     let recording_keys: Vec<String> = {
         let guard = procs().lock().map_err(|e| e.to_string())?;
-        guard.iter().filter(|(_, p)| p.record.is_some()).map(|(k, _)| k.clone()).collect()
+        guard
+            .iter()
+            .filter(|(_, p)| p.record.is_some())
+            .map(|(k, _)| k.clone())
+            .collect()
     };
     let mut audio_map: HashMap<String, AudioJob> = {
         let mut aguard = audio_jobs().lock().map_err(|e| e.to_string())?;
@@ -706,11 +780,18 @@ pub fn stop_captures(track_ids: &[String]) -> Result<Vec<FinishedCapture>, Strin
     };
     let mut finished = Vec::new();
     for key in recording_keys {
-        let Some(proc) = procs().lock().ok().and_then(|mut g| g.remove(&key)) else { continue };
+        let Some(proc) = procs().lock().ok().and_then(|mut g| g.remove(&key)) else {
+            continue;
+        };
         let device_label = proc.device_label.clone();
-        let record = proc.record.as_ref().map(|r| (r.track_id.clone(), r.path.clone(), r.offset_ms));
+        let record = proc
+            .record
+            .as_ref()
+            .map(|r| (r.track_id.clone(), r.path.clone(), r.offset_ms));
         stop_proc(proc);
-        let Some((track_id, path, offset_ms)) = record else { continue };
+        let Some((track_id, path, offset_ms)) = record else {
+            continue;
+        };
         // Stop this track's audio capture (if any) regardless of keep/discard.
         let audio = audio_map.remove(&track_id).map(|mut job| {
             let pid = job.child.id().to_string();

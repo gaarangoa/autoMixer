@@ -1,7 +1,9 @@
 //! High-quality resampling via rubato. Used at import to normalize all
 //! source files to the session sample rate; playback never resamples.
 
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 pub fn resample_interleaved(
     samples: &[f32],
@@ -31,7 +33,9 @@ pub fn resample_interleaved(
         SincFixedIn::<f32>::new(ratio, 1.0, params, CHUNK, channels).map_err(|e| e.to_string())?;
 
     // De-interleave into channel-planar buffers.
-    let mut planar: Vec<Vec<f32>> = (0..channels).map(|_| Vec::with_capacity(frames_in)).collect();
+    let mut planar: Vec<Vec<f32>> = (0..channels)
+        .map(|_| Vec::with_capacity(frames_in))
+        .collect();
     for frame in 0..frames_in {
         for (c, plane) in planar.iter_mut().enumerate() {
             plane.push(samples[frame * channels + c]);

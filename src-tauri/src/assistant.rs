@@ -6,7 +6,9 @@ use crate::{
     actions::{apply_actions, clamp_actions, redo, undo, validate_actions},
     capabilities::skill_catalog,
     config::Config,
-    model::{AssistantRequest, AssistantResponse, HistorySource, MixAction, MixProject, MixSession},
+    model::{
+        AssistantRequest, AssistantResponse, HistorySource, MixAction, MixProject, MixSession,
+    },
 };
 
 const SKILL_TIMEOUT_MS: u64 = 600_000;
@@ -65,8 +67,9 @@ impl LlmProvider {
 /// Successful probes cached per base URL so the detection round-trip is paid once
 /// per server per app run. Failures are not cached — a server that comes up later
 /// is found on the next call.
-static PROVIDER_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, LlmProvider>>> =
-    std::sync::OnceLock::new();
+static PROVIDER_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, LlmProvider>>,
+> = std::sync::OnceLock::new();
 
 fn provider_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, LlmProvider>> {
     PROVIDER_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -80,11 +83,20 @@ pub async fn detect_provider(base_url: &str) -> Result<LlmProvider, String> {
     if key.is_empty() {
         return Err("No model server URL configured.".into());
     }
-    if let Some(provider) = provider_cache().lock().ok().and_then(|cache| cache.get(&key).copied()) {
+    if let Some(provider) = provider_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).copied())
+    {
         return Ok(provider);
     }
     let client = reqwest::Client::new();
-    if let Ok(Ok(response)) = timeout(Duration::from_millis(2500), client.get(format!("{key}/v1/models")).send()).await {
+    if let Ok(Ok(response)) = timeout(
+        Duration::from_millis(2500),
+        client.get(format!("{key}/v1/models")).send(),
+    )
+    .await
+    {
         if response.status().is_success() {
             if let Ok(mut cache) = provider_cache().lock() {
                 cache.insert(key, LlmProvider::OpenAiCompat);
@@ -92,7 +104,12 @@ pub async fn detect_provider(base_url: &str) -> Result<LlmProvider, String> {
             return Ok(LlmProvider::OpenAiCompat);
         }
     }
-    if let Ok(Ok(response)) = timeout(Duration::from_millis(2500), client.get(format!("{key}/api/tags")).send()).await {
+    if let Ok(Ok(response)) = timeout(
+        Duration::from_millis(2500),
+        client.get(format!("{key}/api/tags")).send(),
+    )
+    .await
+    {
         if response.status().is_success() {
             if let Ok(mut cache) = provider_cache().lock() {
                 cache.insert(key, LlmProvider::Ollama);
@@ -127,7 +144,15 @@ pub async fn handle_assistant(
         ));
     }
 
-    let selected_skills = match model_select_skills(&base_url, &model, &request, &project.session, observer.as_ref()).await {
+    let selected_skills = match model_select_skills(
+        &base_url,
+        &model,
+        &request,
+        &project.session,
+        observer.as_ref(),
+    )
+    .await
+    {
         Some(s) if !s.is_empty() => s,
         _ => {
             return Ok((
@@ -200,12 +225,30 @@ pub async fn handle_assistant(
     }
 
     if selected_skills.iter().any(|s| s == "critique") {
-        return match try_model_critique(&base_url, &model, &request, &project.session, &selected_skills, observer.as_ref()).await {
-            Ok(critique) => Ok((AssistantResponse::Critique { critique, selected_skills }, project)),
+        return match try_model_critique(
+            &base_url,
+            &model,
+            &request,
+            &project.session,
+            &selected_skills,
+            observer.as_ref(),
+        )
+        .await
+        {
+            Ok(critique) => Ok((
+                AssistantResponse::Critique {
+                    critique,
+                    selected_skills,
+                },
+                project,
+            )),
             Err(detail) => Ok((
                 AssistantResponse::Err {
                     kind: "ModelInvalidJson".into(),
-                    message: format!("Model {model} did not produce a valid critique: {}", detail.message),
+                    message: format!(
+                        "Model {model} did not produce a valid critique: {}",
+                        detail.message
+                    ),
                     raw_model_output: detail.raw,
                 },
                 project,
@@ -213,11 +256,20 @@ pub async fn handle_assistant(
         };
     }
 
-    let attempt =
-        try_model_actions(&base_url, &model, &request, &project.session, &selected_skills, observer.as_ref()).await;
+    let attempt = try_model_actions(
+        &base_url,
+        &model,
+        &request,
+        &project.session,
+        &selected_skills,
+        observer.as_ref(),
+    )
+    .await;
 
     let (actions, rationale, per_action_notes) = match attempt.turn {
-        Some(turn) if !turn.actions.is_empty() => (turn.actions, turn.rationale, turn.per_action_notes),
+        Some(turn) if !turn.actions.is_empty() => {
+            (turn.actions, turn.rationale, turn.per_action_notes)
+        }
         Some(_) => {
             return Ok((
                 AssistantResponse::Err {
@@ -231,11 +283,15 @@ pub async fn handle_assistant(
             ));
         }
         None => {
-            let detail = attempt.parse_error.unwrap_or_else(|| "Unknown error".into());
+            let detail = attempt
+                .parse_error
+                .unwrap_or_else(|| "Unknown error".into());
             return Ok((
                 AssistantResponse::Err {
                     kind: "ModelInvalidJson".into(),
-                    message: format!("Model {model} did not produce a valid action envelope: {detail}"),
+                    message: format!(
+                        "Model {model} did not produce a valid action envelope: {detail}"
+                    ),
                     raw_model_output: attempt.raw,
                 },
                 project,
@@ -257,7 +313,11 @@ pub async fn handle_assistant(
     let warnings = clamp_actions(&mut actions);
     if let Err(message) = validate_actions(&project.session, &actions) {
         return Ok((
-            AssistantResponse::Err { kind: "InvalidActions".into(), message, raw_model_output: None },
+            AssistantResponse::Err {
+                kind: "InvalidActions".into(),
+                message,
+                raw_model_output: None,
+            },
             project,
         ));
     }
@@ -373,7 +433,10 @@ pub struct AccumulatingObserver {
 
 impl AccumulatingObserver {
     pub fn new(inner: std::sync::Arc<dyn LlmObserver>) -> Self {
-        Self { inner, totals: std::sync::Mutex::new(LlmCallStats::default()) }
+        Self {
+            inner,
+            totals: std::sync::Mutex::new(LlmCallStats::default()),
+        }
     }
     pub fn snapshot(&self) -> LlmCallStats {
         self.totals.lock().map(|g| g.clone()).unwrap_or_default()
@@ -478,14 +541,21 @@ pub async fn llm_generate(
     };
     let generated = async {
         match provider {
-            LlmProvider::Ollama => ollama_generate(base_url, model, prompt, phase, observer, max_tokens).await,
-            LlmProvider::OpenAiCompat => openai_generate(base_url, model, prompt, phase, observer, max_tokens).await,
+            LlmProvider::Ollama => {
+                ollama_generate(base_url, model, prompt, phase, observer, max_tokens).await
+            }
+            LlmProvider::OpenAiCompat => {
+                openai_generate(base_url, model, prompt, phase, observer, max_tokens).await
+            }
         }
     };
     match timeout(Duration::from_millis(timeout_ms), generated).await {
         Ok(call) => call,
         Err(_) => {
-            eprintln!("[llm] phase '{phase}' timed out after {:.1}s", timeout_ms as f64 / 1000.0);
+            eprintln!(
+                "[llm] phase '{phase}' timed out after {:.1}s",
+                timeout_ms as f64 / 1000.0
+            );
             None
         }
     }
@@ -511,8 +581,8 @@ async fn ollama_generate(
             options: max_tokens.map(|n| json!({ "num_predict": n })),
         })
         .send()
-    .await
-    .ok()?;
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -561,7 +631,10 @@ async fn ollama_generate(
     }
     stats.elapsed_ms = started.elapsed().as_millis() as u32;
     observer.stats(phase, &stats);
-    Some(LlmCall { response: accumulated, stats })
+    Some(LlmCall {
+        response: accumulated,
+        stats,
+    })
 }
 
 #[derive(Deserialize)]
@@ -622,10 +695,13 @@ async fn openai_generate(
         .post(format!("{base_url}/v1/chat/completions"))
         .json(&body)
         .send()
-    .await
-    .ok()?;
+        .await
+        .ok()?;
     if !resp.status().is_success() {
-        eprintln!("[llm] OpenAI-compatible server returned {} for model {model}", resp.status());
+        eprintln!(
+            "[llm] OpenAI-compatible server returned {} for model {model}",
+            resp.status()
+        );
         return None;
     }
     let mut stream = resp.bytes_stream();
@@ -650,13 +726,17 @@ async fn openai_generate(
             return None;
         }
         let bytes = chunk.ok()?;
-        let Ok(s) = std::str::from_utf8(&bytes) else { continue };
+        let Ok(s) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
         buffer.push_str(s);
         while let Some(newline) = buffer.find('\n') {
             let line = buffer[..newline].to_string();
             buffer.drain(..=newline);
             let trimmed = line.trim();
-            let Some(data) = trimmed.strip_prefix("data:").map(str::trim) else { continue };
+            let Some(data) = trimmed.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
             // Stop as soon as the server signals completion. Previously this was
             // `continue`, so if the server kept the socket open after `[DONE]` the loop
             // awaited a chunk that never came and the whole stage wedged.
@@ -691,7 +771,10 @@ async fn openai_generate(
     }
     stats.elapsed_ms = started.elapsed().as_millis() as u32;
     observer.stats(phase, &stats);
-    Some(LlmCall { response: accumulated, stats })
+    Some(LlmCall {
+        response: accumulated,
+        stats,
+    })
 }
 
 async fn model_select_skills(
@@ -726,7 +809,16 @@ async fn model_select_skills(
         request.selected_region_ids,
         request.user_text
     );
-    let call = llm_generate(base_url, model, &prompt, SKILL_TIMEOUT_MS, "skill", observer, None).await?;
+    let call = llm_generate(
+        base_url,
+        model,
+        &prompt,
+        SKILL_TIMEOUT_MS,
+        "skill",
+        observer,
+        None,
+    )
+    .await?;
     eprintln!("[assistant] skill raw response:\n{}", call.response);
     let extracted = extract_json_object(&call.response)?;
     #[derive(Deserialize)]
@@ -735,12 +827,14 @@ async fn model_select_skills(
         ids: Vec<String>,
     }
     let _ = call.stats; // observer already received the stats
-    serde_json::from_str::<SkillEnvelope>(&extracted).ok().map(|e| {
-        let mut v = e.ids;
-        v.sort();
-        v.dedup();
-        v
-    })
+    serde_json::from_str::<SkillEnvelope>(&extracted)
+        .ok()
+        .map(|e| {
+            let mut v = e.ids;
+            v.sort();
+            v.dedup();
+            v
+        })
 }
 
 pub struct ModelTurn {
@@ -926,8 +1020,22 @@ async fn try_model_actions(
         sections_block(&session.sections, session.bpm)
     );
 
-    let Some(call) = llm_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS, "action", observer, None).await else {
-        return ModelAttempt { turn: None, raw: None, parse_error: Some("Model server did not respond within the timeout.".into()) };
+    let Some(call) = llm_generate(
+        base_url,
+        model,
+        &prompt,
+        ACTION_TIMEOUT_MS,
+        "action",
+        observer,
+        None,
+    )
+    .await
+    else {
+        return ModelAttempt {
+            turn: None,
+            raw: None,
+            parse_error: Some("Model server did not respond within the timeout.".into()),
+        };
     };
     let raw_aliased = call.response;
     eprintln!("[assistant] action raw response:\n{raw_aliased}");
@@ -966,18 +1074,31 @@ async fn try_model_actions(
          Do not include any other text. Original output to repair:\n{}",
         raw_aliased
     );
-    let Some(repair_call) = llm_generate(base_url, model, &repair_prompt, REPAIR_TIMEOUT_MS, "repair", observer, None).await else {
+    let Some(repair_call) = llm_generate(
+        base_url,
+        model,
+        &repair_prompt,
+        REPAIR_TIMEOUT_MS,
+        "repair",
+        observer,
+        None,
+    )
+    .await
+    else {
         return ModelAttempt {
             turn: None,
             raw: Some(raw_real),
-            parse_error: Some(format!("First parse failed ({first_error}); repair pass timed out.")),
+            parse_error: Some(format!(
+                "First parse failed ({first_error}); repair pass timed out."
+            )),
         };
     };
     let repaired_aliased = repair_call.response;
     eprintln!("[assistant] repair raw response:\n{repaired_aliased}");
     let repaired_real = substitute_quoted(&repaired_aliased, &track_aliases, false);
     let repaired_real = substitute_quoted(&repaired_real, &region_aliases, false);
-    let repaired_extracted = extract_json_object(&repaired_real).unwrap_or_else(|| repaired_real.clone());
+    let repaired_extracted =
+        extract_json_object(&repaired_real).unwrap_or_else(|| repaired_real.clone());
     match serde_json::from_str::<ActionEnvelope>(&repaired_extracted) {
         Ok(env) => ModelAttempt {
             turn: Some(ModelTurn {
@@ -991,7 +1112,9 @@ async fn try_model_actions(
         Err(error) => ModelAttempt {
             turn: None,
             raw: Some(repaired_real),
-            parse_error: Some(format!("First parse failed ({first_error}); repair parse failed ({error}).")),
+            parse_error: Some(format!(
+                "First parse failed ({first_error}); repair parse failed ({error})."
+            )),
         },
     }
 }
@@ -1023,8 +1146,11 @@ async fn try_model_critique(
         .collect();
 
     // Render the session offline and analyze the master bus output.
-    let rendered = crate::engine::render::render_session_to_buffer(session)
-        .map_err(|e| CritiqueError { message: format!("offline render failed: {e}"), raw: None })?;
+    let rendered =
+        crate::engine::render::render_session_to_buffer(session).map_err(|e| CritiqueError {
+            message: format!("offline render failed: {e}"),
+            raw: None,
+        })?;
     let master = crate::engine::source::analysis::analyze(
         &rendered.samples,
         rendered.channels,
@@ -1037,7 +1163,12 @@ async fn try_model_critique(
     // the same vocabulary it already knows.
     let snapshot = build_capability_snapshot(
         session,
-        &["balance".into(), "tonal_eq".into(), "dynamics".into(), "space_depth".into()],
+        &[
+            "balance".into(),
+            "tonal_eq".into(),
+            "dynamics".into(),
+            "space_depth".into(),
+        ],
     );
     let master_block = json!({
         "peakDb": round1(master.peak_db),
@@ -1116,9 +1247,20 @@ async fn try_model_critique(
 
     let prompt = substitute_quoted(&prompt, &track_aliases, true);
     let _ = selected_skills; // currently unused but kept for future skill-scoped critique
-    let crit_call = llm_generate(base_url, model, &prompt, ACTION_TIMEOUT_MS, "critique", observer, None)
-        .await
-        .ok_or_else(|| CritiqueError { message: "Model server did not respond within the timeout.".into(), raw: None })?;
+    let crit_call = llm_generate(
+        base_url,
+        model,
+        &prompt,
+        ACTION_TIMEOUT_MS,
+        "critique",
+        observer,
+        None,
+    )
+    .await
+    .ok_or_else(|| CritiqueError {
+        message: "Model server did not respond within the timeout.".into(),
+        raw: None,
+    })?;
     let raw_aliased = crit_call.response;
     eprintln!("[assistant] critique raw response:\n{raw_aliased}");
 
@@ -1143,8 +1285,18 @@ fn normalize_critique_value(value: &mut Value) {
 
     if let Some(results) = obj.get("mixResults").and_then(Value::as_object).cloned() {
         copy_missing(obj, "headroomDb", &results, &["headroomDb"]);
-        copy_missing(obj, "integratedLufsEstimate", &results, &["integratedLufsEstimate", "lufs", "integratedLUFSestimate"]);
-        copy_missing(obj, "truePeakDbEstimate", &results, &["truePeakDbEstimate", "truePeakDb", "peakDb"]);
+        copy_missing(
+            obj,
+            "integratedLufsEstimate",
+            &results,
+            &["integratedLufsEstimate", "lufs", "integratedLUFSestimate"],
+        );
+        copy_missing(
+            obj,
+            "truePeakDbEstimate",
+            &results,
+            &["truePeakDbEstimate", "truePeakDb", "peakDb"],
+        );
     }
     coerce_number(obj, "headroomDb");
     coerce_number(obj, "integratedLufsEstimate");
@@ -1185,7 +1337,10 @@ fn normalize_critique_value(value: &mut Value) {
         collect_step_strings(&raw_steps, &mut steps);
     }
     steps.extend(extra_steps);
-    obj.insert("recommendedNextSteps".into(), Value::Array(steps.into_iter().map(Value::String).collect()));
+    obj.insert(
+        "recommendedNextSteps".into(),
+        Value::Array(steps.into_iter().map(Value::String).collect()),
+    );
 }
 
 fn copy_missing(
@@ -1271,10 +1426,24 @@ fn collect_step_strings(value: &Value, out: &mut Vec<String>) {
 
 fn step_object_to_string(value: &Value) -> Option<String> {
     let obj = value.as_object()?;
-    let action = obj.get("action").and_then(Value::as_str).unwrap_or("Next step").trim();
-    let details = obj.get("details").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-    let delta = obj.get("delta").or_else(|| obj.get("estimatedLUFS")).or_else(|| obj.get("headroom"));
-    let delta = delta.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let action = obj
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("Next step")
+        .trim();
+    let details = obj
+        .get("details")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let delta = obj
+        .get("delta")
+        .or_else(|| obj.get("estimatedLUFS"))
+        .or_else(|| obj.get("headroom"));
+    let delta = delta
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let mut step = details
         .map(|details| format!("{action}: {details}"))
@@ -1320,7 +1489,9 @@ fn build_critique_summary(obj: &serde_json::Map<String, Value>) -> String {
 
     if messages.is_empty() {
         return match score {
-            Some(score) => format!("The model rated the mix {score:.1}/10 and did not provide a separate summary."),
+            Some(score) => format!(
+                "The model rated the mix {score:.1}/10 and did not provide a separate summary."
+            ),
             None => "The model returned a technical critique without a separate summary.".into(),
         };
     }
@@ -1346,7 +1517,12 @@ fn compute_true_peak_db(samples: &[f32]) -> f32 {
         let q1 = a + 0.25 * (b - a);
         let q2 = a + 0.5 * (b - a);
         let q3 = a + 0.75 * (b - a);
-        let m = a.abs().max(b.abs()).max(q1.abs()).max(q2.abs()).max(q3.abs());
+        let m = a
+            .abs()
+            .max(b.abs())
+            .max(q1.abs())
+            .max(q2.abs())
+            .max(q3.abs());
         if m > max {
             max = m;
         }
@@ -1379,7 +1555,9 @@ pub fn profile_block(profile: &crate::model::MixerProfile) -> String {
     let target_lufs = match profile.loudness_target.as_str() {
         "broadcast" => "-23 LUFS integrated",
         "streaming" => "-14 LUFS integrated",
-        "loud" => "-10 LUFS integrated (loudness war level — only when the song's style demands it)",
+        "loud" => {
+            "-10 LUFS integrated (loudness war level — only when the song's style demands it)"
+        }
         _ => "-14 LUFS integrated",
     };
     let aggressiveness_rule = match profile.aggressiveness.as_str() {
@@ -1417,7 +1595,9 @@ pub fn profile_block(profile: &crate::model::MixerProfile) -> String {
         extras.push(format!("Reference engineer: {eng} — channel that style."));
     }
     if let Some(genre) = &profile.genre {
-        extras.push(format!("Genre: {genre}. Decisions should suit the genre's conventions."));
+        extras.push(format!(
+            "Genre: {genre}. Decisions should suit the genre's conventions."
+        ));
     }
     if let Some(notes) = &profile.custom_notes {
         if !notes.trim().is_empty() {
@@ -1436,7 +1616,11 @@ pub fn profile_block(profile: &crate::model::MixerProfile) -> String {
          These rules override any default tendency to be aggressive. When in doubt, do less — \
          a small turn that's verifiably correct is better than a big turn that might be wrong.\n\n",
         profile.preset_id,
-        extras = if extras.is_empty() { String::new() } else { format!("- {}\n", extras.join("\n- ")) },
+        extras = if extras.is_empty() {
+            String::new()
+        } else {
+            format!("- {}\n", extras.join("\n- "))
+        },
     )
 }
 
@@ -1473,7 +1657,11 @@ pub fn ai_stem_preservation_block(session: &crate::model::MixSession) -> String 
     if session.tracks.is_empty() {
         return String::new();
     }
-    let ai_count = session.tracks.iter().filter(|track| track.ai_generated).count();
+    let ai_count = session
+        .tracks
+        .iter()
+        .filter(|track| track.ai_generated)
+        .count();
     let all_ai = ai_count == session.tracks.len();
     let mostly_ai = ai_count * 2 >= session.tracks.len();
     if !mostly_ai {
@@ -1538,26 +1726,47 @@ pub fn sections_block(sections: &[crate::model::MixSection], bpm: Option<f32>) -
 }
 
 fn round0(x: f32) -> f32 {
-    if x.is_finite() { x.round() } else { 0.0 }
+    if x.is_finite() {
+        x.round()
+    } else {
+        0.0
+    }
 }
 fn round1(x: f32) -> f32 {
-    if x.is_finite() { (x * 10.0).round() / 10.0 } else { 0.0 }
+    if x.is_finite() {
+        (x * 10.0).round() / 10.0
+    } else {
+        0.0
+    }
 }
 fn round2(x: f32) -> f32 {
-    if x.is_finite() { (x * 100.0).round() / 100.0 } else { 0.0 }
+    if x.is_finite() {
+        (x * 100.0).round() / 100.0
+    } else {
+        0.0
+    }
 }
 
 /// Compact, skill-scoped snapshot of currently relevant processors / parameters.
 pub fn build_capability_snapshot(session: &MixSession, selected: &[String]) -> serde_json::Value {
     use std::collections::HashMap;
-    let by_source: HashMap<&str, &crate::model::SourceFile> =
-        session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
+    let by_source: HashMap<&str, &crate::model::SourceFile> = session
+        .source_files
+        .iter()
+        .map(|s| (s.id.as_str(), s))
+        .collect();
     let mut tracks_json = Vec::new();
     for t in &session.tracks {
         let mut params = serde_json::Map::new();
         if selected.iter().any(|s| s == "balance") {
-            params.insert("gainDb".into(), json!({"current": t.gain_db, "min": -24.0, "max": 24.0, "unit": "dB"}));
-            params.insert("pan".into(), json!({"current": t.pan, "min": -1.0, "max": 1.0}));
+            params.insert(
+                "gainDb".into(),
+                json!({"current": t.gain_db, "min": -24.0, "max": 24.0, "unit": "dB"}),
+            );
+            params.insert(
+                "pan".into(),
+                json!({"current": t.pan, "min": -1.0, "max": 1.0}),
+            );
             params.insert("muted".into(), json!({"current": t.muted}));
             params.insert("solo".into(), json!({"current": t.solo}));
         }
@@ -1584,21 +1793,27 @@ pub fn build_capability_snapshot(session: &MixSession, selected: &[String]) -> s
         }
         if selected.iter().any(|s| s == "dynamics") {
             let c = &t.chain.compressor;
-            params.insert("compressor".into(), json!({
-                "enabled": c.enabled,
-                "thresholdDb": {"current": c.threshold_db, "min": -60.0, "max": 0.0},
-                "ratio": {"current": c.ratio, "min": 1.0, "max": 20.0},
-                "attackMs": {"current": c.attack_ms, "min": 1.0, "max": 200.0},
-                "releaseMs": {"current": c.release_ms, "min": 20.0, "max": 1000.0},
-                "kneeDb": {"current": c.knee_db, "min": 0.0, "max": 24.0},
-                "makeupDb": {"current": c.makeup_db, "min": -12.0, "max": 12.0},
-            }));
+            params.insert(
+                "compressor".into(),
+                json!({
+                    "enabled": c.enabled,
+                    "thresholdDb": {"current": c.threshold_db, "min": -60.0, "max": 0.0},
+                    "ratio": {"current": c.ratio, "min": 1.0, "max": 20.0},
+                    "attackMs": {"current": c.attack_ms, "min": 1.0, "max": 200.0},
+                    "releaseMs": {"current": c.release_ms, "min": 20.0, "max": 1000.0},
+                    "kneeDb": {"current": c.knee_db, "min": 0.0, "max": 24.0},
+                    "makeupDb": {"current": c.makeup_db, "min": -12.0, "max": 12.0},
+                }),
+            );
         }
         if selected.iter().any(|s| s == "space_depth") {
-            params.insert("sends".into(), json!({
-                "reverbDb": {"current": t.sends.reverb_db, "min": -60.0, "max": 0.0},
-                "delayDb": {"current": t.sends.delay_db, "min": -60.0, "max": 0.0},
-            }));
+            params.insert(
+                "sends".into(),
+                json!({
+                    "reverbDb": {"current": t.sends.reverb_db, "min": -60.0, "max": 0.0},
+                    "delayDb": {"current": t.sends.delay_db, "min": -60.0, "max": 0.0},
+                }),
+            );
         }
         let mut track_obj = serde_json::Map::new();
         track_obj.insert("id".into(), json!(t.id));
@@ -1658,15 +1873,27 @@ pub async fn list_models(base_url: String) -> Result<(LlmProvider, Vec<String>),
             struct TagModel {
                 name: Option<String>,
             }
-            let response = timeout(Duration::from_millis(4500), client.get(format!("{base_url}/api/tags")).send())
-                .await
-                .map_err(|_| format!("Timed out connecting to Ollama at {base_url}"))?
-                .map_err(|_| format!("Could not connect to Ollama at {base_url}"))?;
+            let response = timeout(
+                Duration::from_millis(4500),
+                client.get(format!("{base_url}/api/tags")).send(),
+            )
+            .await
+            .map_err(|_| format!("Timed out connecting to Ollama at {base_url}"))?
+            .map_err(|_| format!("Could not connect to Ollama at {base_url}"))?;
             if !response.status().is_success() {
                 return Err(format!("Ollama returned HTTP {}", response.status()));
             }
-            let tags = response.json::<Tags>().await.map_err(|error| error.to_string())?;
-            Ok((provider, tags.models.into_iter().filter_map(|model| model.name).collect()))
+            let tags = response
+                .json::<Tags>()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((
+                provider,
+                tags.models
+                    .into_iter()
+                    .filter_map(|model| model.name)
+                    .collect(),
+            ))
         }
         LlmProvider::OpenAiCompat => {
             #[derive(Deserialize)]
@@ -1678,15 +1905,27 @@ pub async fn list_models(base_url: String) -> Result<(LlmProvider, Vec<String>),
             struct ModelEntry {
                 id: Option<String>,
             }
-            let response = timeout(Duration::from_millis(4500), client.get(format!("{base_url}/v1/models")).send())
-                .await
-                .map_err(|_| format!("Timed out connecting to the model server at {base_url}"))?
-                .map_err(|_| format!("Could not connect to the model server at {base_url}"))?;
+            let response = timeout(
+                Duration::from_millis(4500),
+                client.get(format!("{base_url}/v1/models")).send(),
+            )
+            .await
+            .map_err(|_| format!("Timed out connecting to the model server at {base_url}"))?
+            .map_err(|_| format!("Could not connect to the model server at {base_url}"))?;
             if !response.status().is_success() {
-                return Err(format!("The model server returned HTTP {}", response.status()));
+                return Err(format!(
+                    "The model server returned HTTP {}",
+                    response.status()
+                ));
             }
-            let list = response.json::<ModelList>().await.map_err(|error| error.to_string())?;
-            Ok((provider, list.data.into_iter().filter_map(|model| model.id).collect()))
+            let list = response
+                .json::<ModelList>()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((
+                provider,
+                list.data.into_iter().filter_map(|model| model.id).collect(),
+            ))
         }
     }
 }
@@ -1697,7 +1936,10 @@ pub fn expand_skills_from_actions(mut selected: Vec<String>, actions: &[MixActio
     for action in actions {
         let tool = action_name(action);
         for skill in &catalog.skills {
-            if skill.summary_actions.iter().any(|a| a == tool) && !selected.contains(&skill.skill_id) && !additions.contains(&skill.skill_id) {
+            if skill.summary_actions.iter().any(|a| a == tool)
+                && !selected.contains(&skill.skill_id)
+                && !additions.contains(&skill.skill_id)
+            {
                 additions.push(skill.skill_id.clone());
             }
         }
@@ -1737,22 +1979,42 @@ fn explain_actions(actions: &[MixAction], session: &MixSession) -> String {
                 .unwrap_or("the mix");
             match action {
                 MixAction::RenameTrack { name, .. } => format!("renamed {name}"),
-                MixAction::SetTrackRole { role, .. } => format!("classified {name} as {}", role.as_deref().unwrap_or("unassigned")),
-                MixAction::AdjustTrackGain { delta_db, .. } => format!("{} {name} by {} dB", if *delta_db > 0.0 { "raised" } else { "lowered" }, delta_db.abs()),
+                MixAction::SetTrackRole { role, .. } => format!(
+                    "classified {name} as {}",
+                    role.as_deref().unwrap_or("unassigned")
+                ),
+                MixAction::AdjustTrackGain { delta_db, .. } => format!(
+                    "{} {name} by {} dB",
+                    if *delta_db > 0.0 { "raised" } else { "lowered" },
+                    delta_db.abs()
+                ),
                 MixAction::SetTrackGain { gain_db, .. } => format!("set {name} to {gain_db} dB"),
                 MixAction::SetTrackPan { .. } => format!("moved {name} in the stereo field"),
-                MixAction::MuteTrack { muted, .. } => format!("{} {name}", if *muted { "muted" } else { "unmuted" }),
-                MixAction::SoloTrack { solo, .. } => format!("{} {name}", if *solo { "soloed" } else { "unsoloed" }),
-                MixAction::SetTrackAiGenerated { ai_generated, .. } => format!("{} {name} as AI-generated", if *ai_generated { "marked" } else { "unmarked" }),
+                MixAction::MuteTrack { muted, .. } => {
+                    format!("{} {name}", if *muted { "muted" } else { "unmuted" })
+                }
+                MixAction::SoloTrack { solo, .. } => {
+                    format!("{} {name}", if *solo { "soloed" } else { "unsoloed" })
+                }
+                MixAction::SetTrackAiGenerated { ai_generated, .. } => format!(
+                    "{} {name} as AI-generated",
+                    if *ai_generated { "marked" } else { "unmarked" }
+                ),
                 MixAction::SetEqBand { .. } => format!("adjusted EQ on {name}"),
                 MixAction::SetHighPass { .. } => format!("cleaned low rumble on {name}"),
                 MixAction::SetLowPass { .. } => format!("softened top end on {name}"),
                 MixAction::SetCompressor { .. } => format!("set compression on {name}"),
                 MixAction::SetReverbSend { .. } => format!("changed reverb depth on {name}"),
                 MixAction::SetDelaySend { .. } => format!("changed delay send on {name}"),
-                MixAction::SetRegionGain { .. } | MixAction::ApplySectionAutomation { .. } => format!("created a section-scoped move for {name}"),
+                MixAction::SetRegionGain { .. } | MixAction::ApplySectionAutomation { .. } => {
+                    format!("created a section-scoped move for {name}")
+                }
                 MixAction::SetMasterGain { gain_db } => format!("set master gain to {gain_db} dB"),
-                MixAction::AdjustMasterGain { delta_db } => format!("{} master by {} dB", if *delta_db > 0.0 { "raised" } else { "lowered" }, delta_db.abs()),
+                MixAction::AdjustMasterGain { delta_db } => format!(
+                    "{} master by {} dB",
+                    if *delta_db > 0.0 { "raised" } else { "lowered" },
+                    delta_db.abs()
+                ),
                 MixAction::DeleteTrack { .. } => format!("deleted {name}"),
                 MixAction::RenderMix => "prepared the current mix for render".into(),
                 _ => format!("updated {name}"),
@@ -1829,7 +2091,8 @@ mod tests {
             ]
         }"#;
 
-        let critique = parse_model_critique(raw).expect("critique should parse after normalization");
+        let critique =
+            parse_model_critique(raw).expect("critique should parse after normalization");
 
         assert_eq!(critique.mix_score, 6.5);
         assert_eq!(critique.headroom_db, 1.0);
@@ -1838,8 +2101,14 @@ mod tests {
         assert!(critique.summary.contains("6.5/10"));
         assert_eq!(critique.per_track[0].track_id, "tk1");
         assert_eq!(critique.per_track[0].track_name, "Synth");
-        assert!(matches!(critique.mix_issues[1].severity, CritiqueSeverity::Medium));
-        assert!(matches!(critique.per_track[0].issues[0].severity, CritiqueSeverity::Low));
+        assert!(matches!(
+            critique.mix_issues[1].severity,
+            CritiqueSeverity::Medium
+        ));
+        assert!(matches!(
+            critique.per_track[0].issues[0].severity,
+            CritiqueSeverity::Low
+        ));
         assert_eq!(critique.recommended_next_steps.len(), 3);
         assert!(critique.recommended_next_steps[0].contains("Raise dry track levels"));
         assert!(critique.recommended_next_steps[2].contains("Increase low-mid boost"));
@@ -1860,7 +2129,9 @@ mod provider_tests {
         let port = listener.local_addr().expect("local addr").port();
         std::thread::spawn(move || {
             for _ in 0..8 {
-                let Ok((mut stream, _)) = listener.accept() else { return };
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
                 let mut buf = [0u8; 16384];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]);
@@ -1885,7 +2156,8 @@ mod provider_tests {
                         sse
                     )
                 } else {
-                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
                 };
                 let _ = stream.write_all(response.as_bytes());
             }
@@ -1898,7 +2170,9 @@ mod provider_tests {
         let port = listener.local_addr().expect("local addr").port();
         std::thread::spawn(move || {
             for _ in 0..4 {
-                let Ok((mut stream, _)) = listener.accept() else { return };
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
                 let mut buf = [0u8; 16384];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]);
@@ -1912,7 +2186,8 @@ mod provider_tests {
                     );
                     let _ = stream.write_all(response.as_bytes());
                 } else if first_line.contains("/v1/chat/completions") {
-                    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"complete json\"}}]}\n\n";
+                    let sse =
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"complete json\"}}]}\n\n";
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n{:X}\r\n{}\r\n",
                         sse.len(),
@@ -1922,7 +2197,9 @@ mod provider_tests {
                     let _ = stream.flush();
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 } else {
-                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    );
                 }
             }
         });
@@ -1938,9 +2215,17 @@ mod provider_tests {
         assert_eq!(provider, LlmProvider::OpenAiCompat);
         assert_eq!(models, vec!["test-model".to_string()]);
 
-        let call = llm_generate(&base_url, "test-model", "hi", 10_000, "test", &NoopObserver, None)
-            .await
-            .expect("generate against mock server");
+        let call = llm_generate(
+            &base_url,
+            "test-model",
+            "hi",
+            10_000,
+            "test",
+            &NoopObserver,
+            None,
+        )
+        .await
+        .expect("generate against mock server");
         assert_eq!(call.response, "Hello world");
         assert_eq!(call.stats.prompt_tokens, 5);
         assert_eq!(call.stats.response_tokens, 2);
@@ -1951,9 +2236,17 @@ mod provider_tests {
         let port = spawn_openai_server_without_done();
         let base_url = format!("http://127.0.0.1:{port}");
 
-        let call = llm_generate(&base_url, "test-model", "hi", 10_000, "test", &NoopObserver, None)
-            .await
-            .expect("generate should finish after idle timeout");
+        let call = llm_generate(
+            &base_url,
+            "test-model",
+            "hi",
+            10_000,
+            "test",
+            &NoopObserver,
+            None,
+        )
+        .await
+        .expect("generate should finish after idle timeout");
 
         assert_eq!(call.response, "complete json");
     }

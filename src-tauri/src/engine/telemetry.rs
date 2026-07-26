@@ -7,8 +7,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::time::interval;
 
-use super::shared::EngineShared;
 use super::mixer::MAX_TRACKS;
+use super::shared::EngineShared;
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -38,12 +38,17 @@ pub fn spawn_telemetry(app: AppHandle, shared: Arc<EngineShared>) {
             if playhead != last_playhead || running != last_running {
                 let _ = app.emit(
                     "engine:playhead",
-                    PlayheadEvent { sample: playhead, running },
+                    PlayheadEvent {
+                        sample: playhead,
+                        running,
+                    },
                 );
                 last_playhead = playhead;
                 last_running = running;
             }
-            let master_peak = shared.master_peak.load(std::sync::atomic::Ordering::Relaxed) as f32
+            let master_peak = shared
+                .master_peak
+                .load(std::sync::atomic::Ordering::Relaxed) as f32
                 / 1_000_000.0;
             let track_peaks: Vec<f32> = (0..MAX_TRACKS)
                 .map(|i| {
@@ -53,7 +58,10 @@ pub fn spawn_telemetry(app: AppHandle, shared: Arc<EngineShared>) {
                 .collect();
             let _ = app.emit(
                 "engine:meters",
-                MetersEvent { master_peak, track_peaks },
+                MetersEvent {
+                    master_peak,
+                    track_peaks,
+                },
             );
         }
     });

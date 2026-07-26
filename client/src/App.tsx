@@ -594,58 +594,50 @@ export function App() {
   // keeps the latest closures so the listeners can be registered once.
   const menuHandlersRef = useRef<Record<string, (id?: string) => void>>({});
   menuHandlersRef.current = {
-    "menu:new-album": () => {
-      void (async () => {
-        const dir = await open({ directory: true, title: "Choose a folder to save the new album" });
-        if (typeof dir === "string") { pendingAlbumDirRef.current = dir; setAlbumNewDraft("New Album"); }
-      })();
+    "menu:new-album": () => { void beginCreateAlbum(); },
+    "menu:open-album": () => { void beginOpenAlbum(); },
+    "menu:close-album": () => { void closeCurrentAlbum(); },
+    "menu:new-song": () => {
+      if (currentAlbumId) setNewDraft("New song");
+      else pushToast("info", "Open or create an album first.");
     },
-    "menu:new-song": () => setNewDraft("New song"),
-    "menu:rename-album": () => setAlbumRenameDraft(currentAlbum?.name ?? ""),
-    "menu:rename-song": () => setRenameDraft(session?.name ?? ""),
-    "menu:delete-album": () => { void deleteCurrentAlbum(); },
+    "menu:rename-album": () => {
+      if (currentAlbum) setAlbumRenameDraft(currentAlbum.name);
+    },
+    "menu:rename-song": () => {
+      if (session) setRenameDraft(session.name);
+    },
     "menu:delete-song": () => { void deleteCurrentSession(); },
     "menu:save-bundle": () => { void saveProjectBundle(); },
     "menu:open-bundle": () => { void openProjectBundle(); },
     "menu:split-track": () => { void openSplitTrackModal(); },
-    "menu:open-album": (id) => {
-      // From the Recent submenu we get an id (already-open album → switch).
-      // From "Open Album…" there's no id → show the folder picker.
-      if (id) { void switchAlbum(id); return; }
-      void (async () => {
-        const dir = await open({ directory: true, title: "Open album" });
-        if (typeof dir === "string") void openAlbumPath(dir);
-      })();
-    },
     "menu:open-song": (id) => { if (id) void switchSession(id); },
   };
   useEffect(() => {
-    const simple = ["menu:new-album", "menu:new-song", "menu:rename-album", "menu:rename-song", "menu:delete-album", "menu:delete-song", "menu:save-bundle", "menu:open-bundle", "menu:split-track"];
+    const simple = ["menu:new-album", "menu:open-album", "menu:close-album", "menu:new-song", "menu:rename-album", "menu:rename-song", "menu:delete-song", "menu:save-bundle", "menu:open-bundle", "menu:split-track"];
     const unsubs: (() => void)[] = [];
     for (const name of simple) {
       void listen(name, () => menuHandlersRef.current[name]?.()).then((fn) => unsubs.push(fn));
     }
-    void listen<{ id: string }>("menu:open-album", (e) => menuHandlersRef.current["menu:open-album"]?.(e.payload.id)).then((fn) => unsubs.push(fn));
     void listen<{ id: string }>("menu:open-song", (e) => menuHandlersRef.current["menu:open-song"]?.(e.payload.id)).then((fn) => unsubs.push(fn));
     return () => unsubs.forEach((f) => f());
   }, []);
 
-  // Keep the native File menu's album/song lists (and checkmarks) in sync.
+  // Keep the native Project menu's song list and checkmark in sync.
   useEffect(() => {
-    if (!session) return;
     void api.setFileMenu(
-      albums.map((a) => ({ id: a.id, name: a.name })),
+      [],
       sessionList.map((s) => ({ id: s.id, name: s.name })),
       currentAlbumId,
-      session.id,
+      session?.id ?? "",
     ).catch(() => undefined);
   }, [albums, sessionList, currentAlbumId, session?.id]);
 
-  // Show the current album / song in the native macOS title bar (instead of an
-  // in-window breadcrumb).
+  // Show the explicitly open document in the native title bar.
   useEffect(() => {
-    if (!session) return;
-    const title = currentAlbum?.name ? `${currentAlbum.name} — ${session.name}` : session.name;
+    const title = currentAlbum?.name
+      ? (session ? `${currentAlbum.name} — ${session.name}` : currentAlbum.name)
+      : "AutoMixer";
     void getCurrentWebviewWindow().setTitle(title).catch(() => undefined);
   }, [currentAlbum?.name, session?.name]);
 
@@ -1469,7 +1461,7 @@ export function App() {
 
   async function commitNewSession(name: string) {
     const trimmed = name.trim();
-    if (!trimmed) return;
+    if (!trimmed || !currentAlbumId) return;
     await flushChat();
     setBusy(true);
     try {
@@ -1534,9 +1526,9 @@ export function App() {
   async function deleteCurrentSession() {
     if (!session) return;
     const confirmed = await confirmAction({
-      title: "Delete session",
-      message: `Delete session "${session.name}"? This cannot be undone.`,
-      confirmLabel: "Delete session",
+      title: "Delete song",
+      message: `Delete the entire "${session.name}" song folder, including its audio, recordings, video, and renders? This cannot be undone.`,
+      confirmLabel: "Delete song",
     });
     if (!confirmed) return;
     setBusy(true);
@@ -1544,10 +1536,7 @@ export function App() {
       await api.deleteSession(session.id);
       const remaining = (await api.sessions(currentAlbumId)).filter((s) => s.id !== session.id);
       setSessionList(remaining);
-      const next = remaining[0]
-        ? await api.getSession(remaining[0].id)
-        : await api.createSession(currentAlbumId, "AutoMixer session");
-      setProject(next);
+      setProject(remaining[0] ? await api.getSession(remaining[0].id) : undefined);
       setSelectedTrackIds([]);
       setSelectedRegionIds([]);
       playbackAnchorRef.current = undefined;
@@ -1558,24 +1547,14 @@ export function App() {
     }
   }
 
-  async function refreshAlbums() {
-    try {
-      setAlbums(await api.albums());
-    } catch (error) {
-      pushSystem(error);
-    }
-  }
-
   async function switchAlbum(albumId: string) {
-    if (!albumId || albumId === currentAlbumId) return;
-    await flushChat();
+    if (!albumId) return;
     setBusy(true);
     try {
       setCurrentAlbumId(albumId);
       const sessions = await api.sessions(albumId);
-      const next = sessions[0] ? await api.getSession(sessions[0].id) : await api.createSession(albumId, "AutoMixer session");
-      setProject(next);
-      setSessionList(sessions.length > 0 ? sessions : [next.session]);
+      setProject(sessions[0] ? await api.getSession(sessions[0].id) : undefined);
+      setSessionList(sessions);
       setSelectedTrackIds([]);
       setSelectedRegionIds([]);
       playbackAnchorRef.current = undefined;
@@ -1590,14 +1569,54 @@ export function App() {
     }
   }
 
+  async function prepareForAlbumChange() {
+    if (busy) {
+      pushToast("info", "Wait for the current job to finish before changing albums.");
+      return false;
+    }
+    if (recording || recordingStarting || videoRecordingTrackIds.length > 0 || videoRecordingStarting) {
+      pushToast("info", "Stop recording before changing albums.");
+      return false;
+    }
+    await flushChat();
+    await api.stop().catch(() => undefined);
+    await api.stopInputMonitor().catch(() => undefined);
+    return true;
+  }
+
+  async function beginCreateAlbum() {
+    if (!(await prepareForAlbumChange())) return;
+    const picked = await open({
+      multiple: false,
+      directory: true,
+      title: "Choose where to create the album folder",
+    });
+    const parentDir = Array.isArray(picked) ? picked[0] : picked;
+    if (!parentDir) return;
+    pendingAlbumDirRef.current = parentDir;
+    setAlbumNewDraft("New Album");
+  }
+
+  async function beginOpenAlbum() {
+    if (!(await prepareForAlbumChange())) return;
+    const picked = await open({
+      multiple: false,
+      directory: true,
+      title: "Open an AutoMixer album folder",
+    });
+    const albumDir = Array.isArray(picked) ? picked[0] : picked;
+    if (albumDir) await openAlbumPath(albumDir);
+  }
+
   async function commitNewAlbum(name: string) {
     const trimmed = name.trim();
     const dir = pendingAlbumDirRef.current;
     if (!trimmed || !dir) return;
     pendingAlbumDirRef.current = null;
     try {
+      if (!(await prepareForAlbumChange())) return;
       const album = await api.createAlbum(trimmed, dir);
-      setAlbums((current) => [album, ...current.filter((a) => a.id !== album.id)]);
+      setAlbums([album]);
       await switchAlbum(album.id);
     } catch (error) {
       pushSystem(error);
@@ -1607,8 +1626,9 @@ export function App() {
   // Open an existing album folder picked from disk.
   async function openAlbumPath(path: string) {
     try {
+      if (!(await prepareForAlbumChange())) return;
       const album = await api.openAlbum(path);
-      setAlbums((current) => [album, ...current.filter((a) => a.id !== album.id)]);
+      setAlbums([album]);
       await switchAlbum(album.id);
     } catch (error) {
       pushSystem(error);
@@ -1627,32 +1647,33 @@ export function App() {
     }
   }
 
-  async function deleteCurrentAlbum() {
+  async function closeCurrentAlbum() {
     if (!currentAlbumId) return;
-    const confirmed = await confirmAction({
-      title: "Delete album",
-      message: `Delete album "${currentAlbum?.name}" and all its songs? This cannot be undone.`,
-      confirmLabel: "Delete album",
-    });
-    if (!confirmed) return;
+    if (busy) {
+      pushToast("info", "Wait for the current job to finish before closing the album.");
+      return;
+    }
+    if (recording || recordingStarting || videoRecordingTrackIds.length > 0 || videoRecordingStarting) {
+      pushToast("info", "Stop recording before closing the album.");
+      return;
+    }
+    await flushChat();
     setBusy(true);
     try {
-      await api.deleteAlbum(currentAlbumId);
-      const remaining = await api.albums();
-      if (remaining.length === 0) {
-        // Nothing left — fall back to a default app-managed album/song.
-        const proj = await api.createDefaultSession("New song");
-        const newAlbumId = proj.session.albumId ?? "";
-        setAlbums(await api.albums());
-        setCurrentAlbumId(newAlbumId);
-        const sess = await api.sessions(newAlbumId);
-        setSessionList(sess.length > 0 ? sess : [proj.session]);
-        setProject(proj);
-      } else {
-        setAlbums(remaining);
-        setCurrentAlbumId("");
-        await switchAlbum(remaining[0].id);
-      }
+      await api.stop().catch(() => undefined);
+      await api.stopInputMonitor().catch(() => undefined);
+      await api.closeAlbum(currentAlbumId);
+      setAlbums([]);
+      setCurrentAlbumId("");
+      setSessionList([]);
+      setProject(undefined);
+      setSelectedTrackIds([]);
+      setSelectedRegionIds([]);
+      lastLoadedSessionRef.current = undefined;
+      playbackAnchorRef.current = undefined;
+      pausedAtRef.current = 0;
+      setPlayhead(0);
+      setPlaying(false);
     } catch (error) {
       pushSystem(error);
     } finally {
@@ -1681,6 +1702,10 @@ export function App() {
   }
 
   async function openProjectBundle() {
+    if (!currentAlbumId) {
+      pushToast("info", "Open or create an album before importing a song bundle.");
+      return;
+    }
     const folder = await open({ multiple: false, directory: true, title: "Select an AutoMixer project bundle" });
     const bundleDir = Array.isArray(folder) ? folder[0] : folder;
     if (!bundleDir) return;
@@ -1703,7 +1728,7 @@ export function App() {
   async function bootstrap() {
     setLoading(true);
     try {
-      const [config, albumList] = await Promise.all([api.config().catch(() => undefined), api.albums()]);
+      const config = await api.config().catch(() => undefined);
       if (config) {
         if (!initialOllamaUrlRef.current) setOllamaUrl(config.ollamaBaseUrl);
         if (!initialOllamaModelRef.current) {
@@ -1723,25 +1748,11 @@ export function App() {
       void api.getSamAudioConfig().then((config) => {
         setSamAudioUrl(config.baseUrl);
       }).catch(() => undefined);
-      // Albums (projects) own the songs (sessions). With no album yet (document
-      // model), spin up a default app-managed one so there's a song to show.
-      let albumsNow = albumList;
-      let loaded: MixProject;
-      let albumId: string;
-      if (albumsNow.length === 0) {
-        loaded = await api.createDefaultSession("New song");
-        albumId = loaded.session.albumId ?? "";
-        albumsNow = await api.albums();
-      } else {
-        albumId = albumsNow[0].id;
-        const sessions = await api.sessions(albumId);
-        loaded = sessions[0] ? await api.getSession(sessions[0].id) : await api.createSession(albumId, "New song");
-      }
-      setAlbums(albumsNow);
-      setCurrentAlbumId(albumId);
-      const sess = await api.sessions(albumId);
-      setSessionList(sess.length > 0 ? sess : [loaded.session]);
-      setProject(loaded);
+      // Albums are documents. Never index or reopen one implicitly at launch.
+      setAlbums([]);
+      setCurrentAlbumId("");
+      setSessionList([]);
+      setProject(undefined);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not start app.";
       setStartupError(message);
@@ -2136,7 +2147,7 @@ export function App() {
       // Rust owns previews AND recorders: it stops these devices' previews itself,
       // spawns all recorder processes in parallel, and returns once every camera
       // reports frames flowing (or errors naming the dead camera).
-      await api.startCameraCaptures(specs);
+      await api.startCameraCaptures(session.id, specs);
       nativeCapturesRef.current = Object.fromEntries(specs.map((spec) => [spec.trackId, {
         startSample,
         createAudioTrack: spec.includeAudio,
@@ -3973,14 +3984,110 @@ export function App() {
     setConfirmRequest(null);
   }
 
+  function renderNamePrompt() {
+    const prompt =
+      albumNewDraft !== null ? { value: albumNewDraft, set: setAlbumNewDraft, title: "New album", placeholder: "Album name", submit: (value: string) => commitNewAlbum(value) } :
+      albumRenameDraft !== null ? { value: albumRenameDraft, set: setAlbumRenameDraft, title: "Rename album", placeholder: "Album name", submit: (value: string) => commitAlbumRename(value) } :
+      newDraft !== null ? { value: newDraft, set: setNewDraft, title: "New song", placeholder: "Song name", submit: (value: string) => commitNewSession(value) } :
+      renameDraft !== null ? { value: renameDraft, set: setRenameDraft, title: "Rename song", placeholder: "Song name", submit: (value: string) => commitRename(value) } :
+      null;
+    if (!prompt) return null;
+    return (
+      <div className="name-prompt-backdrop" onPointerDown={() => prompt.set(null)}>
+        <form
+          className="name-prompt"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            const value = prompt.value;
+            prompt.set(null);
+            void prompt.submit(value);
+          }}
+        >
+          <div className="name-prompt-title">{prompt.title}</div>
+          <input
+            autoFocus
+            value={prompt.value}
+            placeholder={prompt.placeholder}
+            onChange={(event) => prompt.set(event.target.value)}
+            onKeyDown={(event) => { if (event.key === "Escape") prompt.set(null); }}
+          />
+          <div className="name-prompt-actions">
+            <button type="button" onClick={() => prompt.set(null)}>Cancel</button>
+            <button type="submit" className="primary">OK</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+
+  function renderToasts() {
+    return (
+      <div className="toast-stack" role="status" aria-live="polite">
+        {toasts.map((toast) => (
+          <div key={toast.id} className={`toast toast-${toast.kind}`}>
+            {toast.kind === "success" ? <CheckCircle2 size={15} /> : toast.kind === "error" ? <AlertCircle size={15} /> : <Info size={15} />}
+            <span className="toast-text">{toast.text}</span>
+            <button type="button" onClick={() => dismissToast(toast.id)} aria-label="Dismiss notification">
+              <X size={13} />
+            </button>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   if (loading) return <main className="loading">Loading AutoMixer...</main>;
-  if (startupError || !project || !session) {
+  if (startupError) {
     return (
       <main className="loading">
         <div>
           <h1>AutoMixer could not start</h1>
-          <p>{startupError ?? "No session was loaded."}</p>
+          <p>{startupError}</p>
         </div>
+      </main>
+    );
+  }
+  if (!project || !session) {
+    const albumIsOpen = Boolean(currentAlbumId && currentAlbum);
+    return (
+      <main className="project-welcome">
+        <section className="project-welcome-card">
+          <div className="project-welcome-icon">
+            {albumIsOpen ? <FilePlus2 size={30} /> : <FolderOpen size={30} />}
+          </div>
+          <p className="project-welcome-eyebrow">{albumIsOpen ? "Album open" : "Document-based projects"}</p>
+          <h1>{albumIsOpen ? currentAlbum?.name : "Open an album folder"}</h1>
+          <p className="project-welcome-copy">
+            {albumIsOpen
+              ? "This album has no songs yet. Create one and AutoMixer will place it in its own self-contained subfolder."
+              : "AutoMixer starts empty and never indexes or reopens a library. Create a new album folder or choose one that contains album.json."}
+          </p>
+          <div className="project-welcome-actions">
+            {albumIsOpen ? (
+              <>
+                <button type="button" className="primary" onClick={() => setNewDraft("New song")}>
+                  <FilePlus2 size={16} /> New Song
+                </button>
+                <button type="button" onClick={() => void closeCurrentAlbum()}>Close Album</button>
+              </>
+            ) : (
+              <>
+                <button type="button" className="primary" onClick={() => void beginCreateAlbum()}>
+                  <FilePlus2 size={16} /> Create Album
+                </button>
+                <button type="button" onClick={() => void beginOpenAlbum()}>
+                  <FolderOpen size={16} /> Open Album
+                </button>
+              </>
+            )}
+          </div>
+          <div className="project-welcome-layout" aria-label="Album folder structure">
+            <code>Album / album.json / Song / song.json + Audio + Peaks + Recordings + Video + Renders</code>
+          </div>
+        </section>
+        {renderNamePrompt()}
+        {renderToasts()}
       </main>
     );
   }
@@ -5353,31 +5460,7 @@ export function App() {
         )}
       </aside>
       </div>
-      {(() => {
-        const prompt =
-          albumNewDraft !== null ? { value: albumNewDraft, set: setAlbumNewDraft, title: "New album", placeholder: "Album name", submit: (v: string) => commitNewAlbum(v) } :
-          albumRenameDraft !== null ? { value: albumRenameDraft, set: setAlbumRenameDraft, title: "Rename album", placeholder: "Album name", submit: (v: string) => commitAlbumRename(v) } :
-          newDraft !== null ? { value: newDraft, set: setNewDraft, title: "New song", placeholder: "Song name", submit: (v: string) => commitNewSession(v) } :
-          renameDraft !== null ? { value: renameDraft, set: setRenameDraft, title: "Rename song", placeholder: "Song name", submit: (v: string) => commitRename(v) } :
-          null;
-        if (!prompt) return null;
-        return (
-          <div className="name-prompt-backdrop" onPointerDown={() => prompt.set(null)}>
-            <form
-              className="name-prompt"
-              onPointerDown={(e) => e.stopPropagation()}
-              onSubmit={(e) => { e.preventDefault(); const v = prompt.value; prompt.set(null); void prompt.submit(v); }}
-            >
-              <div className="name-prompt-title">{prompt.title}</div>
-              <input autoFocus value={prompt.value} placeholder={prompt.placeholder} onChange={(e) => prompt.set(e.target.value)} onKeyDown={(e) => { if (e.key === "Escape") prompt.set(null); }} />
-              <div className="name-prompt-actions">
-                <button type="button" onClick={() => prompt.set(null)}>Cancel</button>
-                <button type="submit" className="primary">OK</button>
-              </div>
-            </form>
-          </div>
-        );
-      })()}
+      {renderNamePrompt()}
       {downloadOpen ? (
         <div className="settings-backdrop" onPointerDown={() => setDownloadOpen(false)}>
           <div className="settings-modal download-modal" role="dialog" aria-modal="true" aria-label="Export audio" onPointerDown={(e) => e.stopPropagation()}>
@@ -5922,17 +6005,7 @@ export function App() {
           </div>
         </div>
       ) : null}
-      <div className="toast-stack" role="status" aria-live="polite">
-        {toasts.map((toast) => (
-          <div key={toast.id} className={`toast toast-${toast.kind}`}>
-            {toast.kind === "success" ? <CheckCircle2 size={15} /> : toast.kind === "error" ? <AlertCircle size={15} /> : <Info size={15} />}
-            <span className="toast-text">{toast.text}</span>
-            <button type="button" onClick={() => dismissToast(toast.id)} aria-label="Dismiss notification">
-              <X size={13} />
-            </button>
-          </div>
-        ))}
-      </div>
+      {renderToasts()}
     </main>
   );
 }

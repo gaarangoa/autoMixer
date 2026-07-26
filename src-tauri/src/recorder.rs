@@ -9,7 +9,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     SampleFormat, StreamConfig,
 };
-use crossbeam_channel::{bounded, TryRecvError, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 
 #[derive(Debug, Clone)]
@@ -114,7 +114,10 @@ pub fn input_devices() -> Result<Vec<String>, String> {
 /// Number of input channels exposed by an audio interface (or default input).
 pub fn input_device_channel_count(input_device: Option<String>) -> Result<u32, String> {
     let host = cpal::default_host();
-    let device = match input_device.as_deref().filter(|name| !name.trim().is_empty()) {
+    let device = match input_device
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+    {
         Some(name) => host
             .input_devices()
             .map_err(|e| e.to_string())?
@@ -152,7 +155,16 @@ pub fn start_recording(
     std::thread::Builder::new()
         .name("automixer-recorder".into())
         .spawn(move || {
-            let result = run_recording_thread(thread_path.clone(), input_device, target_channels, gain_factor, selected_channels, stop_rx, ready_tx.clone(), meter_tx);
+            let result = run_recording_thread(
+                thread_path.clone(),
+                input_device,
+                target_channels,
+                gain_factor,
+                selected_channels,
+                stop_rx,
+                ready_tx.clone(),
+                meter_tx,
+            );
             if let Err(error) = &result {
                 let _ = ready_tx.try_send(Err(error.clone()));
             }
@@ -160,7 +172,15 @@ pub fn start_recording(
         })
         .map_err(|e| format!("Could not start recording thread: {e}"))?;
 
-    Ok(RecordingHandle { stop_tx, ready_rx, done_rx, meter_rx, path, start_sample, target_track_id })
+    Ok(RecordingHandle {
+        stop_tx,
+        ready_rx,
+        done_rx,
+        meter_rx,
+        path,
+        start_sample,
+        target_track_id,
+    })
 }
 
 pub fn start_input_monitor(input_device: Option<String>) -> Result<InputMonitorHandle, String> {
@@ -180,7 +200,12 @@ pub fn start_input_monitor(input_device: Option<String>) -> Result<InputMonitorH
         })
         .map_err(|e| format!("Could not start input monitor thread: {e}"))?;
 
-    Ok(InputMonitorHandle { stop_tx, ready_rx, done_rx, meter_rx })
+    Ok(InputMonitorHandle {
+        stop_tx,
+        ready_rx,
+        done_rx,
+        meter_rx,
+    })
 }
 
 fn run_recording_thread(
@@ -194,7 +219,10 @@ fn run_recording_thread(
     meter_tx: Sender<RecordingMeter>,
 ) -> Result<(), String> {
     let host = cpal::default_host();
-    let device = match input_device.as_deref().filter(|name| !name.trim().is_empty()) {
+    let device = match input_device
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+    {
         Some(name) => host
             .input_devices()
             .map_err(|e| e.to_string())?
@@ -216,11 +244,23 @@ fn run_recording_thread(
         bits_per_sample: 32,
         sample_format: WavSampleFormat::Float,
     };
-    let writer = WavWriter::create(&path, spec).map_err(|e| format!("Could not create recording WAV: {e}"))?;
+    let writer = WavWriter::create(&path, spec)
+        .map_err(|e| format!("Could not create recording WAV: {e}"))?;
     let writer = Arc::new(Mutex::new(Some(writer)));
-    let stream = build_input_stream(&device, &config, sample_format, target_channels, gain_factor, selected_channels, writer.clone(), meter_tx)?;
+    let stream = build_input_stream(
+        &device,
+        &config,
+        sample_format,
+        target_channels,
+        gain_factor,
+        selected_channels,
+        writer.clone(),
+        meter_tx,
+    )?;
 
-    stream.play().map_err(|e| format!("Could not start input stream: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("Could not start input stream: {e}"))?;
     let _ = ready_tx.send(Ok(()));
     let _ = stop_rx.recv();
     drop(stream);
@@ -230,7 +270,9 @@ fn run_recording_thread(
         .map_err(|e| e.to_string())?
         .take()
         .ok_or_else(|| "Recording writer was already finalized.".to_string())?;
-    writer.finalize().map_err(|e| format!("Could not finalize recording WAV: {e}"))?;
+    writer
+        .finalize()
+        .map_err(|e| format!("Could not finalize recording WAV: {e}"))?;
     Ok(())
 }
 
@@ -241,7 +283,10 @@ fn run_monitor_thread(
     meter_tx: Sender<RecordingMeter>,
 ) -> Result<(), String> {
     let host = cpal::default_host();
-    let device = match input_device.as_deref().filter(|name| !name.trim().is_empty()) {
+    let device = match input_device
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+    {
         Some(name) => host
             .input_devices()
             .map_err(|e| e.to_string())?
@@ -258,7 +303,9 @@ fn run_monitor_thread(
     let config: StreamConfig = default_config.config();
     let stream = build_meter_stream(&device, &config, sample_format, meter_tx)?;
 
-    stream.play().map_err(|e| format!("Could not start input monitor: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("Could not start input monitor: {e}"))?;
     let _ = ready_tx.send(Ok(()));
     let _ = stop_rx.recv();
     drop(stream);
@@ -283,7 +330,10 @@ fn build_input_stream(
     // Default: take the first N channels (legacy behaviour). When the user picked
     // specific channels in the inspector, use those instead.
     let selected: Vec<usize> = match selected_channels {
-        Some(v) if !v.is_empty() => v.into_iter().map(|c| (c as usize).min(channel_count.saturating_sub(1))).collect(),
+        Some(v) if !v.is_empty() => v
+            .into_iter()
+            .map(|c| (c as usize).min(channel_count.saturating_sub(1)))
+            .collect(),
         _ => (0..channel_count).take(target).collect(),
     };
 
@@ -297,7 +347,14 @@ fn build_input_stream(
                 .build_input_stream(
                     config,
                     move |data: &[f32], _| {
-                        write_recording_samples(data, channels, target, gain_factor, &selected, &writer);
+                        write_recording_samples(
+                            data,
+                            channels,
+                            target,
+                            gain_factor,
+                            &selected,
+                            &writer,
+                        );
                         emit_meter(data.iter().copied(), channels, &meter_tx);
                     },
                     err,
@@ -314,8 +371,16 @@ fn build_input_stream(
                 .build_input_stream(
                     config,
                     move |data: &[i16], _| {
-                        let converted: Vec<f32> = data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
-                        write_recording_samples(&converted, channels, target, gain_factor, &selected, &writer);
+                        let converted: Vec<f32> =
+                            data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
+                        write_recording_samples(
+                            &converted,
+                            channels,
+                            target,
+                            gain_factor,
+                            &selected,
+                            &writer,
+                        );
                         emit_meter(converted.iter().copied(), channels, &meter_tx);
                     },
                     err,
@@ -336,7 +401,14 @@ fn build_input_stream(
                             .iter()
                             .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0)
                             .collect();
-                        write_recording_samples(&converted, channels, target, gain_factor, &selected, &writer);
+                        write_recording_samples(
+                            &converted,
+                            channels,
+                            target,
+                            gain_factor,
+                            &selected,
+                            &writer,
+                        );
                         emit_meter(converted.iter().copied(), channels, &meter_tx);
                     },
                     err,
@@ -392,7 +464,9 @@ fn build_meter_stream(
                 None,
             )
             .map_err(|e| format!("Could not build u16 input monitor: {e}")),
-        other => Err(format!("Unsupported input monitor sample format: {other:?}")),
+        other => Err(format!(
+            "Unsupported input monitor sample format: {other:?}"
+        )),
     }
 }
 
@@ -416,7 +490,10 @@ where
     for v in &mut channel_peaks {
         *v = v.clamp(0.0, 1.0);
     }
-    let _ = meter_tx.try_send(RecordingMeter { peak: peak.clamp(0.0, 1.0), channel_peaks });
+    let _ = meter_tx.try_send(RecordingMeter {
+        peak: peak.clamp(0.0, 1.0),
+        channel_peaks,
+    });
 }
 
 fn write_recording_samples(
@@ -437,8 +514,16 @@ fn write_recording_samples(
     let target_channels = target_channels.max(1).min(2);
     // Map each output channel to a specific input-channel index. Falls back to 0/1 so
     // we never panic on a misconfigured slice.
-    let ch0 = selected.first().copied().unwrap_or(0).min(input_channels.saturating_sub(1));
-    let ch1 = selected.get(1).copied().unwrap_or(ch0).min(input_channels.saturating_sub(1));
+    let ch0 = selected
+        .first()
+        .copied()
+        .unwrap_or(0)
+        .min(input_channels.saturating_sub(1));
+    let ch1 = selected
+        .get(1)
+        .copied()
+        .unwrap_or(ch0)
+        .min(input_channels.saturating_sub(1));
     for frame in samples.chunks(input_channels) {
         if frame.is_empty() {
             continue;

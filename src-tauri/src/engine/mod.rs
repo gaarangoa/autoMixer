@@ -49,7 +49,9 @@ impl AudioEngine {
             commands: consumer,
             events: events_tx,
             shared: shared.clone(),
-            config: AudioThreadConfig { preferred_block_size: block_size },
+            config: AudioThreadConfig {
+                preferred_block_size: block_size,
+            },
         });
 
         Self {
@@ -111,8 +113,11 @@ impl AudioEngine {
     /// Slots beyond the session's track count are cleared.
     pub fn bind_session_sources(&mut self, session: &MixSession) -> Result<(), String> {
         use std::collections::HashMap;
-        let by_id: HashMap<&str, &crate::model::SourceFile> =
-            session.source_files.iter().map(|s| (s.id.as_str(), s)).collect();
+        let by_id: HashMap<&str, &crate::model::SourceFile> = session
+            .source_files
+            .iter()
+            .map(|s| (s.id.as_str(), s))
+            .collect();
 
         for (i, track) in session.tracks.iter().enumerate() {
             if i >= self.shared.source_slots.len() {
@@ -134,14 +139,18 @@ impl AudioEngine {
                 }
             } else {
                 for clip in &track.clips {
-                    let source_id = clip.source_file_id.as_deref().unwrap_or(track.source_file_id.as_str());
+                    let source_id = clip
+                        .source_file_id
+                        .as_deref()
+                        .unwrap_or(track.source_file_id.as_str());
                     let Some(src) = by_id.get(source_id) else {
                         continue;
                     };
                     let (header, samples) = read_cache_all(Path::new(&src.cache_path))?;
                     clips.push(TrackClipSource {
                         start_sample: clip.start_sample,
-                        duration_samples: header.frames
+                        duration_samples: header
+                            .frames
                             .saturating_sub(clip.source_offset_sample)
                             .min(clip.end_sample.saturating_sub(clip.start_sample)),
                         source_offset_sample: clip.source_offset_sample,
@@ -158,7 +167,9 @@ impl AudioEngine {
                 self.shared.source_slots[i].store(Some(Arc::new(TrackSource { clips })));
             }
         }
-        self.send(EngineCommand::SetSessionRate { rate: session.sample_rate });
+        self.send(EngineCommand::SetSessionRate {
+            rate: session.sample_rate,
+        });
         for i in session.tracks.len()..self.shared.source_slots.len() {
             self.shared.source_slots[i].store(None);
         }

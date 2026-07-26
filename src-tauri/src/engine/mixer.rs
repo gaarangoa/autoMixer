@@ -153,19 +153,35 @@ impl Mixer {
                     t.active = active;
                 }
             }
-            EngineCommand::SetTrackHighPass { slot, enabled, frequency_hz, slope_db_oct } => {
+            EngineCommand::SetTrackHighPass {
+                slot,
+                enabled,
+                frequency_hz,
+                slope_db_oct,
+            } => {
                 if let Some(t) = self.tracks.get_mut(slot as usize) {
                     t.default_hp_freq = frequency_hz;
                     t.high_pass.set(enabled, frequency_hz, slope_db_oct);
                 }
             }
-            EngineCommand::SetTrackLowPass { slot, enabled, frequency_hz, slope_db_oct } => {
+            EngineCommand::SetTrackLowPass {
+                slot,
+                enabled,
+                frequency_hz,
+                slope_db_oct,
+            } => {
                 if let Some(t) = self.tracks.get_mut(slot as usize) {
                     t.default_lp_freq = frequency_hz;
                     t.low_pass.set(enabled, frequency_hz, slope_db_oct);
                 }
             }
-            EngineCommand::SetTrackEqBand { slot, band, frequency_hz, gain_db, q } => {
+            EngineCommand::SetTrackEqBand {
+                slot,
+                band,
+                frequency_hz,
+                gain_db,
+                q,
+            } => {
                 if let Some(t) = self.tracks.get_mut(slot as usize) {
                     t.eq.set_band(band as usize, frequency_hz, gain_db, q);
                 }
@@ -351,15 +367,24 @@ impl Mixer {
                         continue;
                     }
                     let l0 = buf[idx0];
-                    let r0 = if source.channels >= 2 { buf[idx0 + 1] } else { l0 };
-                    let (clip_l, clip_r) = if i_floor + 1 < source.duration_samples && idx0 + 2 * ch <= buf.len() {
-                        let idx1 = idx0 + ch;
-                        let l1 = buf[idx1];
-                        let r1 = if source.channels >= 2 { buf[idx1 + 1] } else { l1 };
-                        (l0 + frac * (l1 - l0), r0 + frac * (r1 - r0))
+                    let r0 = if source.channels >= 2 {
+                        buf[idx0 + 1]
                     } else {
-                        (l0, r0)
+                        l0
                     };
+                    let (clip_l, clip_r) =
+                        if i_floor + 1 < source.duration_samples && idx0 + 2 * ch <= buf.len() {
+                            let idx1 = idx0 + ch;
+                            let l1 = buf[idx1];
+                            let r1 = if source.channels >= 2 {
+                                buf[idx1 + 1]
+                            } else {
+                                l1
+                            };
+                            (l0 + frac * (l1 - l0), r0 + frac * (r1 - r0))
+                        } else {
+                            (l0, r0)
+                        };
                     let clip_gain = db_to_gain(source.gain_db);
                     l += clip_l * clip_gain;
                     r += clip_r * clip_gain;
@@ -458,13 +483,18 @@ impl Mixer {
         }
 
         self.playhead += frames as f64 * session_per_output;
-        self.shared.playhead.store(self.playhead as u64, Ordering::Relaxed);
         self.shared
-            .master_peak
-            .store((max_peak.clamp(0.0, 4.0) * 1_000_000.0) as u32, Ordering::Relaxed);
+            .playhead
+            .store(self.playhead as u64, Ordering::Relaxed);
+        self.shared.master_peak.store(
+            (max_peak.clamp(0.0, 4.0) * 1_000_000.0) as u32,
+            Ordering::Relaxed,
+        );
         for (i, peak) in track_peak.iter().enumerate() {
-            self.shared.track_peaks[i]
-                .store((peak.clamp(0.0, 4.0) * 1_000_000.0) as u32, Ordering::Relaxed);
+            self.shared.track_peaks[i].store(
+                (peak.clamp(0.0, 4.0) * 1_000_000.0) as u32,
+                Ordering::Relaxed,
+            );
         }
     }
 }

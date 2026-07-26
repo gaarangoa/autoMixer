@@ -8,11 +8,26 @@
 pub enum EngineCommand {
     SetMasterGainDb(f32),
     SetMasterCeilingDb(f32),
-    SetTrackGainDb { slot: u32, db: f32 },
-    SetTrackPan { slot: u32, pan: f32 },
-    SetTrackMuted { slot: u32, muted: bool },
-    SetTrackSolo { slot: u32, solo: bool },
-    SetTrackActive { slot: u32, active: bool },
+    SetTrackGainDb {
+        slot: u32,
+        db: f32,
+    },
+    SetTrackPan {
+        slot: u32,
+        pan: f32,
+    },
+    SetTrackMuted {
+        slot: u32,
+        muted: bool,
+    },
+    SetTrackSolo {
+        slot: u32,
+        solo: bool,
+    },
+    SetTrackActive {
+        slot: u32,
+        active: bool,
+    },
     SetTrackHighPass {
         slot: u32,
         enabled: bool,
@@ -42,12 +57,24 @@ pub enum EngineCommand {
         knee_db: f32,
         makeup_db: f32,
     },
-    SetTrackReverbSendDb { slot: u32, db: f32 },
-    SetTrackDelaySendDb { slot: u32, db: f32 },
+    SetTrackReverbSendDb {
+        slot: u32,
+        db: f32,
+    },
+    SetTrackDelaySendDb {
+        slot: u32,
+        db: f32,
+    },
     Play,
     Pause,
     Stop,
-    Seek { sample: u64 },
-    SetSessionRate { rate: u32 },
-    SetMasterBypass { enabled: bool },
+    Seek {
+        sample: u64,
+    },
+    SetSessionRate {
+        rate: u32,
+    },
+    SetMasterBypass {
+        enabled: bool,
+    },
 }

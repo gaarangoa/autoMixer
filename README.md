@@ -10,6 +10,33 @@ The app is designed around real multitrack sessions: import stems, record takes,
 edit track regions, audition pre/post AI processing, ask the agent for mix
 changes, or run the staged autonomous mix workflow.
 
+## Album Documents
+
+AutoMixer does not maintain or reopen a global album library. It starts empty;
+use **Create Album** to choose a parent directory or **Open Album** to select an
+existing album folder. Closing an album only closes the document and never
+deletes its files.
+
+An album is portable and self-contained:
+
+```text
+Album Name/
+  album.json
+  Song Name/
+    song.json
+    Audio/
+    Peaks/
+    Recordings/
+    Video/
+    Renders/
+```
+
+Each new song is a direct subdirectory of its album. Media references in
+`song.json` are stored relative to the song directory, so the complete album
+folder can be moved, copied, backed up, or opened on another machine. Deleting a
+song from AutoMixer deletes that whole song directory; the confirmation dialog
+calls this out explicitly.
+
 ## License
 
 This is proprietary commercial software. See [LICENSE](LICENSE). No commercial
@@ -48,19 +75,22 @@ uv sync --python 3.11
 cd ..
 ```
 
-For local LLM use, run one of the supported model servers. With Ollama, pull the
-default model:
+For local LLM use, the checked-in launcher uses the already-downloaded Qwen3.6
+GGUF through llama.cpp:
 
 ```sh
-ollama pull gpt-oss:20b
+npm run models:start
 ```
 
-With vLLM or llama.cpp, start the server and point the app at its URL in
-Settings (the protocol is auto-detected):
+Other OpenAI-compatible servers can also be selected in Settings (the protocol
+is auto-detected). For example:
 
 ```sh
 # vLLM (default port 8000)
 vllm serve Qwen/Qwen2.5-32B-Instruct
+
+# Ollama (default port 11434)
+ollama pull gpt-oss:20b
 
 # llama.cpp (default port 8080)
 llama-server -m model.gguf
@@ -73,9 +103,8 @@ a Qwen-VL model on vLLM / a model with an mmproj file on llama.cpp).
 
 The app has sensible local defaults:
 
-- Model server URL: `http://localhost:11434` (Ollama; use e.g. `:8000` for vLLM
-  or `:8080` for llama.cpp)
-- Model: `gpt-oss:20b`
+- Model server URL: `http://127.0.0.1:2261`
+- Model: `qwen3.6-35b-a3b`
 - Audio sidecar port: `7321`
 
 You can copy `.env.example` to `.env.local` for local overrides:
@@ -87,8 +116,8 @@ cp .env.example .env.local
 Useful environment variables:
 
 ```sh
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=gpt-oss:20b
+OLLAMA_BASE_URL=http://127.0.0.1:2261
+OLLAMA_MODEL=qwen3.6-35b-a3b
 GEMINI_API_KEY=...
 AUTOMIXER_AUDIO_PORT=7321
 AUTOMIXER_UV=/path/to/uv
@@ -112,6 +141,28 @@ only when debugging it directly:
 cd audio-service
 uv run uvicorn main:app --host 127.0.0.1 --port 7321
 ```
+
+## Managed Local Model Server
+
+The reproducible launcher for the external llama.cpp/vLLM deployment is tracked
+under [`model-service/`](model-service/README.md). The current Apple-silicon
+configuration serves the already-downloaded Qwen3.6 GGUF and vision projector
+from `~/vLLM/models/` at `http://127.0.0.1:2261`.
+
+```sh
+npm run models:status
+npm run models:start
+npm run models:stop
+```
+
+To start it automatically whenever this user logs in after a Mac restart:
+
+```sh
+npm run models:install
+```
+
+Large model files and machine-specific `model-service/config.env` overrides are
+kept outside Git.
 
 ## Build
 

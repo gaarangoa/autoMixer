@@ -11,10 +11,30 @@ const COLORS: [&str; 7] = [
 
 pub fn default_eq() -> Vec<EqBand> {
     vec![
-        EqBand { band_type: EqBandType::LowShelf, frequency_hz: 100.0, gain_db: 0.0, q: 0.7 },
-        EqBand { band_type: EqBandType::Peak, frequency_hz: 400.0, gain_db: 0.0, q: 1.0 },
-        EqBand { band_type: EqBandType::Peak, frequency_hz: 2500.0, gain_db: 0.0, q: 1.0 },
-        EqBand { band_type: EqBandType::HighShelf, frequency_hz: 8000.0, gain_db: 0.0, q: 0.7 },
+        EqBand {
+            band_type: EqBandType::LowShelf,
+            frequency_hz: 100.0,
+            gain_db: 0.0,
+            q: 0.7,
+        },
+        EqBand {
+            band_type: EqBandType::Peak,
+            frequency_hz: 400.0,
+            gain_db: 0.0,
+            q: 1.0,
+        },
+        EqBand {
+            band_type: EqBandType::Peak,
+            frequency_hz: 2500.0,
+            gain_db: 0.0,
+            q: 1.0,
+        },
+        EqBand {
+            band_type: EqBandType::HighShelf,
+            frequency_hz: 8000.0,
+            gain_db: 0.0,
+            q: 0.7,
+        },
     ]
 }
 
@@ -32,8 +52,16 @@ pub fn default_compressor() -> CompressorState {
 
 pub fn default_chain() -> TrackChain {
     TrackChain {
-        high_pass: FilterState { enabled: false, frequency_hz: 40.0, slope_db_oct: 12 },
-        low_pass: FilterState { enabled: false, frequency_hz: 18000.0, slope_db_oct: 12 },
+        high_pass: FilterState {
+            enabled: false,
+            frequency_hz: 40.0,
+            slope_db_oct: 12,
+        },
+        low_pass: FilterState {
+            enabled: false,
+            frequency_hz: 18000.0,
+            slope_db_oct: 12,
+        },
         eq: default_eq(),
         compressor: default_compressor(),
     }
@@ -42,7 +70,10 @@ pub fn default_chain() -> TrackChain {
 pub fn default_master() -> MasterChannel {
     MasterChannel {
         gain_db: 0.0,
-        limiter: LimiterState { enabled: true, ceiling_db: -1.0 },
+        limiter: LimiterState {
+            enabled: true,
+            ceiling_db: -1.0,
+        },
     }
 }
 
@@ -62,7 +93,10 @@ pub fn make_track(source_file_id: String, name: String, index: usize) -> Track {
         input_latency_ms: 0,
         color: COLORS[index % COLORS.len()].to_string(),
         chain: default_chain(),
-        sends: Sends { reverb_db: -60.0, delay_db: -60.0 },
+        sends: Sends {
+            reverb_db: -60.0,
+            delay_db: -60.0,
+        },
         automation: Vec::new(),
         clips_materialized: false,
         clips: Vec::new(),

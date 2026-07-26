@@ -43,7 +43,10 @@ impl AudioThreadHandle {
             .name("automixer-audio".into())
             .spawn(move || run_audio_thread(deps, control_rx))
             .expect("failed to spawn audio thread");
-        Self { control_tx, join: Some(join) }
+        Self {
+            control_tx,
+            join: Some(join),
+        }
     }
 
     pub fn start(&self) {
@@ -65,7 +68,12 @@ impl Drop for AudioThreadHandle {
 }
 
 fn run_audio_thread(deps: AudioThreadDeps, control_rx: Receiver<ControlMessage>) {
-    let AudioThreadDeps { commands, events, shared, config } = deps;
+    let AudioThreadDeps {
+        commands,
+        events,
+        shared,
+        config,
+    } = deps;
 
     let host = cpal::default_host();
     let Some(device) = host.default_output_device() else {
@@ -85,7 +93,13 @@ fn run_audio_thread(deps: AudioThreadDeps, control_rx: Receiver<ControlMessage>)
 
     let sample_rate = stream_config.sample_rate.0 as f32;
     let channels = stream_config.channels;
-    let mixer = Mixer::new(sample_rate, channels, commands, events.clone(), shared.clone());
+    let mixer = Mixer::new(
+        sample_rate,
+        channels,
+        commands,
+        events.clone(),
+        shared.clone(),
+    );
 
     let stream = match build_stream(&device, &stream_config, sample_format, mixer) {
         Ok(stream) => stream,

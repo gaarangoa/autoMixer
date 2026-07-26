@@ -83,16 +83,42 @@ pub fn select_skills(text: &str) -> Vec<String> {
     if has_any(&lower, &["undo", "redo", "revert"]) {
         skills.push("safety_undo".into());
     }
-    if has_any(&lower, &["organize", "prep", "raw", "multitrack", "tracks", "takes", "roles", "rename"]) {
+    if has_any(
+        &lower,
+        &[
+            "organize",
+            "prep",
+            "raw",
+            "multitrack",
+            "tracks",
+            "takes",
+            "roles",
+            "rename",
+        ],
+    ) {
         skills.push("session_prep".into());
     }
-    if has_any(&lower, &["eq", "bright", "dark", "warm", "mud", "harsh", "presence", "rumble", "air", "low", "mid", "high"]) {
+    if has_any(
+        &lower,
+        &[
+            "eq", "bright", "dark", "warm", "mud", "harsh", "presence", "rumble", "air", "low",
+            "mid", "high",
+        ],
+    ) {
         skills.push("tonal_eq".into());
     }
-    if has_any(&lower, &["compress", "punch", "tight", "dynamic", "control"]) {
+    if has_any(
+        &lower,
+        &["compress", "punch", "tight", "dynamic", "control"],
+    ) {
         skills.push("dynamics".into());
     }
-    if has_any(&lower, &["reverb", "delay", "space", "room", "dry", "closer", "deeper"]) {
+    if has_any(
+        &lower,
+        &[
+            "reverb", "delay", "space", "room", "dry", "closer", "deeper",
+        ],
+    ) {
         skills.push("space_depth".into());
     }
     if has_any(&lower, &["chorus", "verse", "hook", "section", "region"]) {
@@ -101,7 +127,14 @@ pub fn select_skills(text: &str) -> Vec<String> {
     if has_any(&lower, &["render", "export", "bounce", "wav"]) {
         skills.push("render_export".into());
     }
-    if skills.is_empty() || has_any(&lower, &["louder", "quieter", "front", "forward", "back", "pan", "wide", "mute", "solo"]) {
+    if skills.is_empty()
+        || has_any(
+            &lower,
+            &[
+                "louder", "quieter", "front", "forward", "back", "pan", "wide", "mute", "solo",
+            ],
+        )
+    {
         skills.insert(0, "balance".into());
     }
     skills.sort();
@@ -126,7 +159,11 @@ fn card(id: &str, name: &str, when: &str, intents: &[&str], actions: &[&str]) ->
         when_to_use: when.to_string(),
         musical_intents: intents.iter().map(|item| item.to_string()).collect(),
         summary_actions: actions.iter().map(|item| item.to_string()).collect(),
-        required_context: vec!["track names".into(), "track roles".into(), "current parameter values".into()],
+        required_context: vec![
+            "track names".into(),
+            "track roles".into(),
+            "current parameter values".into(),
+        ],
     }
 }
 

@@ -63,7 +63,11 @@ fn build_level(samples: &[f32], channels: usize, frames: usize, spp: usize) -> P
         mins.push(lo);
         maxs.push(hi);
     }
-    PeakLevel { samples_per_peak: spp, mins, maxs }
+    PeakLevel {
+        samples_per_peak: spp,
+        mins,
+        maxs,
+    }
 }
 
 fn build_preview(samples: &[f32], channels: usize, frames: usize, bins: usize) -> Vec<f32> {
