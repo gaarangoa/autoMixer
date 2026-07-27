@@ -141,7 +141,7 @@ fn build_render_mixer(
                     gain_db: 0.0,
                     channels: header.channels,
                     sample_rate: header.sample_rate,
-                    buffer: samples,
+                    buffer: samples.into(),
                 });
             }
         } else {
@@ -166,7 +166,7 @@ fn build_render_mixer(
                     gain_db: clip.gain_db,
                     channels: header.channels,
                     sample_rate: header.sample_rate,
-                    buffer: samples,
+                    buffer: samples.into(),
                 });
             }
         }

@@ -16,7 +16,9 @@ pub struct TrackClipSource {
     pub gain_db: f32,
     pub channels: u16,
     pub sample_rate: u32,
-    pub buffer: Vec<f32>,
+    /// Decoded PCM is shared by every clip that references the same cache file.
+    /// Keeping an `Arc` here avoids copying an entire take for repeated regions.
+    pub buffer: Arc<[f32]>,
 }
 
 /// Audio data bound to a track slot. Immutable once published; rebinding is

@@ -364,6 +364,8 @@ mod tests {
                 minimum_timeline_seconds: None,
                 tempo_percent: 100.0,
                 bpm: None,
+                time_signature: Default::default(),
+                project_start_bar: 1,
                 source_files: sources,
                 video_source_files: Vec::new(),
                 tracks: before_tracks.clone(),

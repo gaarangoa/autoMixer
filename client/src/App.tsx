@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertCircle, Aperture, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Copy, Download, FilePlus2, Focus, FolderOpen, Gauge, GitCompareArrows, Info, Keyboard, Maximize2, MessageSquare, Mic, MoveRight, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, Repeat, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X } from "lucide-react";
+import { AlertCircle, Aperture, ArrowDown, ArrowUp, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Copy, Download, FilePlus2, Focus, FolderOpen, Gauge, GitCompareArrows, GripVertical, Info, Keyboard, Magnet, Maximize2, MessageSquare, Mic, MoveRight, Music2, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, Repeat, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X, ZoomIn, ZoomOut } from "lucide-react";
 import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixAlbum, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -10,12 +10,26 @@ import { WebviewWindow, getCurrentWebviewWindow } from "@tauri-apps/api/webviewW
 import { getVersion } from "@tauri-apps/api/app";
 import { api, type ExportAspect, type ExportQuality, type SamSplitProgressEvent, type SplitTrackPreview } from "./api";
 import { recordingTimelineDuration, shouldStopPlaybackAtTimelineEnd } from "./timeline";
+import {
+  barSeconds,
+  beatSeconds,
+  formatMusicalPosition,
+  normalizeTimeSignature,
+  snapSecondsToGrid,
+  type SnapResolution,
+} from "./timelineGrid";
 import { cssAdjustFilter, vignetteStyle, grainStyle, whiteBalanceStyle } from "./videoAdjust";
 
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "gpt-oss:20b";
 const DEFAULT_AGENT_VIDEO_MODEL = "qwen2.5vl:latest";
 const SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS = 180;
+const DEFAULT_TIMELINE_PIXELS_PER_SECOND = 24;
+const MIN_TIMELINE_PIXELS_PER_SECOND = 2;
+const MAX_TIMELINE_PIXELS_PER_SECOND = 480;
+const TIMELINE_INSPECTOR_WIDTH = 208;
+const TIMELINE_LANE_HEAD_WIDTH = 132;
+const TIMELINE_EDGE_SCROLL_ZONE = 72;
 
 // Cap the backing-store resolution of the UI canvases (waveforms, meters). Full Retina
 // 2–3× is wasted GPU fill for these — 1.5× is plenty sharp and noticeably lighter. The
@@ -103,6 +117,14 @@ type ClipDragState = {
   targetStartSeconds?: number;
   valid: boolean;
   copy: boolean;
+  pointerStartX: number;
+  pointerStartY: number;
+  moved: boolean;
+};
+
+type TrackPointerDragState = {
+  pointerId: number;
+  trackIds: string[];
 };
 
 type CameraPreviewTrack = {
@@ -217,6 +239,11 @@ export function App() {
   const videoEditorWindowRef = useRef<WebviewWindow | null>(null);
   const mixerWindowRef = useRef<WebviewWindow | null>(null);
   const trackLanesRef = useRef<HTMLDivElement>(null);
+  const timelineViewportRef = useRef<HTMLDivElement>(null);
+  const timelinePointerRef = useRef<{ x: number; y: number } | null>(null);
+  const timelineAutoScrollFrameRef = useRef<number | null>(null);
+  const clipDragRef = useRef<ClipDragState | null>(null);
+  const trackDropTargetRef = useRef<{ trackId: string; position: "before" | "after" } | null>(null);
   const [project, setProject] = useState<MixProject>();
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
   // Inspector focus is a single track. selectedTrackIds is the independent edit/video
@@ -231,6 +258,12 @@ export function App() {
   const [clipDrag, setClipDrag] = useState<ClipDragState | null>(null);
   const [draggingTrackIds, setDraggingTrackIds] = useState<string[]>([]);
   const [trackDropTarget, setTrackDropTarget] = useState<{ trackId: string; position: "before" | "after" } | null>(null);
+  const [trackPointerDrag, setTrackPointerDrag] = useState<TrackPointerDragState | null>(null);
+  const [timelinePixelsPerSecond, setTimelinePixelsPerSecond] = useState(DEFAULT_TIMELINE_PIXELS_PER_SECOND);
+  const [timelineViewportWidth, setTimelineViewportWidth] = useState(900);
+  const [timelineTailSeconds, setTimelineTailSeconds] = useState(0);
+  const [snapEnabled, setSnapEnabled] = useState(true);
+  const [snapResolution, setSnapResolution] = useState<SnapResolution>("beat");
   const [chatText, setChatText] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -290,6 +323,17 @@ export function App() {
   // Tempo (time-stretch) overlay: percent speed, pitch preserved.
   const [tempoOpen, setTempoOpen] = useState(false);
   const [tempoPercent, setTempoPercent] = useState(100);
+  const [musicalSettingsOpen, setMusicalSettingsOpen] = useState(false);
+  const [bpmDraft, setBpmDraft] = useState("120");
+  const [meterNumeratorDraft, setMeterNumeratorDraft] = useState("4");
+  const [meterDenominatorDraft, setMeterDenominatorDraft] = useState("4");
+  const [projectStartBarDraft, setProjectStartBarDraft] = useState("1");
+  const [metronomeEnabled, setMetronomeEnabled] = useState(
+    () => localStorage.getItem("autoMixer.metronomeEnabled") === "true",
+  );
+  const [metronomeVolumeDb, setMetronomeVolumeDb] = useState(
+    () => Number(localStorage.getItem("autoMixer.metronomeVolumeDb") ?? "-12"),
+  );
   // Sync-to-reference dialog: align a re-recorded take to an existing track.
   const [syncOpen, setSyncOpen] = useState(false);
   const [syncReferenceId, setSyncReferenceId] = useState("");
@@ -554,6 +598,16 @@ export function App() {
     setAgentUsage(null);
     setArmedTrackId(undefined);
   }, [session?.id, project?.chatMessages]);
+
+  // Decode and bind the session while the user is looking at the project, so
+  // the first transport press does not have to perform disk I/O. Later Play
+  // calls are idempotent and reuse the already resident PCM buffers.
+  useEffect(() => {
+    if (!session) return;
+    void api.preparePlayback(session.id).catch((error) => {
+      console.warn("Could not prefetch session audio", error);
+    });
+  }, [session?.id]);
 
   useEffect(() => {
     if (!session) return;
@@ -835,6 +889,9 @@ export function App() {
     // Clicking a tile in the video monitor selects that track here.
     reg(listen<{ trackId: string }>("video-monitor:select", (event) => {
       setSelectedTrackIds([event.payload.trackId]);
+    }));
+    reg(listen<{ sessionId: string; project: MixProject }>("video-monitor:project-updated", (event) => {
+      setProject((prev) => (prev && prev.session.id === event.payload.sessionId ? event.payload.project : prev));
     }));
     // The agent set the selection (select_tracks tool) — mirror it in the UI.
     reg(listen<{ sessionId: string; trackIds: string[] }>("selection:set", (event) => {
@@ -1267,6 +1324,169 @@ export function App() {
   const duration = recordingActive
     ? recordingTimelineDuration(baseDuration, playhead)
     : baseDuration;
+  const projectTimeSignature = normalizeTimeSignature(session?.timeSignature);
+  const projectBpm = Math.max(20, Math.min(400, session?.bpm ?? 120));
+  const timelineVisibleSeconds = Math.max(
+    1,
+    (timelineViewportWidth - TIMELINE_INSPECTOR_WIDTH - TIMELINE_LANE_HEAD_WIDTH)
+      / timelinePixelsPerSecond,
+  );
+  const timelineExtent = Math.max(
+    duration + Math.max(16, timelineVisibleSeconds * 0.35),
+    timelineTailSeconds,
+    timelineVisibleSeconds,
+  );
+  const timelineCanvasWidth = Math.max(1, Math.ceil(timelineExtent * timelinePixelsPerSecond));
+  const timelineBeatPixels = beatSeconds(projectBpm, projectTimeSignature) * timelinePixelsPerSecond;
+  const timelineBarPixels = barSeconds(projectBpm, projectTimeSignature) * timelinePixelsPerSecond;
+  const timelineAlignmentCandidates = useMemo(() => {
+    if (!session) return [];
+    return session.tracks.flatMap((track) => {
+      if (track.kind === "video") {
+        return (track.videoClips ?? []).flatMap((clip) => [
+          clip.startSample / session.sampleRate,
+          clip.endSample / session.sampleRate,
+        ]);
+      }
+      if (track.clips.length > 0 || track.clipsMaterialized) {
+        return track.clips.flatMap((clip) => [
+          clip.startSample / session.sampleRate,
+          clip.endSample / session.sampleRate,
+        ]);
+      }
+      const source = session.sourceFiles.find((item) => item.id === track.sourceFileId);
+      const start = track.startSample / session.sampleRate;
+      return source ? [start, start + source.durationSamples / session.sampleRate] : [start];
+    });
+  }, [session]);
+
+  useEffect(() => {
+    setTimelineTailSeconds(0);
+    setClipDrag(null);
+    clipDragRef.current = null;
+    setDraggingTrackIds([]);
+    setTrackPointerDrag(null);
+    setTrackDropTarget(null);
+  }, [session?.id]);
+
+  useEffect(() => {
+    clipDragRef.current = clipDrag;
+  }, [clipDrag]);
+
+  useEffect(() => {
+    const viewport = timelineViewportRef.current;
+    if (!viewport) return;
+    const updateWidth = () => setTimelineViewportWidth(viewport.clientWidth);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [session?.id]);
+
+  useEffect(() => {
+    localStorage.setItem("autoMixer.metronomeEnabled", String(metronomeEnabled));
+    localStorage.setItem("autoMixer.metronomeVolumeDb", String(metronomeVolumeDb));
+    if (!session) return;
+    void api.setMetronome(
+      metronomeEnabled,
+      projectBpm,
+      projectTimeSignature.numerator,
+      projectTimeSignature.denominator,
+      metronomeVolumeDb,
+    ).catch(pushSystem);
+  }, [
+    metronomeEnabled,
+    metronomeVolumeDb,
+    projectBpm,
+    projectTimeSignature.numerator,
+    projectTimeSignature.denominator,
+    session?.id,
+  ]);
+
+  function changeTimelineZoom(nextPixelsPerSecond: number, anchorClientX?: number) {
+    const next = Math.max(
+      MIN_TIMELINE_PIXELS_PER_SECOND,
+      Math.min(MAX_TIMELINE_PIXELS_PER_SECOND, nextPixelsPerSecond),
+    );
+    if (Math.abs(next - timelinePixelsPerSecond) < 0.001) return;
+    const viewport = timelineViewportRef.current;
+    if (!viewport) {
+      setTimelinePixelsPerSecond(next);
+      return;
+    }
+    const rect = viewport.getBoundingClientRect();
+    const anchorViewportX = Math.max(
+      TIMELINE_INSPECTOR_WIDTH + TIMELINE_LANE_HEAD_WIDTH,
+      Math.min(rect.width, (anchorClientX ?? rect.left + rect.width * 0.62) - rect.left),
+    );
+    const timelineOffset = TIMELINE_INSPECTOR_WIDTH + TIMELINE_LANE_HEAD_WIDTH;
+    const anchorSeconds = Math.max(
+      0,
+      (viewport.scrollLeft + anchorViewportX - timelineOffset) / timelinePixelsPerSecond,
+    );
+    const nextScrollLeft = Math.max(
+      0,
+      anchorSeconds * next + timelineOffset - anchorViewportX,
+    );
+    setTimelinePixelsPerSecond(next);
+    requestAnimationFrame(() => {
+      if (timelineViewportRef.current) {
+        timelineViewportRef.current.scrollLeft = nextScrollLeft;
+      }
+    });
+  }
+
+  function zoomTimelineToProject() {
+    const available = Math.max(
+      200,
+      timelineViewportWidth - TIMELINE_INSPECTOR_WIDTH - TIMELINE_LANE_HEAD_WIDTH - 32,
+    );
+    const next = available / Math.max(8, duration + 4);
+    changeTimelineZoom(next, timelineViewportRef.current?.getBoundingClientRect().right);
+    requestAnimationFrame(() => {
+      if (timelineViewportRef.current) timelineViewportRef.current.scrollLeft = 0;
+    });
+  }
+
+  function zoomTimelineToSelection() {
+    if (!selectedRange) {
+      zoomTimelineToProject();
+      return;
+    }
+    const start = Math.min(selectedRange.start, selectedRange.end);
+    const end = Math.max(selectedRange.start, selectedRange.end);
+    const span = Math.max(0.1, end - start);
+    const available = Math.max(
+      200,
+      timelineViewportWidth - TIMELINE_INSPECTOR_WIDTH - TIMELINE_LANE_HEAD_WIDTH - 40,
+    );
+    const next = Math.max(
+      MIN_TIMELINE_PIXELS_PER_SECOND,
+      Math.min(MAX_TIMELINE_PIXELS_PER_SECOND, available / span),
+    );
+    setTimelinePixelsPerSecond(next);
+    requestAnimationFrame(() => {
+      const viewport = timelineViewportRef.current;
+      if (!viewport) return;
+      viewport.scrollLeft = Math.max(
+        0,
+        start * next + TIMELINE_INSPECTOR_WIDTH + TIMELINE_LANE_HEAD_WIDTH - 20,
+      );
+    });
+  }
+
+  useEffect(() => {
+    const viewport = timelineViewportRef.current;
+    if (!viewport) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (!(event.metaKey || event.ctrlKey)) return;
+      event.preventDefault();
+      const scale = Math.exp(-event.deltaY * 0.0025);
+      changeTimelineZoom(timelinePixelsPerSecond * scale, event.clientX);
+    };
+    viewport.addEventListener("wheel", handleWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", handleWheel);
+  }, [timelinePixelsPerSecond, session?.id, timelineViewportWidth]);
 
   useEffect(() => {
     let frame = 0;
@@ -1349,6 +1569,19 @@ export function App() {
         setSelectedRange(undefined);
         return;
       }
+      if ((event.key === "j" || event.key === "J") && !inField) {
+        event.preventDefault();
+        setSnapEnabled((enabled) => !enabled);
+        return;
+      }
+      const mod = event.metaKey || event.ctrlKey;
+      if (mod && !inField && (event.key === "+" || event.key === "=" || event.key === "-")) {
+        event.preventDefault();
+        changeTimelineZoom(
+          event.key === "-" ? timelinePixelsPerSecond / 1.35 : timelinePixelsPerSecond * 1.35,
+        );
+        return;
+      }
       // M and R: toggle Mute / Record-arm on the selected tracks (or the focused track).
       // First hit selects (mutes/arms), second hit deselects (unmutes/disarms).
       if ((event.key === "m" || event.key === "M" || event.key === "r" || event.key === "R") && !inField && session && !busy) {
@@ -1400,7 +1633,7 @@ export function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [session, selectedClip, selectedRange, selectedTrackIds, focusedTrackId, armedTrackId, armedVideoTrackIds, busy, recording, recordingTrackId]);
+  }, [session, selectedClip, selectedRange, selectedTrackIds, focusedTrackId, armedTrackId, armedVideoTrackIds, busy, recording, recordingTrackId, timelinePixelsPerSecond]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -1520,6 +1753,52 @@ export function App() {
       pushSystem(error);
     } finally {
       setTimelineDurationSaving(false);
+    }
+  }
+
+  function openMusicalSettings() {
+    if (!session) return;
+    const signature = normalizeTimeSignature(session.timeSignature);
+    setBpmDraft(String(Math.round((session.bpm ?? 120) * 100) / 100));
+    setMeterNumeratorDraft(String(signature.numerator));
+    setMeterDenominatorDraft(String(signature.denominator));
+    setProjectStartBarDraft(String(session.projectStartBar ?? 1));
+    setMusicalSettingsOpen(true);
+  }
+
+  async function saveMusicalSettings() {
+    if (!session) return;
+    const bpm = Math.max(20, Math.min(400, Number(bpmDraft) || 120));
+    const numerator = Math.max(1, Math.min(32, Math.round(Number(meterNumeratorDraft) || 4)));
+    const rawDenominator = Math.round(Number(meterDenominatorDraft) || 4);
+    const denominator = [1, 2, 4, 8, 16, 32].includes(rawDenominator) ? rawDenominator : 4;
+    const projectStartBar = Math.max(-9999, Math.min(9999, Math.round(Number(projectStartBarDraft) || 1)));
+    const previousSignature = normalizeTimeSignature(session.timeSignature);
+    const previousBpm = session.bpm ?? null;
+    const previousStartBar = session.projectStartBar ?? 1;
+    setBusy(true);
+    try {
+      const updated = await api.applyPatch(
+        session.id,
+        [
+          { op: "replace", path: "/bpm", value: bpm },
+          { op: "replace", path: "/timeSignature", value: { numerator, denominator } },
+          { op: "replace", path: "/projectStartBar", value: projectStartBar },
+        ],
+        [
+          { op: "replace", path: "/bpm", value: previousBpm },
+          { op: "replace", path: "/timeSignature", value: previousSignature },
+          { op: "replace", path: "/projectStartBar", value: previousStartBar },
+        ],
+        `Set project tempo to ${bpm} BPM in ${numerator}/${denominator}`,
+      );
+      setProject(updated);
+      setMusicalSettingsOpen(false);
+      pushToast("success", `${bpm} BPM · ${numerator}/${denominator}`);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -1872,7 +2151,7 @@ export function App() {
             startSeconds: clip.startSample / session.sampleRate,
             endSeconds: clip.endSample / session.sampleRate,
             localTime: Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000 + playhead - (clip.startSample / session.sampleRate)),
-            layout: normalizeVideoLayout(clip.layout, visibleIndex),
+            layout: normalizeVideoLayout(clip.layout ?? track.videoLayout, visibleIndex),
           }];
         });
         const activeClip = clips.find((clip) => playhead >= clip.startSeconds && playhead <= clip.endSeconds);
@@ -1886,7 +2165,7 @@ export function App() {
           recording: videoRecordingTrackIds.includes(track.id),
           transportPlaying: playing,
           activeClip,
-          defaultLayout: defaultVideoLayout(visibleIndex),
+          defaultLayout: normalizeVideoLayout(track.videoLayout, visibleIndex),
         };
       });
   }
@@ -2248,34 +2527,54 @@ export function App() {
     }
   }
 
-  function beginTrackDrag(trackId: string, event: React.DragEvent) {
-    if (!session) return;
+  function beginTrackPointerDrag(trackId: string, event: ReactPointerEvent<HTMLButtonElement>) {
+    if (!session || event.button !== 0 || busy || recording) return;
+    event.preventDefault();
+    event.stopPropagation();
     const selectedIds = selectedTrackIds.includes(trackId) ? selectedTrackIds : [trackId];
     setSelectedTrackIds(selectedIds);
+    setFocusedTrackId(trackId);
     setSelectedClip(undefined);
+    setSelectedClips([]);
     setSelectedRange((current) => (current && !current.trackId ? current : undefined));
     setDraggingTrackIds(selectedIds);
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", selectedIds.join(","));
+    setTrackPointerDrag({ pointerId: event.pointerId, trackIds: selectedIds });
+    timelinePointerRef.current = { x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture(event.pointerId);
   }
 
-  function updateTrackDropTarget(trackId: string, event: React.DragEvent) {
-    if (!draggingTrackIds.length || draggingTrackIds.includes(trackId)) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
-    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    const position = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
-    setTrackDropTarget({ trackId, position });
+  function updateTrackDropTargetFromPoint(clientX: number, clientY: number) {
+    if (!draggingTrackIds.length) return;
+    const element = document.elementFromPoint(clientX, clientY);
+    const row = element?.closest<HTMLElement>("[data-track-id]");
+    const trackId = row?.dataset.trackId;
+    if (!row || !trackId || draggingTrackIds.includes(trackId)) {
+      trackDropTargetRef.current = null;
+      setTrackDropTarget(null);
+      return;
+    }
+    const rect = row.getBoundingClientRect();
+    const next = {
+      trackId,
+      position: clientY < rect.top + rect.height / 2 ? "before" as const : "after" as const,
+    };
+    trackDropTargetRef.current = next;
+    setTrackDropTarget(next);
   }
 
-  async function dropTracks(trackId: string, event: React.DragEvent) {
-    event.preventDefault();
-    if (!session || !draggingTrackIds.length) return;
-    const position = trackDropTarget?.trackId === trackId ? trackDropTarget.position : "before";
+  async function commitTrackDrop(target: { trackId: string; position: "before" | "after" } | null) {
+    if (!session || !draggingTrackIds.length || !target) {
+      setDraggingTrackIds([]);
+      setTrackDropTarget(null);
+      trackDropTargetRef.current = null;
+      return;
+    }
+    const { trackId, position } = target;
     const movingSet = new Set(draggingTrackIds);
     if (movingSet.has(trackId)) {
       setDraggingTrackIds([]);
       setTrackDropTarget(null);
+      trackDropTargetRef.current = null;
       return;
     }
 
@@ -2311,8 +2610,105 @@ export function App() {
       setBusy(false);
       setDraggingTrackIds([]);
       setTrackDropTarget(null);
+      trackDropTargetRef.current = null;
     }
   }
+
+  async function reorderSelectedTracks(direction: -1 | 1, anchorTrackId?: string, toEdge = false) {
+    if (!session || busy || recording) return;
+    const trackIds = anchorTrackId && !selectedTrackIds.includes(anchorTrackId)
+      ? [anchorTrackId]
+      : selectedTrackIds;
+    if (trackIds.length === 0) return;
+    const movingSet = new Set(trackIds);
+    const moving = session.tracks.filter((track) => movingSet.has(track.id));
+    if (moving.length === 0) return;
+    const firstIndex = session.tracks.findIndex((track) => movingSet.has(track.id));
+    let lastIndex = firstIndex;
+    for (let index = firstIndex + 1; index < session.tracks.length; index += 1) {
+      if (movingSet.has(session.tracks[index].id)) lastIndex = index;
+    }
+    let neighborIndex = -1;
+    if (direction < 0) {
+      for (let index = firstIndex - 1; index >= 0; index -= 1) {
+        if (!movingSet.has(session.tracks[index].id)) {
+          neighborIndex = index;
+          break;
+        }
+      }
+    } else {
+      for (let index = lastIndex + 1; index < session.tracks.length; index += 1) {
+        if (!movingSet.has(session.tracks[index].id)) {
+          neighborIndex = index;
+          break;
+        }
+      }
+    }
+    const remaining = session.tracks.filter((track) => !movingSet.has(track.id));
+    let insertIndex: number;
+    if (toEdge) {
+      insertIndex = direction < 0 ? 0 : remaining.length;
+    } else {
+      if (neighborIndex < 0) return;
+      const neighborId = session.tracks[neighborIndex].id;
+      const remainingNeighborIndex = remaining.findIndex((track) => track.id === neighborId);
+      insertIndex = remainingNeighborIndex + (direction > 0 ? 1 : 0);
+    }
+    const nextTracks = [
+      ...remaining.slice(0, insertIndex),
+      ...moving,
+      ...remaining.slice(insertIndex),
+    ];
+
+    setBusy(true);
+    try {
+      const updated = await api.applyPatch(
+        session.id,
+        [{ op: "replace", path: "/tracks", value: nextTracks }],
+        [{ op: "replace", path: "/tracks", value: session.tracks }],
+        moving.length > 1 ? `Moved ${moving.length} tracks` : `Moved ${moving[0].name}`,
+      );
+      setProject(updated);
+      setSelectedTrackIds(nextTracks.filter((track) => movingSet.has(track.id)).map((track) => track.id));
+      if (anchorTrackId) setFocusedTrackId(anchorTrackId);
+    } catch (error) {
+      pushSystem(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!trackPointerDrag) return;
+    const handleMove = (event: PointerEvent) => {
+      if (event.pointerId !== trackPointerDrag.pointerId) return;
+      timelinePointerRef.current = { x: event.clientX, y: event.clientY };
+      updateTrackDropTargetFromPoint(event.clientX, event.clientY);
+    };
+    const handleUp = (event: PointerEvent) => {
+      if (event.pointerId !== trackPointerDrag.pointerId) return;
+      const target = trackDropTargetRef.current;
+      timelinePointerRef.current = null;
+      setTrackPointerDrag(null);
+      void commitTrackDrop(target);
+    };
+    const handleCancel = (event: PointerEvent) => {
+      if (event.pointerId !== trackPointerDrag.pointerId) return;
+      timelinePointerRef.current = null;
+      setTrackPointerDrag(null);
+      setDraggingTrackIds([]);
+      setTrackDropTarget(null);
+      trackDropTargetRef.current = null;
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleCancel);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleCancel);
+    };
+  }, [trackPointerDrag, draggingTrackIds, session]);
 
   async function deleteSelectedTracks() {
     if (!session || selectedTrackIds.length === 0) return;
@@ -2357,6 +2753,11 @@ export function App() {
       event.preventDefault();
       const step = event.shiftKey ? 0.001 : event.altKey ? 0.1 : 0.01;
       void moveSelectedClip((event.key === "ArrowRight" ? 1 : -1) * step);
+      return;
+    }
+    if ((event.metaKey || event.ctrlKey) && event.shiftKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+      event.preventDefault();
+      void reorderSelectedTracks(event.key === "ArrowDown" ? 1 : -1);
       return;
     }
     const lastSelectedId = selectedTrackIds[selectedTrackIds.length - 1];
@@ -2629,6 +3030,17 @@ export function App() {
     const track = session.tracks[trackIndex];
     const deltaSamples = Math.round(deltaSeconds * session.sampleRate);
     if (deltaSamples === 0) return;
+    if (track.kind !== "video" && clipId === `legacy-${track.id}`) {
+      const nextStart = Math.max(0, track.startSample + deltaSamples);
+      await transferClipToTrack(
+        trackId,
+        clipId,
+        trackId,
+        nextStart / session.sampleRate,
+        false,
+      );
+      return;
+    }
     if (track.kind === "video") {
       const before = track.videoClips ?? [];
       const clip = before.find((item) => item.id === clipId);
@@ -2667,6 +3079,215 @@ export function App() {
     setProject(updated);
     setSelectedClip({ trackId, clipId });
   }
+
+  function snapTimelinePosition(rawSeconds: number, originalSeconds: number) {
+    if (!snapEnabled || !session) {
+      return { seconds: Math.max(0, rawSeconds), guide: undefined as number | undefined };
+    }
+    const grid = session.bpm
+      ? snapSecondsToGrid(rawSeconds, projectBpm, projectTimeSignature, snapResolution)
+      : Math.max(0, rawSeconds);
+    const magnetic = nearestAlignment(
+      rawSeconds,
+      timelineAlignmentCandidates,
+      originalSeconds,
+      Math.max(0.004, 10 / timelinePixelsPerSecond),
+    );
+    if (magnetic !== undefined) return { seconds: magnetic, guide: magnetic };
+    return { seconds: grid, guide: grid };
+  }
+
+  function beginClipPointerDrag(
+    trackId: string,
+    clipId: string,
+    kind: "audio" | "video",
+    startSeconds: number,
+    durationSeconds: number,
+    grabOffsetSeconds: number,
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) {
+    if (!session || event.button !== 0 || cutToolActive || busy) return;
+    if ((recording && recordingTrackId === trackId) || videoRecordingTrackIds.includes(trackId)) {
+      pushToast("error", "Stop recording before moving clips on that track.");
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const next: ClipDragState = {
+      sourceTrackId: trackId,
+      clipId,
+      kind,
+      originalStartSeconds: startSeconds,
+      durationSeconds,
+      grabOffsetSeconds,
+      targetTrackId: trackId,
+      targetStartSeconds: startSeconds,
+      valid: true,
+      copy: event.altKey,
+      pointerStartX: event.clientX,
+      pointerStartY: event.clientY,
+      moved: false,
+    };
+    timelinePointerRef.current = { x: event.clientX, y: event.clientY };
+    clipDragRef.current = next;
+    setClipDrag(next);
+  }
+
+  function updateClipDragFromPoint(
+    clientX: number,
+    clientY: number,
+    options?: { copy?: boolean; bypassSnap?: boolean },
+  ) {
+    const active = clipDragRef.current;
+    if (!active || !session) return;
+    const element = document.elementFromPoint(clientX, clientY);
+    const row = element?.closest<HTMLElement>("[data-track-id]");
+    const targetTrackId = row?.dataset.trackId;
+    const targetTrack = session.tracks.find((track) => track.id === targetTrackId);
+    const lane = row?.querySelector<HTMLElement>(".wave-wrap");
+    if (!targetTrack || !targetTrackId || !lane) {
+      const invalid = { ...active, valid: false, copy: options?.copy ?? active.copy };
+      clipDragRef.current = invalid;
+      setClipDrag(invalid);
+      setAlignmentGuideSeconds(undefined);
+      return;
+    }
+    const laneRect = lane.getBoundingClientRect();
+    const pointerSeconds = Math.max(0, (clientX - laneRect.left) / timelinePixelsPerSecond);
+    const rawStart = Math.max(0, pointerSeconds - active.grabOffsetSeconds);
+    const snapped = options?.bypassSnap
+      ? { seconds: rawStart, guide: undefined as number | undefined }
+      : snapTimelinePosition(rawStart, active.originalStartSeconds);
+    const valid = active.kind === (targetTrack.kind === "video" ? "video" : "audio");
+    const next: ClipDragState = {
+      ...active,
+      targetTrackId,
+      targetStartSeconds: snapped.seconds,
+      valid,
+      copy: options?.copy ?? active.copy,
+      moved: active.moved
+        || Math.hypot(clientX - active.pointerStartX, clientY - active.pointerStartY) >= 3,
+    };
+    const requiredEnd = snapped.seconds + active.durationSeconds + Math.max(16, timelineVisibleSeconds * 0.35);
+    if (requiredEnd > timelineExtent) {
+      setTimelineTailSeconds(requiredEnd);
+    }
+    clipDragRef.current = next;
+    setClipDrag(next);
+    setAlignmentGuideSeconds(valid ? snapped.guide : undefined);
+  }
+
+  useEffect(() => {
+    if (!clipDrag) return;
+    const handleMove = (event: PointerEvent) => {
+      timelinePointerRef.current = { x: event.clientX, y: event.clientY };
+      updateClipDragFromPoint(event.clientX, event.clientY, {
+        copy: event.altKey,
+        bypassSnap: event.metaKey || event.ctrlKey,
+      });
+    };
+    const finish = (event: PointerEvent, cancelled: boolean) => {
+      const active = clipDragRef.current;
+      if (!cancelled) {
+        updateClipDragFromPoint(event.clientX, event.clientY, {
+          copy: event.altKey,
+          bypassSnap: event.metaKey || event.ctrlKey,
+        });
+      }
+      const finalDrag = clipDragRef.current ?? active;
+      timelinePointerRef.current = null;
+      clipDragRef.current = null;
+      setClipDrag(null);
+      setAlignmentGuideSeconds(undefined);
+      if (
+        !cancelled
+        && finalDrag?.moved
+        && finalDrag.valid
+        && finalDrag.targetTrackId
+        && finalDrag.targetStartSeconds !== undefined
+      ) {
+        void transferClipToTrack(
+          finalDrag.sourceTrackId,
+          finalDrag.clipId,
+          finalDrag.targetTrackId,
+          finalDrag.targetStartSeconds,
+          finalDrag.copy,
+        );
+      }
+    };
+    const handleUp = (event: PointerEvent) => finish(event, false);
+    const handleCancel = (event: PointerEvent) => finish(event, true);
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleCancel);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleCancel);
+    };
+  }, [
+    clipDrag?.clipId,
+    session,
+    snapEnabled,
+    snapResolution,
+    timelinePixelsPerSecond,
+    timelineExtent,
+    timelineVisibleSeconds,
+  ]);
+
+  useEffect(() => {
+    if (!clipDrag && !trackPointerDrag) return;
+    const tick = () => {
+      const viewport = timelineViewportRef.current;
+      const pointer = timelinePointerRef.current;
+      if (!viewport || !pointer) {
+        timelineAutoScrollFrameRef.current = requestAnimationFrame(tick);
+        return;
+      }
+      const rect = viewport.getBoundingClientRect();
+      let dx = 0;
+      let dy = 0;
+      if (clipDrag) {
+        const leftEdge = rect.left + TIMELINE_INSPECTOR_WIDTH + TIMELINE_LANE_HEAD_WIDTH;
+        const rightEdge = rect.right;
+        if (pointer.x < leftEdge + TIMELINE_EDGE_SCROLL_ZONE) {
+          const strength = Math.min(1, (leftEdge + TIMELINE_EDGE_SCROLL_ZONE - pointer.x) / TIMELINE_EDGE_SCROLL_ZONE);
+          dx = -Math.max(2, strength * 24);
+        } else if (pointer.x > rightEdge - TIMELINE_EDGE_SCROLL_ZONE) {
+          const strength = Math.min(1, (pointer.x - (rightEdge - TIMELINE_EDGE_SCROLL_ZONE)) / TIMELINE_EDGE_SCROLL_ZONE);
+          dx = Math.max(2, strength * 24);
+        }
+      }
+      if (pointer.y < rect.top + TIMELINE_EDGE_SCROLL_ZONE) {
+        const strength = Math.min(1, (rect.top + TIMELINE_EDGE_SCROLL_ZONE - pointer.y) / TIMELINE_EDGE_SCROLL_ZONE);
+        dy = -Math.max(2, strength * 18);
+      } else if (pointer.y > rect.bottom - TIMELINE_EDGE_SCROLL_ZONE) {
+        const strength = Math.min(1, (pointer.y - (rect.bottom - TIMELINE_EDGE_SCROLL_ZONE)) / TIMELINE_EDGE_SCROLL_ZONE);
+        dy = Math.max(2, strength * 18);
+      }
+      if (dx !== 0 || dy !== 0) {
+        const previousLeft = viewport.scrollLeft;
+        const previousTop = viewport.scrollTop;
+        viewport.scrollBy(dx, dy);
+        if (viewport.scrollLeft !== previousLeft || viewport.scrollTop !== previousTop) {
+          if (clipDragRef.current) {
+            updateClipDragFromPoint(pointer.x, pointer.y);
+          } else if (trackPointerDrag) {
+            updateTrackDropTargetFromPoint(pointer.x, pointer.y);
+          }
+        }
+      }
+      timelineAutoScrollFrameRef.current = requestAnimationFrame(tick);
+    };
+    timelineAutoScrollFrameRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (timelineAutoScrollFrameRef.current !== null) {
+        cancelAnimationFrame(timelineAutoScrollFrameRef.current);
+        timelineAutoScrollFrameRef.current = null;
+      }
+    };
+  }, [clipDrag?.clipId, trackPointerDrag?.pointerId, timelinePixelsPerSecond, session]);
 
   async function transferClipToTrack(
     sourceTrackId: string,
@@ -4159,12 +4780,21 @@ export function App() {
                 >
                   <Plus size={11} />
                 </button>
-                {session.bpm ? <span className="lcd-bars">{formatBars(playhead, session.bpm)}</span> : null}
+                <span className="lcd-bars">
+                  {formatMusicalPosition(
+                    playhead,
+                    projectBpm,
+                    projectTimeSignature,
+                    session.projectStartBar ?? 1,
+                  )}
+                </span>
               </div>
               <div className="lcd-sub">
                 <span>{session.tracks.length} TRK</span>
                 <span>{Math.round(session.sampleRate / 100) / 10} kHz</span>
-                {session.bpm ? <span>{Math.round(session.bpm)} BPM</span> : null}
+                <button type="button" className="lcd-musical-button" onClick={openMusicalSettings}>
+                  {Math.round(projectBpm * 100) / 100} BPM · {projectTimeSignature.numerator}/{projectTimeSignature.denominator}
+                </button>
                 <TransportMeter />
               </div>
             </div>
@@ -4585,7 +5215,70 @@ export function App() {
             </div>
           );
         })()}
-        <div className="timeline">
+        <div className="timeline-toolbar" role="toolbar" aria-label="Timeline tools">
+          <div className="timeline-toolbar-group musical">
+            <button
+              type="button"
+              className={metronomeEnabled ? "active" : ""}
+              onClick={() => setMetronomeEnabled((enabled) => !enabled)}
+              title={metronomeEnabled ? "Turn metronome off" : "Turn metronome on"}
+              aria-pressed={metronomeEnabled}
+            >
+              <Music2 size={14} />
+              <span>Click</span>
+            </button>
+            <button type="button" onClick={openMusicalSettings} title="Project tempo and time signature">
+              <span>{Math.round(projectBpm * 100) / 100} BPM</span>
+              <strong>{projectTimeSignature.numerator}/{projectTimeSignature.denominator}</strong>
+            </button>
+          </div>
+          <div className="timeline-toolbar-group snap">
+            <button
+              type="button"
+              className={snapEnabled ? "active" : ""}
+              onClick={() => setSnapEnabled((enabled) => !enabled)}
+              title="Toggle grid snap (J)"
+              aria-pressed={snapEnabled}
+            >
+              <Magnet size={14} />
+              <span>Snap</span>
+            </button>
+            <select
+              value={snapResolution}
+              onChange={(event) => setSnapResolution(event.target.value as SnapResolution)}
+              disabled={!snapEnabled}
+              aria-label="Snap resolution"
+            >
+              <option value="bar">Bar</option>
+              <option value="beat">Beat</option>
+              <option value="1/2">1/2</option>
+              <option value="1/4">1/4</option>
+              <option value="1/8">1/8</option>
+              <option value="1/16">1/16</option>
+            </select>
+          </div>
+          <div className="timeline-toolbar-spacer" />
+          <div className="timeline-toolbar-group zoom">
+            <button type="button" onClick={() => changeTimelineZoom(timelinePixelsPerSecond / 1.35)} title="Zoom out">
+              <ZoomOut size={14} />
+            </button>
+            <input
+              type="range"
+              min={Math.log2(MIN_TIMELINE_PIXELS_PER_SECOND)}
+              max={Math.log2(MAX_TIMELINE_PIXELS_PER_SECOND)}
+              step="0.05"
+              value={Math.log2(timelinePixelsPerSecond)}
+              onChange={(event) => changeTimelineZoom(2 ** Number(event.target.value))}
+              aria-label="Timeline zoom"
+            />
+            <button type="button" onClick={() => changeTimelineZoom(timelinePixelsPerSecond * 1.35)} title="Zoom in">
+              <ZoomIn size={14} />
+            </button>
+            <button type="button" onClick={zoomTimelineToProject} title="Fit the whole project">Fit</button>
+            <button type="button" onClick={zoomTimelineToSelection} title="Fit the selected range">Sel</button>
+          </div>
+        </div>
+        <div className="timeline" ref={timelineViewportRef}>
           <div className="daw-workspace">
             <TrackInspector
               track={focusedTrackId ? session.tracks.find((track) => track.id === focusedTrackId) : undefined}
@@ -4641,6 +5334,15 @@ export function App() {
             <div
               ref={trackLanesRef}
               className="track-lanes"
+              style={{
+                width: `${TIMELINE_LANE_HEAD_WIDTH + timelineCanvasWidth}px`,
+                ['--lane-head-w' as string]: `${TIMELINE_LANE_HEAD_WIDTH}px`,
+                ['--timeline-canvas-w' as string]: `${timelineCanvasWidth}px`,
+                ['--timeline-beat-px' as string]: `${timelineBeatPixels}px`,
+                ['--timeline-bar-px' as string]: `${timelineBarPixels}px`,
+                ['--timeline-beat-grid-color' as string]: timelineBeatPixels >= 7 ? "rgba(215, 177, 90, 0.075)" : "transparent",
+                ['--timeline-bar-grid-color' as string]: timelineBarPixels >= 4 ? "rgba(215, 177, 90, 0.17)" : "transparent",
+              }}
               tabIndex={0}
               role="listbox"
               aria-label="Tracks"
@@ -4648,9 +5350,12 @@ export function App() {
               onKeyDown={handleTrackLaneKeyDown}
             >
               <TimeRuler
-                duration={duration}
+                duration={timelineExtent}
                 playhead={playhead}
-                bpm={session.bpm}
+                bpm={projectBpm}
+                timeSignature={projectTimeSignature}
+                projectStartBar={session.projectStartBar ?? 1}
+                pixelsPerSecond={timelinePixelsPerSecond}
                 selection={selectedRange}
                 loopActive={!!(loopSection && selectedRange &&
                   Math.abs(loopSection.start - Math.min(selectedRange.start, selectedRange.end)) < 0.01 &&
@@ -4688,7 +5393,7 @@ export function App() {
                     : { start: lo, end: hi });
                 }}
               />
-              {selectedRange && !selectedRange.trackId && duration > 0 && Math.abs(selectedRange.end - selectedRange.start) > 0.02 ? (
+              {selectedRange && !selectedRange.trackId && timelineExtent > 0 && Math.abs(selectedRange.end - selectedRange.start) > 0.02 ? (
                 <div className="lane-region-overlay" aria-hidden="true">
                   <div
                     className={`lane-region-band ${loopSection
@@ -4696,24 +5401,24 @@ export function App() {
                       && Math.abs(loopSection.end - Math.max(selectedRange.start, selectedRange.end)) < 0.01
                       ? "active" : ""}`}
                     style={{
-                      left: `${(Math.min(selectedRange.start, selectedRange.end) / duration) * 100}%`,
-                      width: `${(Math.abs(selectedRange.end - selectedRange.start) / duration) * 100}%`,
+                      left: `${TIMELINE_LANE_HEAD_WIDTH + Math.min(selectedRange.start, selectedRange.end) * timelinePixelsPerSecond}px`,
+                      width: `${Math.abs(selectedRange.end - selectedRange.start) * timelinePixelsPerSecond}px`,
                     }}
                   />
                 </div>
               ) : null}
-              {cutToolActive && cutCursorSeconds !== undefined && duration > 0 ? (
+              {cutToolActive && cutCursorSeconds !== undefined && timelineExtent > 0 ? (
                 <div className="lane-region-overlay" aria-hidden="true">
                   <div
                     className="lane-cut-cursor"
-                    style={{ left: `${Math.max(0, Math.min(100, (cutCursorSeconds / duration) * 100))}%` }}
+                    style={{ left: `${TIMELINE_LANE_HEAD_WIDTH + Math.max(0, cutCursorSeconds) * timelinePixelsPerSecond}px` }}
                   />
                 </div>
               ) : null}
-              {session.sections && session.sections.length > 0 && duration > 0 ? (
+              {session.sections && session.sections.length > 0 && timelineExtent > 0 ? (
                 <SectionRibbon
                   sections={session.sections}
-                  duration={duration}
+                  duration={timelineExtent}
                   playhead={playhead}
                   scopedIndex={scopedSection?.index ?? null}
                   loopRange={loopSection}
@@ -4755,14 +5460,6 @@ export function App() {
               ) : (() => {
                 const hasAudioSolo = session.tracks.some((track) => track.kind !== "video" && track.solo);
                 const hasVideoSolo = session.tracks.some((track) => track.kind === "video" && track.solo);
-                const alignmentCandidates = session.tracks.flatMap((candidateTrack) => {
-                  if (candidateTrack.kind === "video") {
-                    return (candidateTrack.videoClips ?? []).map((clip) => clip.startSample / session.sampleRate);
-                  }
-                  return candidateTrack.clips.length > 0 || candidateTrack.clipsMaterialized
-                    ? candidateTrack.clips.map((clip) => clip.startSample / session.sampleRate)
-                    : [candidateTrack.startSample / session.sampleRate];
-                });
                 return session.tracks.map((track, trackIndex) => {
                   const sourceById = new Map(session.sourceFiles.map((item) => [item.id, item]));
                   const videoSourceById = new Map((session.videoSourceFiles ?? []).map((item) => [item.id, item]));
@@ -4808,7 +5505,8 @@ export function App() {
                       peak={playing ? (trackPeaks[trackIndex] ?? 0) : 0}
                       playhead={playhead}
                       transportPlaying={playing}
-                      duration={duration}
+                      duration={timelineExtent}
+                      pixelsPerSecond={timelinePixelsPerSecond}
                       alignmentGuideSeconds={alignmentGuideSeconds}
                       clips={clips}
                       selectedClipId={selectedClip?.trackId === track.id ? selectedClip.clipId : undefined}
@@ -4843,6 +5541,10 @@ export function App() {
                         }
                         setFocusedTrackId(track.id);
                       }}
+                      onFocusTrack={() => {
+                        setFocusedTrackId(track.id);
+                        setSelectedTrackIds((ids) => ids.includes(track.id) ? ids : [track.id]);
+                      }}
                       onClipSelect={(clipId, additive) => {
                         trackLanesRef.current?.focus({ preventScroll: true });
                         // Selecting a clip never moves the playhead or the playback anchor —
@@ -4874,60 +5576,18 @@ export function App() {
                         setSelectedClip({ trackId: track.id, clipId });
                         setClipMenu({ x: event.clientX, y: event.clientY });
                       }}
-                      onClipDragStart={(clipId, grabOffsetSeconds, event) => {
+                      onClipPointerDragStart={(clipId, grabOffsetSeconds, event) => {
                         const clip = clips.find((item) => item.id === clipId);
                         if (!clip) return;
-                        event.dataTransfer.effectAllowed = "copyMove";
-                        event.dataTransfer.setData("text/plain", `${track.id}:${clipId}`);
-                        setClipDrag({
-                          sourceTrackId: track.id,
+                        beginClipPointerDrag(
+                          track.id,
                           clipId,
-                          kind: clip.kind ?? "audio",
-                          originalStartSeconds: clip.startSeconds,
-                          durationSeconds: clip.sourceSeconds,
+                          clip.kind ?? "audio",
+                          clip.startSeconds,
+                          clip.sourceSeconds,
                           grabOffsetSeconds,
-                          targetTrackId: track.id,
-                          targetStartSeconds: clip.startSeconds,
-                          valid: true,
-                          copy: event.altKey,
-                        });
-                      }}
-                      onClipDragOver={(atSeconds, event) => {
-                        if (!clipDrag) return;
-                        const valid = clipDrag.kind === (isVideo ? "video" : "audio");
-                        if (valid) event.preventDefault();
-                        event.stopPropagation();
-                        const copy = event.altKey;
-                        event.dataTransfer.dropEffect = copy ? "copy" : "move";
-                        const rawStart = Math.max(0, atSeconds - clipDrag.grabOffsetSeconds);
-                        const aligned = nearestAlignment(rawStart, alignmentCandidates, clipDrag.originalStartSeconds);
-                        const targetStartSeconds = aligned ?? rawStart;
-                        setAlignmentGuideSeconds(aligned);
-                        setClipDrag((current) => current ? {
-                          ...current,
-                          targetTrackId: track.id,
-                          targetStartSeconds,
-                          valid,
-                          copy,
-                        } : current);
-                      }}
-                      onClipDrop={(atSeconds, event) => {
-                        const active = clipDrag;
-                        if (!active) return;
-                        event.stopPropagation();
-                        const valid = active.kind === (isVideo ? "video" : "audio");
-                        if (valid) event.preventDefault();
-                        const rawStart = Math.max(0, atSeconds - active.grabOffsetSeconds);
-                        const aligned = nearestAlignment(rawStart, alignmentCandidates, active.originalStartSeconds);
-                        const startSeconds = aligned ?? rawStart;
-                        const copy = event.altKey;
-                        setClipDrag(null);
-                        setAlignmentGuideSeconds(undefined);
-                        if (valid) void transferClipToTrack(active.sourceTrackId, active.clipId, track.id, startSeconds, copy);
-                      }}
-                      onClipDragEnd={() => {
-                        setClipDrag(null);
-                        setAlignmentGuideSeconds(undefined);
+                          event,
+                        );
                       }}
                       cutToolActive={cutToolActive}
                       onClipCut={(clipId, atSeconds) => void splitClip(track.id, clipId, atSeconds)}
@@ -4983,8 +5643,10 @@ export function App() {
                       onSolo={() => void updateTrack(track, { solo: !track.solo })}
                       onSeek={(seconds) => seekTo(seconds)}
                       onChange={(patch) => void updateTrack(track, patch)}
-                      onDragOver={(event) => updateTrackDropTarget(track.id, event)}
-                      onDrop={(event) => void dropTracks(track.id, event)}
+                      draggingTrack={draggingTrackIds.includes(track.id)}
+                      dropPosition={trackDropTarget?.trackId === track.id ? trackDropTarget.position : undefined}
+                      onTrackPointerDragStart={(event) => beginTrackPointerDrag(track.id, event)}
+                      onMoveTrack={(direction, toEdge) => void reorderSelectedTracks(direction, track.id, toEdge)}
                     />
                   );
                 });
@@ -5568,6 +6230,92 @@ export function App() {
           </div>
         </div>
       ) : null}
+      {musicalSettingsOpen && session ? (
+        <div className="settings-backdrop" onPointerDown={() => setMusicalSettingsOpen(false)}>
+          <form
+            className="settings-modal musical-settings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Project tempo and meter"
+            onPointerDown={(event) => event.stopPropagation()}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveMusicalSettings();
+            }}
+          >
+            <header className="settings-modal-head">
+              <h2>Project Tempo & Meter</h2>
+              <button type="button" className="icon-btn" onClick={() => setMusicalSettingsOpen(false)} aria-label="Close"><X size={18} /></button>
+            </header>
+            <div className="settings-modal-body">
+              <section className="settings-group musical-settings-grid">
+                <label className="settings-field">
+                  <span>BPM</span>
+                  <input
+                    type="number"
+                    min="20"
+                    max="400"
+                    step="0.01"
+                    value={bpmDraft}
+                    onChange={(event) => setBpmDraft(event.target.value)}
+                  />
+                </label>
+                <label className="settings-field">
+                  <span>Beats per bar</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="32"
+                    step="1"
+                    value={meterNumeratorDraft}
+                    onChange={(event) => setMeterNumeratorDraft(event.target.value)}
+                  />
+                </label>
+                <label className="settings-field">
+                  <span>Beat unit</span>
+                  <select value={meterDenominatorDraft} onChange={(event) => setMeterDenominatorDraft(event.target.value)}>
+                    {[1, 2, 4, 8, 16, 32].map((value) => <option key={value} value={value}>1/{value}</option>)}
+                  </select>
+                </label>
+                <label className="settings-field">
+                  <span>First bar number</span>
+                  <input
+                    type="number"
+                    min="-9999"
+                    max="9999"
+                    step="1"
+                    value={projectStartBarDraft}
+                    onChange={(event) => setProjectStartBarDraft(event.target.value)}
+                  />
+                </label>
+              </section>
+              <section className="settings-group">
+                <div className="settings-group-title">Metronome</div>
+                <label className="settings-field metronome-volume-field">
+                  <span>Click volume</span>
+                  <input
+                    type="range"
+                    min="-36"
+                    max="0"
+                    step="1"
+                    value={metronomeVolumeDb}
+                    onChange={(event) => setMetronomeVolumeDb(Number(event.target.value))}
+                  />
+                  <strong>{Math.round(metronomeVolumeDb)} dB</strong>
+                </label>
+              </section>
+              <p className="settings-group-desc">
+                Project tempo controls the ruler, snapping, and metronome. It does not stretch existing audio.
+                Use the separate Tempo tool when you intentionally want to time-stretch the song.
+              </p>
+              <div className="download-actions">
+                <button type="button" className="download-cancel" onClick={() => setMusicalSettingsOpen(false)}>Cancel</button>
+                <button type="submit" className="download-export" disabled={busy}>Save</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      ) : null}
       {tempoOpen && session ? (
         <div className="settings-backdrop" onPointerDown={() => setTempoOpen(false)}>
           <div className="settings-modal tempo-modal" role="dialog" aria-modal="true" aria-label="Change tempo" onPointerDown={(e) => e.stopPropagation()}>
@@ -5986,7 +6734,12 @@ export function App() {
                 [`${SHIFT_KEY}${MOD_KEY}Z`, "Redo"],
                 ["← →", `Nudge selected clip 10 ms (${ALT_KEY} = 100 ms, ${SHIFT_KEY} = 1 ms)`],
                 ["Drag clip", `Move between compatible tracks (${ALT_KEY} = copy)`],
+                [`${MOD_KEY} drag clip`, "Temporarily bypass grid snapping"],
                 ["↑ ↓", `Select previous / next track (${SHIFT_KEY} extends)`],
+                [`${SHIFT_KEY}${MOD_KEY} ↑ ↓`, "Move selected track(s) up / down"],
+                ["J", "Toggle timeline snapping"],
+                [`${MOD_KEY} + / −`, "Zoom the timeline in / out"],
+                [`${MOD_KEY} mouse wheel`, "Zoom around the pointer"],
                 ["Delete", "Delete selected clip, range, or selection"],
                 [`${SHIFT_KEY} Delete`, "Delete selected tracks"],
                 ["Esc", "Clear selection / close dialogs"],
@@ -6165,12 +6918,12 @@ function summarizeClipEditResult(
   return lines.join("\n");
 }
 
-// Pick "nice" tick marks (1/2/5/10/15/30/60... seconds) so the ruler shows ~6-10 labels.
-function buildRulerTicks(duration: number): number[] {
+// Pick clock ticks based on zoom. Keep the total bounded for very long sessions.
+function buildRulerTicks(duration: number, pixelsPerSecond: number): number[] {
   if (!(duration > 0)) return [];
-  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
-  const target = duration / 8;
-  const step = steps.find((value) => value >= target) ?? Math.ceil(target / 60) * 60;
+  const steps = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200];
+  const minimumStep = Math.max(0.1, 72 / Math.max(0.01, pixelsPerSecond), duration / 1800);
+  const step = steps.find((value) => value >= minimumStep) ?? Math.ceil(minimumStep / 600) * 600;
   const ticks: number[] = [];
   for (let t = 0; t <= duration + 0.001; t += step) ticks.push(Math.round(t * 1000) / 1000);
   return ticks;
@@ -6183,6 +6936,9 @@ function TimeRuler({
   selection,
   loopActive,
   bpm,
+  timeSignature,
+  projectStartBar,
+  pixelsPerSecond,
   onSeek,
   onSelect,
   onMove,
@@ -6194,6 +6950,9 @@ function TimeRuler({
   selection?: { start: number; end: number };
   loopActive: boolean;
   bpm?: number;
+  timeSignature?: { numerator: number; denominator: number };
+  projectStartBar: number;
+  pixelsPerSecond: number;
   onSeek: (seconds: number) => void;
   onSelect: (start: number, end: number) => void;
   onMove: (start: number, end: number) => void;
@@ -6207,7 +6966,7 @@ function TimeRuler({
   const secondsFromClientX = (clientX: number) => {
     const rect = wrapRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return 0;
-    return Math.max(0, Math.min(duration, ((clientX - rect.left) / rect.width) * duration));
+    return Math.max(0, Math.min(duration, (clientX - rect.left) / pixelsPerSecond));
   };
   // Drag a selection edge: keep the opposite edge fixed and move this one to the pointer.
   const handleEdgeDown = (edge: "start" | "end", event: React.PointerEvent<HTMLDivElement>) => {
@@ -6295,31 +7054,36 @@ function TimeRuler({
       onSeek(seconds);
     }
   };
-  const ticks = buildRulerTicks(duration);
-  // Bar marks when the session has a tempo. Memoized: the ruler re-renders at
-  // playhead rate, but the bar grid only changes with bpm/duration.
-  const barMarks = useMemo(() => {
+  const ticks = buildRulerTicks(duration, pixelsPerSecond);
+  // Musical grid marks. Beat lines are hidden automatically when zoomed too far out.
+  const musicalMarks = useMemo(() => {
     if (!bpm || bpm <= 0 || duration <= 0) return [];
-    const barSeconds = 240 / bpm;
-    const totalBars = Math.floor(duration / barSeconds) + 1;
-    const labelEvery = totalBars > 96 ? 8 : totalBars > 48 ? 4 : totalBars > 24 ? 2 : 1;
-    const renderEvery = totalBars > 240 ? labelEvery : 1;
-    const marks: { bar: number; left: number; labeled: boolean }[] = [];
-    for (let bar = 1; bar <= totalBars; bar++) {
-      if ((bar - 1) % renderEvery !== 0) continue;
+    const signature = normalizeTimeSignature(timeSignature);
+    const beatLength = beatSeconds(bpm, signature);
+    const totalBeats = Math.floor(duration / beatLength) + 1;
+    const renderBeats = beatLength * pixelsPerSecond >= 7;
+    const totalBars = Math.ceil(totalBeats / signature.numerator);
+    const labelEveryBars = totalBars > 256 ? 16 : totalBars > 128 ? 8 : totalBars > 64 ? 4 : totalBars > 32 ? 2 : 1;
+    const marks: { key: number; bar: number; beat: number; left: number; labeled: boolean }[] = [];
+    for (let index = 0; index < totalBeats; index++) {
+      const beat = index % signature.numerator;
+      if (beat !== 0 && !renderBeats) continue;
+      const bar = Math.floor(index / signature.numerator);
       marks.push({
-        bar,
-        left: (((bar - 1) * barSeconds) / duration) * 100,
-        labeled: (bar - 1) % labelEvery === 0,
+        key: index,
+        bar: projectStartBar + bar,
+        beat: beat + 1,
+        left: index * beatLength * pixelsPerSecond,
+        labeled: beat === 0 && bar % labelEveryBars === 0,
       });
     }
     return marks;
-  }, [bpm, duration]);
-  const cursorPct = duration > 0 ? Math.max(0, Math.min(100, (playhead / duration) * 100)) : 0;
+  }, [bpm, duration, pixelsPerSecond, projectStartBar, timeSignature?.numerator, timeSignature?.denominator]);
+  const cursorLeft = Math.max(0, playhead * pixelsPerSecond);
   const selStart = selection ? Math.min(selection.start, selection.end) : 0;
   const selEnd = selection ? Math.max(selection.start, selection.end) : 0;
-  const selLeftPct = duration > 0 ? (selStart / duration) * 100 : 0;
-  const selWidthPct = duration > 0 ? ((selEnd - selStart) / duration) * 100 : 0;
+  const selLeft = selStart * pixelsPerSecond;
+  const selWidth = (selEnd - selStart) * pixelsPerSecond;
   return (
     <div className="time-ruler">
       <div className="time-ruler-spacer" />
@@ -6332,23 +7096,23 @@ function TimeRuler({
         title="Drag to select a region. Click to set the playhead."
       >
         {ticks.map((tick) => (
-          <div key={tick} className="time-ruler-tick" style={{ left: `${duration > 0 ? (tick / duration) * 100 : 0}%` }}>
+          <div key={tick} className="time-ruler-tick" style={{ left: `${tick * pixelsPerSecond}px` }}>
             <span>{formatTime(tick)}</span>
           </div>
         ))}
-        {barMarks.map((mark) => (
+        {musicalMarks.map((mark) => (
           <div
-            key={`bar-${mark.bar}`}
-            className={`time-ruler-bar ${mark.labeled ? "labeled" : ""}`}
-            style={{ left: `${mark.left}%` }}
+            key={`beat-${mark.key}`}
+            className={`time-ruler-bar ${mark.beat === 1 ? "bar" : "beat"} ${mark.labeled ? "labeled" : ""}`}
+            style={{ left: `${mark.left}px` }}
           >
             {mark.labeled ? <span>{mark.bar}</span> : null}
           </div>
         ))}
-        {selection && selWidthPct > 0.05 ? (
+        {selection && selWidth > 1 ? (
           <div
             className={`time-ruler-selection ${loopActive ? "active" : ""}`}
-            style={{ left: `${selLeftPct}%`, width: `${selWidthPct}%` }}
+            style={{ left: `${selLeft}px`, width: `${selWidth}px` }}
             onPointerDown={handleBandDown}
             onPointerMove={handleBandMove}
             onPointerUp={handleBandUp}
@@ -6370,7 +7134,7 @@ function TimeRuler({
             />
           </div>
         ) : null}
-        <div className="time-ruler-playhead" style={{ left: `${cursorPct}%` }} />
+        <div className="time-ruler-playhead" style={{ left: `${cursorLeft}px` }} />
       </div>
     </div>
   );
@@ -6676,13 +7440,15 @@ function filterThumbCss(patch: Record<string, number>): string {
 }
 
 function FilterRow({ filter, clipSrc, active, onClick }: {
-  filter: PhotoFilterDef; clipSrc: string; active: boolean; onClick: () => void;
+  filter: PhotoFilterDef; clipSrc?: string; active: boolean; onClick: () => void;
 }) {
   const wb = whiteBalanceStyle(filter.patch as unknown as VideoLayout);
   return (
     <button type="button" className={`ph-filter ${active ? "active" : ""}`} onClick={onClick}>
       <span className="ph-filter-thumb">
-        <video src={clipSrc} muted playsInline preload="auto" style={{ filter: filterThumbCss(filter.patch) }} />
+        {clipSrc
+          ? <video src={clipSrc} muted playsInline preload="auto" style={{ filter: filterThumbCss(filter.patch) }} />
+          : <span className="ph-filter-live" style={{ filter: filterThumbCss(filter.patch) }} />}
         {wb ? <div style={wb} /> : null}
       </span>
       <span className="ph-filter-name">{filter.name}</span>
@@ -6775,8 +7541,9 @@ function MonitorTile({ clip, grade, selected, registerVideo, onClick }: {
   );
 }
 
-function MonitorLiveTile({ track, selected, onClick }: {
+function MonitorLiveTile({ track, grade, selected, onClick }: {
   track: CameraPreviewTrack;
+  grade: VideoLayout;
   selected: boolean;
   onClick: () => void;
 }) {
@@ -6785,9 +7552,10 @@ function MonitorLiveTile({ track, selected, onClick }: {
     <div
       className={`monitor-tile live ${selected ? "selected" : ""}`}
       onClick={onClick}
-      title={`Click to select ${track.name}`}
+      title={`Click to adjust ${track.name}`}
+      style={{ filter: presetCss(grade) }}
     >
-      <CameraLiveFeed track={track} />
+      <CameraLiveFeed track={track} grade={grade} />
       <span className="monitor-tile-label">{track.name}</span>
       <span className={`monitor-tile-state ${track.recording ? "rec" : track.armed ? "arm" : "live"}`}>{state}</span>
       {track.deviceLabel ? <span className="monitor-tile-device">{track.deviceLabel}</span> : null}
@@ -6823,6 +7591,7 @@ export function VideoMonitorApp() {
   const [exportStage, setExportStage] = useState<string>("");
   // Photos-style adjust: the clip being edited and its live (un-persisted) grade.
   const [focusedClipId, setFocusedClipId] = useState<string | null>(null);
+  const [focusedTrackId, setFocusedTrackId] = useState<string | null>(null);
   const [draftLayout, setDraftLayout] = useState<VideoLayout | null>(null);
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({ light: true, color: true });
   const [panelTab, setPanelTab] = useState<"adjust" | "filters">("adjust");
@@ -6898,7 +7667,7 @@ export function VideoMonitorApp() {
           cl: (c.layout?.cropLeft ?? 0) / 100, cr: (c.layout?.cropRight ?? 0) / 100,
           ct: (c.layout?.cropTop ?? 0) / 100, cb: (c.layout?.cropBottom ?? 0) / 100,
           rot: c.layout?.rotation ?? 0, op: c.layout?.opacity ?? 1,
-          layout: normalizeVideoLayout(c.layout), ti, ci,
+          layout: normalizeVideoLayout(c.layout ?? t.videoLayout, ti), ti, ci,
         });
       });
     });
@@ -6952,7 +7721,7 @@ export function VideoMonitorApp() {
             startSeconds: clip.startSample / s.sampleRate,
             endSeconds: clip.endSample / s.sampleRate,
             localTime: Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000 + pos - (clip.startSample / s.sampleRate)),
-            layout: normalizeVideoLayout(clip.layout, trackIndex),
+            layout: normalizeVideoLayout(clip.layout ?? track.videoLayout, trackIndex),
           }];
         });
         const activeClip = clips.find((clip) => pos >= clip.startSeconds && pos <= clip.endSeconds) ?? payloadTrack?.activeClip;
@@ -6966,7 +7735,7 @@ export function VideoMonitorApp() {
           recording: payloadTrack?.recording ?? false,
           transportPlaying: playRef.current.running,
           activeClip,
-          defaultLayout: defaultVideoLayout(trackIndex),
+          defaultLayout: normalizeVideoLayout(track.videoLayout, trackIndex),
         };
       });
   }, [cameraPayload, sessionId, project, selectedIds, playheadSample, sr]);
@@ -6979,13 +7748,23 @@ export function VideoMonitorApp() {
     if (selectedIds.length === 0) return;
     const current = allClips.find((c) => c.id === focusedClipId);
     if (current && selectedIds.includes(current.trackId)) return;
-    const target = allClips.find((c) => selectedIds.includes(c.trackId));
+    if (!focusedClipId && focusedTrackId && selectedIds.includes(focusedTrackId)) return;
+    const selectedTrack = monitorCameraTracks.find((track) => selectedIds.includes(track.id));
+    const target = selectedTrack?.activeClip
+      ? allClips.find((clip) => clip.id === selectedTrack.activeClip?.id)
+      : undefined;
     if (target) {
       setFocusedClipId(target.id);
+      setFocusedTrackId(target.trackId);
       setDraftLayout(target.layout);
       setSelectedFilter("original");
+    } else if (selectedTrack) {
+      setFocusedClipId(null);
+      setFocusedTrackId(selectedTrack.id);
+      setDraftLayout(selectedTrack.defaultLayout);
+      setSelectedFilter("original");
     }
-  }, [selectedIds, allClips, focusedClipId]);
+  }, [selectedIds, allClips, monitorCameraTracks, focusedClipId, focusedTrackId]);
 
   // Recorded clips for the selected video tracks. If no video track is selected,
   // use all recorded video clips so export/focus still has a sensible target.
@@ -7058,8 +7837,6 @@ export function VideoMonitorApp() {
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, [displayedRecordedClips, sr]);
-
-  const cols = Math.max(1, Math.ceil(Math.sqrt(monitorCameraTracks.length || 1)));
 
   // The clip to export: prefer the agent's rendered output, else the focused/only clip.
   const exportClip = useMemo(() => {
@@ -7151,10 +7928,19 @@ export function VideoMonitorApp() {
   }
 
   const focusedClip = useMemo(() => allClips.find((c) => c.id === focusedClipId) ?? null, [allClips, focusedClipId]);
-  const focusGrade: VideoLayout | null = focusedClip ? (draftLayout ?? focusedClip.layout) : null;
+  const focusedLiveTrack = useMemo(
+    () => focusedClip ? null : monitorCameraTracks.find((track) => track.id === focusedTrackId) ?? null,
+    [monitorCameraTracks, focusedTrackId, focusedClip],
+  );
+  const focusGrade: VideoLayout | null = focusedClip
+    ? (draftLayout ?? focusedClip.layout)
+    : focusedLiveTrack
+      ? (draftLayout ?? focusedLiveTrack.defaultLayout)
+      : null;
 
   function focusClip(c: MonitorClip) {
     setFocusedClipId(c.id);
+    setFocusedTrackId(c.trackId);
     setDraftLayout(c.layout);
     setSelectedFilter("original");
     void emit("video-monitor:select", { trackId: c.trackId }).catch(() => undefined);
@@ -7162,7 +7948,8 @@ export function VideoMonitorApp() {
 
   function focusLiveTrack(track: CameraPreviewTrack) {
     setFocusedClipId(null);
-    setDraftLayout(null);
+    setFocusedTrackId(track.id);
+    setDraftLayout(track.defaultLayout);
     setSelectedFilter("original");
     void emit("video-monitor:select", { trackId: track.id }).catch(() => undefined);
   }
@@ -7170,29 +7957,51 @@ export function VideoMonitorApp() {
   // Update the focused clip's grade: instant local preview + debounced persist
   // (via applyPatch) so the change survives reloads and downstream renders use it.
   function adjust(patch: Partial<VideoLayout>) {
-    if (!focusedClip) return;
-    const next = normalizeVideoLayout({ ...(draftLayout ?? focusedClip.layout), ...patch });
+    const targetTrackId = focusedClip?.trackId ?? focusedLiveTrack?.id;
+    const baseLayout = focusedClip?.layout ?? focusedLiveTrack?.defaultLayout;
+    if (!targetTrackId || !baseLayout) return;
+    const next = normalizeVideoLayout({ ...(draftLayout ?? baseLayout), ...patch });
     setDraftLayout(next);
     window.clearTimeout(persistTimer.current);
     persistTimer.current = window.setTimeout(() => {
       const s = project?.session;
-      const track = s?.tracks[focusedClip.ti];
-      const before = track?.videoClips ?? [];
-      if (!s || !before.some((c) => c.id === focusedClip.id)) return;
-      const arr = before.map((c) => (c.id === focusedClip.id ? { ...c, layout: next } : c));
+      const trackIndex = s?.tracks.findIndex((track) => track.id === targetTrackId) ?? -1;
+      const track = trackIndex >= 0 ? s?.tracks[trackIndex] : undefined;
+      if (!s || !track) return;
+      if (focusedClip) {
+        const before = track.videoClips ?? [];
+        if (!before.some((clip) => clip.id === focusedClip.id)) return;
+        const arr = before.map((clip) => (clip.id === focusedClip.id ? { ...clip, layout: next } : clip));
+        void api.applyPatch(
+          s.id,
+          [{ op: "replace", path: `/tracks/${trackIndex}/videoClips`, value: arr }],
+          [{ op: "replace", path: `/tracks/${trackIndex}/videoClips`, value: before }],
+          "Adjust clip",
+        ).then((updated) => {
+          setProject(updated);
+          void emit("video-monitor:project-updated", { sessionId: s.id, project: updated }).catch(() => undefined);
+        }).catch(() => undefined);
+        return;
+      }
+      const before = track.videoLayout;
       void api.applyPatch(
         s.id,
-        [{ op: "replace", path: `/tracks/${focusedClip.ti}/videoClips`, value: arr }],
-        [{ op: "replace", path: `/tracks/${focusedClip.ti}/videoClips`, value: before }],
-        "Adjust clip",
-      ).then(setProject).catch(() => undefined);
+        [{ op: before ? "replace" : "add", path: `/tracks/${trackIndex}/videoLayout`, value: next }],
+        [before
+          ? { op: "replace", path: `/tracks/${trackIndex}/videoLayout`, value: before }
+          : { op: "remove", path: `/tracks/${trackIndex}/videoLayout` }],
+        "Adjust live camera",
+      ).then((updated) => {
+        setProject(updated);
+        void emit("video-monitor:project-updated", { sessionId: s.id, project: updated }).catch(() => undefined);
+      }).catch(() => undefined);
     }, 300) as unknown as number;
   }
 
   return (
     <div className="video-monitor-root">
     <div className="video-monitor-body">
-    <main className="video-monitor-grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+    <main className="video-monitor-grid">
       {monitorCameraTracks.length === 0 ? (
         <div className="video-monitor-empty">No video tracks in this session yet — add a video track or select camera tracks in AutoMixer.</div>
       ) : (
@@ -7214,14 +8023,15 @@ export function VideoMonitorApp() {
             <MonitorLiveTile
               key={`live-${track.id}`}
               track={track}
-              selected={selectedIds.includes(track.id)}
+              grade={track.id === focusedTrackId && draftLayout ? draftLayout : track.defaultLayout}
+              selected={track.id === focusedTrackId || selectedIds.includes(track.id)}
               onClick={() => focusLiveTrack(track)}
             />
           );
         })
       )}
     </main>
-    {focusGrade && focusedClip ? (
+    {focusGrade && (focusedClip || focusedLiveTrack) ? (
       <aside className="video-monitor-adjust photos">
         <div className="ph-tabs">
           <button type="button" className={panelTab === "adjust" ? "active" : ""} onClick={() => setPanelTab("adjust")}>Adjust</button>
@@ -7231,7 +8041,7 @@ export function VideoMonitorApp() {
           <>
             <div className="ph-head">
               <span>ADJUST</span>
-              <button type="button" className="ph-share" onClick={() => setShareOpen(true)} title="Share / Export">
+              <button type="button" className="ph-share" onClick={() => setShareOpen(true)} title="Share / Export" disabled={!exportClip}>
                 <Share2 size={11} />
                 Share
               </button>
@@ -7260,7 +8070,7 @@ export function VideoMonitorApp() {
           <>
             <div className="ph-head">
               <span>FILTERS</span>
-              <button type="button" className="ph-share" onClick={() => setShareOpen(true)} title="Share / Export">
+              <button type="button" className="ph-share" onClick={() => setShareOpen(true)} title="Share / Export" disabled={!exportClip}>
                 <Share2 size={11} />
                 Share
               </button>
@@ -7270,7 +8080,7 @@ export function VideoMonitorApp() {
                 <FilterRow
                   key={f.id}
                   filter={f}
-                  clipSrc={convertFileSrc(focusedClip.path)}
+                  clipSrc={focusedClip ? convertFileSrc(focusedClip.path) : undefined}
                   active={selectedFilter === f.id}
                   onClick={() => { setSelectedFilter(f.id); adjust({ ...FILTER_NEUTRAL, ...f.patch }); }}
                 />
@@ -7282,7 +8092,7 @@ export function VideoMonitorApp() {
     ) : (
       <aside className="video-monitor-adjust photos empty">
         <SlidersHorizontal size={26} />
-        <span>Select a clip to adjust</span>
+        <span>Select a video track or clip to adjust</span>
       </aside>
     )}
     </div>
@@ -7682,7 +8492,7 @@ export function VideoEditorWindowApp() {
           startSeconds: clip.startSample / session.sampleRate,
           endSeconds: clip.endSample / session.sampleRate,
           localTime: Math.max(0, (clip.sourceOffsetMs ?? 0) / 1000 + playhead - (clip.startSample / session.sampleRate)),
-          layout: normalizeVideoLayout(clip.layout, trackIndex),
+          layout: normalizeVideoLayout(clip.layout ?? track.videoLayout, trackIndex),
         }];
       });
       const activeClip = clips.find((clip) => playhead >= clip.startSeconds && playhead <= clip.endSeconds);
@@ -7696,7 +8506,7 @@ export function VideoEditorWindowApp() {
         recording: false,
         transportPlaying: false,
         activeClip,
-        defaultLayout: defaultVideoLayout(trackIndex),
+        defaultLayout: normalizeVideoLayout(track.videoLayout, trackIndex),
       };
     });
   }
@@ -8509,10 +9319,10 @@ export function CameraPreviewApp() {
                   {layer.track.recording ? "REC" : layer.track.armed ? "ARM" : "LIVE"}
                 </span> : null}
               </div>
-              <div className="camera-stack-video">
+              <div className="camera-stack-video" style={{ filter: presetCss(layer.layout) }}>
                 {layer.clip
-                  ? <RecordedVideoFeed clip={layer.clip} playing={layer.track.transportPlaying} />
-                  : <CameraLiveFeed track={layer.track} />}
+                  ? <RecordedVideoFeed clip={layer.clip} playing={layer.track.transportPlaying} grade={layer.layout} />
+                  : <CameraLiveFeed track={layer.track} grade={layer.layout} />}
                 {layer.clip ? (
                   <CropEditor
                     layout={layer.layout}
@@ -8689,7 +9499,7 @@ function CameraCanvasLayer({
         <div className="video-canvas-layer-inner" style={innerStyle}>
           {layer.clip
             ? <RecordedVideoFeed clip={layer.clip} playing={layer.track.transportPlaying} grade={layout} />
-            : <CameraLiveFeed track={layer.track} />}
+            : <CameraLiveFeed track={layer.track} grade={layout} />}
         </div>
       </div>
       <span className="video-canvas-label">{layer.track.name}</span>
@@ -8933,7 +9743,7 @@ function RecordedVideoFeed({ clip, playing, grade }: { clip: CameraPreviewClip; 
 /// webview NEVER opens cameras itself (no getUserMedia): Rust owns every device,
 /// so previews can't fight recordings, and any number of windows can watch the
 /// same camera at once.
-function CameraLiveFeed({ track }: { track: CameraPreviewTrack; busy?: boolean }) {
+function CameraLiveFeed({ track, grade }: { track: CameraPreviewTrack; busy?: boolean; grade?: VideoLayout }) {
   const [info, setInfo] = useState<{ port: number; token: string } | undefined>();
   const [attempt, setAttempt] = useState(0);
   const retryTimerRef = useRef<number | undefined>(undefined);
@@ -8956,19 +9766,25 @@ function CameraLiveFeed({ track }: { track: CameraPreviewTrack; busy?: boolean }
   }
   const src = `http://127.0.0.1:${info.port}/camera/preview/${encodeURIComponent(track.deviceLabel)}?token=${encodeURIComponent(info.token)}&a=${attempt}`;
   return (
-    <img
-      // key forces a full remount per camera — multipart streams don't always
-      // switch cleanly on a bare src change.
-      key={track.deviceLabel}
-      className="camera-live-mjpeg"
-      src={src}
-      alt={track.name}
-      onError={() => {
-        // Stream not up yet (or the recorder is swapping processes) — retry.
-        if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = window.setTimeout(() => setAttempt((n) => n + 1), 1500);
-      }}
-    />
+    <>
+      <img
+        // key forces a full remount per camera — multipart streams don't always
+        // switch cleanly on a bare src change.
+        key={track.deviceLabel}
+        className="camera-live-mjpeg"
+        src={src}
+        alt={track.name}
+        style={grade ? { filter: cssAdjustFilter(grade) } : undefined}
+        onError={() => {
+          // Stream not up yet (or the recorder is swapping processes) — retry.
+          if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+          retryTimerRef.current = window.setTimeout(() => setAttempt((n) => n + 1), 1500);
+        }}
+      />
+      {(() => { const wb = grade ? whiteBalanceStyle(grade) : null; return wb ? <div style={wb} /> : null; })()}
+      {grade && (grade.vignette ?? 0) > 0 ? <div style={vignetteStyle(grade)} /> : null}
+      {grade && (grade.grain ?? 0) > 0 ? <div style={grainStyle(grade)} /> : null}
+    </>
   );
 }
 
@@ -9348,13 +10164,11 @@ function TrackRow({
   playhead,
   transportPlaying,
   duration,
+  pixelsPerSecond,
   alignmentGuideSeconds,
   onClipSelect,
   onClipContextMenu,
-  onClipDragStart,
-  onClipDragOver,
-  onClipDrop,
-  onClipDragEnd,
+  onClipPointerDragStart,
   cutToolActive,
   onClipCut,
   onCutHover,
@@ -9365,9 +10179,12 @@ function TrackRow({
   onSolo,
   onSeek,
   onSelectTrack,
+  onFocusTrack,
   onChange,
-  onDragOver,
-  onDrop,
+  draggingTrack,
+  dropPosition,
+  onTrackPointerDragStart,
+  onMoveTrack,
 }: {
   track: Track;
   selected: boolean;
@@ -9390,13 +10207,11 @@ function TrackRow({
   playhead: number;
   transportPlaying: boolean;
   duration: number;
+  pixelsPerSecond: number;
   alignmentGuideSeconds?: number;
   onClipSelect: (clipId: string, additive?: boolean) => void;
   onClipContextMenu: (clipId: string, event: React.MouseEvent) => void;
-  onClipDragStart: (clipId: string, grabOffsetSeconds: number, event: React.DragEvent<HTMLDivElement>) => void;
-  onClipDragOver: (atSeconds: number, event: React.DragEvent<HTMLDivElement>) => void;
-  onClipDrop: (atSeconds: number, event: React.DragEvent<HTMLDivElement>) => void;
-  onClipDragEnd: () => void;
+  onClipPointerDragStart: (clipId: string, grabOffsetSeconds: number, event: ReactPointerEvent<HTMLDivElement>) => void;
   cutToolActive: boolean;
   onClipCut: (clipId: string, atSeconds: number) => void;
   onCutHover: (seconds: number | undefined) => void;
@@ -9407,22 +10222,23 @@ function TrackRow({
   onSolo: () => void;
   onSeek: (seconds: number) => void;
   onSelectTrack: (additive: boolean) => void;
+  onFocusTrack: () => void;
   onChange: (patch: Partial<Track>) => void;
-  onDragOver: (event: React.DragEvent) => void;
-  onDrop: (event: React.DragEvent) => void;
+  draggingTrack: boolean;
+  dropPosition?: "before" | "after";
+  onTrackPointerDragStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onMoveTrack: (direction: -1 | 1, toEdge: boolean) => void;
 }) {
   const dragRef = useRef<{ start: number; moved: boolean } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const secondsFromClientX = (clientX: number) => {
     const rect = wrapRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return 0;
-    const fraction = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    return fraction * duration;
+    return Math.max(0, Math.min(duration, (clientX - rect.left) / pixelsPerSecond));
   };
   const secondsFromPointer = (event: React.PointerEvent<HTMLElement>) => {
     const rect = wrapRef.current?.getBoundingClientRect() ?? event.currentTarget.getBoundingClientRect();
-    const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-    return fraction * duration;
+    return Math.max(0, Math.min(duration, (event.clientX - rect.left) / pixelsPerSecond));
   };
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -9446,6 +10262,14 @@ function TrackRow({
     }
     onClipSelect(clipId, false);
     onSelectTrack(false);
+    const clip = clips.find((item) => item.id === clipId);
+    if (clip) {
+      onClipPointerDragStart(
+        clipId,
+        Math.max(0, secondsFromClientX(event.clientX) - clip.startSeconds),
+        event,
+      );
+    }
   };
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
@@ -9468,44 +10292,91 @@ function TrackRow({
     onRangeClear();
     onSelectTrack(event.metaKey || event.ctrlKey);
   };
-  const cursorPct = duration > 0 ? Math.max(0, Math.min(100, (playhead / duration) * 100)) : 0;
-  const rangeStartPct = selectedRange && duration > 0 ? Math.max(0, Math.min(100, (selectedRange.start / duration) * 100)) : 0;
-  const rangeEndPct = selectedRange && duration > 0 ? Math.max(0, Math.min(100, (selectedRange.end / duration) * 100)) : 0;
-  const alignmentGuidePct = alignmentGuideSeconds !== undefined && duration > 0 ? Math.max(0, Math.min(100, (alignmentGuideSeconds / duration) * 100)) : undefined;
+  const cursorLeft = Math.max(0, playhead * pixelsPerSecond);
+  const rangeStartLeft = selectedRange ? Math.max(0, selectedRange.start * pixelsPerSecond) : 0;
+  const rangeEndLeft = selectedRange ? Math.max(0, selectedRange.end * pixelsPerSecond) : 0;
+  const alignmentGuideLeft = alignmentGuideSeconds !== undefined
+    ? Math.max(0, alignmentGuideSeconds * pixelsPerSecond)
+    : undefined;
   const liveLevel = livePeaks?.length ? livePeaks[livePeaks.length - 1] : 0;
   const isVideo = track.kind === "video";
-  const recordingLeftPct = recordingStartSeconds !== undefined && duration > 0 ? Math.max(0, Math.min(100, (recordingStartSeconds / duration) * 100)) : 0;
-  const recordingWidthPct = recordingStartSeconds !== undefined && duration > 0
-    ? Math.max(0.6, Math.min(100 - recordingLeftPct, ((Math.max(playhead, recordingStartSeconds) - recordingStartSeconds) / duration) * 100))
+  const recordingLeft = recordingStartSeconds !== undefined
+    ? Math.max(0, recordingStartSeconds * pixelsPerSecond)
+    : 0;
+  const recordingWidth = recordingStartSeconds !== undefined
+    ? Math.max(4, (Math.max(playhead, recordingStartSeconds) - recordingStartSeconds) * pixelsPerSecond)
     : 0;
   return (
     <div
       data-track-id={track.id}
-      className={`track ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${track.solo ? "soloed" : ""} ${soloSuppressed ? "solo-suppressed" : ""} ${armed ? "armed" : ""} ${recording ? "recording" : ""} ${track.muted ? "muted" : ""} ${clipDropPreview ? `clip-drop-target ${clipDropPreview.valid ? "valid" : "invalid"}` : ""}`}
-      onDragOver={onDragOver}
-      onDrop={onDrop}
+      className={`track ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${track.solo ? "soloed" : ""} ${soloSuppressed ? "solo-suppressed" : ""} ${armed ? "armed" : ""} ${recording ? "recording" : ""} ${track.muted ? "muted" : ""} ${clipDropPreview ? `clip-drop-target ${clipDropPreview.valid ? "valid" : "invalid"}` : ""} ${draggingTrack ? "dragging" : ""} ${dropPosition ? `drop-${dropPosition}` : ""}`}
       role="option"
       aria-selected={selected}
     >
-      <div className="track-head" style={{ ['--track-color' as string]: track.color }}>
-        <button
-          className={`record-arm ${armed ? "active" : ""}`}
-          title={armed ? "Record enabled. Click to disarm." : "Record enable this track (or group)"}
-          onClick={(event) => { event.stopPropagation(); onArm(); }}
-          aria-pressed={armed}
-        >R</button>
-        <button
-          className={`mute-btn ${track.muted ? "active" : ""}`}
-          title={track.muted ? "Muted. Click to unmute." : "Mute this track (or group)"}
-          onClick={(event) => { event.stopPropagation(); onMute(); }}
-          aria-pressed={track.muted}
-        >M</button>
-        <button
-          className={`solo-btn ${track.solo ? "active" : ""}`}
-          title={track.solo ? "Solo enabled. Click to hear or show the other tracks." : "Solo this track"}
-          onClick={(event) => { event.stopPropagation(); onSolo(); }}
-          aria-pressed={track.solo}
-        >S</button>
+      <div
+        className="track-head"
+        style={{ ['--track-color' as string]: track.color }}
+        onClick={(event) => onSelectTrack(event.metaKey || event.ctrlKey)}
+        title={`Select ${track.name}`}
+      >
+        <div className="track-fixed-header">
+          <button
+            type="button"
+            className="track-drag-handle"
+            onPointerDown={onTrackPointerDragStart}
+            title="Drag to reorder this track"
+            aria-label={`Reorder ${track.name}`}
+          >
+            <GripVertical size={13} />
+          </button>
+          <strong className="track-fixed-name" title={track.name}>{track.name}</strong>
+        </div>
+        <div className="track-head-buttons">
+          <button
+            className={`record-arm ${armed ? "active" : ""}`}
+            title={armed ? "Record enabled. Click to disarm." : "Record enable this track (or group)"}
+            onClick={(event) => { event.stopPropagation(); onFocusTrack(); onArm(); }}
+            aria-pressed={armed}
+          >R</button>
+          <button
+            className={`mute-btn ${track.muted ? "active" : ""}`}
+            title={track.muted ? "Muted. Click to unmute." : "Mute this track (or group)"}
+            onClick={(event) => { event.stopPropagation(); onFocusTrack(); onMute(); }}
+            aria-pressed={track.muted}
+          >M</button>
+          <button
+            className={`solo-btn ${track.solo ? "active" : ""}`}
+            title={track.solo ? "Solo enabled. Click to hear or show the other tracks." : "Solo this track"}
+            onClick={(event) => { event.stopPropagation(); onFocusTrack(); onSolo(); }}
+            aria-pressed={track.solo}
+          >S</button>
+          <button
+            type="button"
+            className="track-order-button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onFocusTrack();
+              onMoveTrack(-1, event.shiftKey);
+            }}
+            title={`Move ${track.name} up · Shift-click sends it to the top`}
+            aria-label={`Move ${track.name} up`}
+          >
+            <ArrowUp size={11} />
+          </button>
+          <button
+            type="button"
+            className="track-order-button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onFocusTrack();
+              onMoveTrack(1, event.shiftKey);
+            }}
+            title={`Move ${track.name} down · Shift-click sends it to the bottom`}
+            aria-label={`Move ${track.name} down`}
+          >
+            <ArrowDown size={11} />
+          </button>
+        </div>
         {!isVideo && (recording || monitoring) ? (
           <div className={`track-record-meter ${recording ? "recording" : "monitoring"}`} title="Live input level">
             <span style={{ width: `${Math.max(2, Math.min(100, liveLevel * 100))}%` }} />
@@ -9519,67 +10390,61 @@ function TrackRow({
       </div>
       <div
         ref={wrapRef}
+        data-wave-lane="true"
         className={`wave-wrap ${cutToolActive ? "cut-mode" : ""}`}
-        style={{ ['--track-color' as string]: track.color }}
+        style={{
+          ['--track-color' as string]: track.color,
+          width: `${Math.max(1, duration * pixelsPerSecond)}px`,
+        }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onMouseMove={cutToolActive ? (event) => onCutHover(secondsFromClientX(event.clientX)) : undefined}
         onMouseLeave={cutToolActive ? () => onCutHover(undefined) : undefined}
-        onDragOver={(event) => onClipDragOver(secondsFromClientX(event.clientX), event)}
-        onDrop={(event) => onClipDrop(secondsFromClientX(event.clientX), event)}
         title={cutToolActive ? "Click on a clip to split it at the cursor." : "Click to select this track."}
       >
         {clips.map((clip) => {
-          const clipLeftPct = duration > 0 ? (clip.startSeconds / duration) * 100 : 0;
-          const clipWidthPct = duration > 0 ? (clip.sourceSeconds / duration) * 100 : 100;
+          const clipLeft = clip.startSeconds * pixelsPerSecond;
+          const clipWidth = Math.max(3, clip.sourceSeconds * pixelsPerSecond);
           return (
             <div
               key={clip.id}
               data-clip-id={clip.id}
               className={`wave-clip ${clip.kind === "video" ? "video-clip" : ""} ${selectedClipId === clip.id || selectedClipIds.includes(clip.id) ? "selected" : ""} ${draggingClipId === clip.id ? "drag-source" : ""}`}
-              style={{ left: `${clipLeftPct}%`, width: `${clipWidthPct}%`, borderLeftColor: track.color }}
+              style={{ left: `${clipLeft}px`, width: `${clipWidth}px`, borderLeftColor: track.color }}
               title={`${clip.name} · Drag to move · ${ALT_KEY}-drag to copy`}
-              draggable={!cutToolActive}
               onPointerDown={(event) => handleClipPointerDown(clip.id, event)}
-              onDragStart={(event) => onClipDragStart(
-                clip.id,
-                Math.max(0, secondsFromClientX(event.clientX) - clip.startSeconds),
-                event,
-              )}
-              onDragEnd={onClipDragEnd}
               onContextMenu={(event) => onClipContextMenu(clip.id, event)}
             >
               {clip.kind === "video"
                 ? <VideoStrip color={track.color} />
                 : <Waveform peaks={clip.peaks} color={track.color} />}
-              <span className="clip-label">{clip.name}</span>
             </div>
           );
         })}
-        {clipDropPreview && duration > 0 ? (
+        {clipDropPreview ? (
           <div
             className={`clip-drop-preview ${clipDropPreview.copy ? "copy" : "move"} ${clipDropPreview.valid ? "valid" : "invalid"}`}
             style={{
-              left: `${(clipDropPreview.startSeconds / duration) * 100}%`,
-              width: `${Math.max(0.2, (clipDropPreview.durationSeconds / duration) * 100)}%`,
+              left: `${clipDropPreview.startSeconds * pixelsPerSecond}px`,
+              width: `${Math.max(3, clipDropPreview.durationSeconds * pixelsPerSecond)}px`,
             }}
             aria-hidden="true"
           >
             {clipDropPreview.copy ? <Copy size={13} /> : <MoveRight size={13} />}
           </div>
         ) : null}
-        {selectedRange && Math.abs(rangeEndPct - rangeStartPct) > 0.1 ? (
+        {selectedRange && Math.abs(rangeEndLeft - rangeStartLeft) > 1 ? (
           <div
             className="range-selection"
-            style={{ left: `${Math.min(rangeStartPct, rangeEndPct)}%`, width: `${Math.abs(rangeEndPct - rangeStartPct)}%` }}
+            style={{ left: `${Math.min(rangeStartLeft, rangeEndLeft)}px`, width: `${Math.abs(rangeEndLeft - rangeStartLeft)}px` }}
           />
         ) : null}
-        {alignmentGuidePct !== undefined ? <div className="alignment-guide" style={{ left: `${alignmentGuidePct}%` }} /> : null}
+        {alignmentGuideLeft !== undefined ? <div className="alignment-guide" style={{ left: `${alignmentGuideLeft}px` }} /> : null}
         {recording && recordingStartSeconds !== undefined ? (
           <div
             className={`wave-clip recording-live ${isVideo ? "video-clip" : ""}`}
-            style={{ left: `${recordingLeftPct}%`, width: `${recordingWidthPct}%`, borderLeftColor: track.color }}
+            style={{ left: `${recordingLeft}px`, width: `${recordingWidth}px`, borderLeftColor: track.color }}
             title="Recording"
           >
             {isVideo ? <VideoStrip color={track.color} /> : <Waveform peaks={livePeaks ?? []} color={track.color} />}
@@ -9591,7 +10456,7 @@ function TrackRow({
             label — too much; just light the R button instead. */}
         {monitoring && !recording && !isVideo ? <LiveWaveform peaks={livePeaks ?? []} color={track.color} /> : null}
         {monitoring && !isVideo ? <div className="recording-overlay monitor">{monitorStarting ? "Opening input" : "Input"}</div> : null}
-        <div className="playhead" style={{ left: `${cursorPct}%` }} />
+        <div className="playhead" style={{ left: `${cursorLeft}px` }} />
       </div>
     </div>
   );
@@ -9605,9 +10470,14 @@ const VideoStrip = memo(function VideoStrip({ color }: { color: string }) {
   );
 });
 
-function nearestAlignment(seconds: number, candidates: number[], originalSeconds: number) {
+function nearestAlignment(
+  seconds: number,
+  candidates: number[],
+  originalSeconds: number,
+  thresholdSeconds = 0.035,
+) {
   let best: number | undefined;
-  let bestDistance = 0.035;
+  let bestDistance = thresholdSeconds;
   for (const candidate of candidates) {
     if (!Number.isFinite(candidate) || Math.abs(candidate - originalSeconds) < 0.0005) continue;
     const distance = Math.abs(candidate - seconds);

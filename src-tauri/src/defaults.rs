@@ -101,6 +101,7 @@ pub fn make_track(source_file_id: String, name: String, index: usize) -> Track {
         clips_materialized: false,
         clips: Vec::new(),
         video_clips: Vec::new(),
+        video_layout: None,
         camera_device_id: None,
         record_camera_audio: false,
     }

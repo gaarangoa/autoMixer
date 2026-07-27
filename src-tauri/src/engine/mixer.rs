@@ -82,6 +82,11 @@ pub struct Mixer {
     pub playhead: f64,
     pub session_rate: u32,
     pub master_bypass: bool,
+    pub metronome_enabled: bool,
+    pub metronome_bpm: f32,
+    pub metronome_numerator: u8,
+    pub metronome_denominator: u8,
+    pub metronome_volume_db: f32,
     pub reverb: Reverb,
     pub delay: StereoDelay,
     pub limiter: Limiter,
@@ -112,6 +117,11 @@ impl Mixer {
             playhead: 0.0,
             session_rate: sample_rate as u32,
             master_bypass: false,
+            metronome_enabled: false,
+            metronome_bpm: 120.0,
+            metronome_numerator: 4,
+            metronome_denominator: 4,
+            metronome_volume_db: -12.0,
             reverb: Reverb::new(sample_rate),
             delay: StereoDelay::new(sample_rate),
             limiter: Limiter::new(sample_rate),
@@ -242,6 +252,22 @@ impl Mixer {
             }
             EngineCommand::SetMasterBypass { enabled } => {
                 self.master_bypass = enabled;
+            }
+            EngineCommand::SetMetronome {
+                enabled,
+                bpm,
+                numerator,
+                denominator,
+                volume_db,
+            } => {
+                self.metronome_enabled = enabled;
+                self.metronome_bpm = bpm.clamp(20.0, 400.0);
+                self.metronome_numerator = numerator.clamp(1, 32);
+                self.metronome_denominator = match denominator {
+                    1 | 2 | 4 | 8 | 16 | 32 => denominator,
+                    _ => 4,
+                };
+                self.metronome_volume_db = volume_db.clamp(-60.0, 0.0);
             }
         }
     }
@@ -437,6 +463,22 @@ impl Mixer {
                 }
             }
 
+            // The click is generated from the same sample clock as the tracks, so
+            // seeks, loops, output-device rates, and recording punch-ins stay aligned.
+            if self.metronome_enabled {
+                let session_pos = self.playhead + frame as f64 * session_per_output;
+                let click = metronome_click_sample(
+                    session_pos,
+                    session_rate,
+                    self.metronome_bpm,
+                    self.metronome_numerator,
+                    self.metronome_denominator,
+                    self.metronome_volume_db,
+                );
+                left += click;
+                right += click;
+            }
+
             // Smooth the master params even in bypass to avoid clicks on toggle.
             let master_gain_db_next = self.master_gain_db.next();
             let _ = self.master_ceiling_db.next();
@@ -496,5 +538,60 @@ impl Mixer {
                 Ordering::Relaxed,
             );
         }
+    }
+}
+
+fn metronome_click_sample(
+    session_position: f64,
+    session_rate: f64,
+    bpm: f32,
+    numerator: u8,
+    denominator: u8,
+    volume_db: f32,
+) -> f32 {
+    if session_rate <= 0.0 || bpm <= 0.0 {
+        return 0.0;
+    }
+    let beat_seconds = (60.0 / bpm as f64) * (4.0 / denominator.max(1) as f64);
+    let beat_samples = session_rate * beat_seconds;
+    if beat_samples <= 1.0 {
+        return 0.0;
+    }
+    let beat_index = (session_position / beat_samples).floor().max(0.0) as u64;
+    let phase_samples = session_position - beat_index as f64 * beat_samples;
+    let phase_seconds = phase_samples / session_rate;
+    const CLICK_SECONDS: f64 = 0.028;
+    if !(0.0..CLICK_SECONDS).contains(&phase_seconds) {
+        return 0.0;
+    }
+    let downbeat = beat_index % numerator.max(1) as u64 == 0;
+    let frequency = if downbeat { 1760.0 } else { 1100.0 };
+    let accent = if downbeat { 1.0 } else { 0.68 };
+    let envelope = (1.0 - phase_seconds / CLICK_SECONDS).powi(3);
+    let oscillator = (std::f64::consts::TAU * frequency * phase_seconds).sin() as f32;
+    oscillator * envelope as f32 * accent * db_to_gain(volume_db)
+}
+
+#[cfg(test)]
+mod metronome_tests {
+    use super::metronome_click_sample;
+
+    #[test]
+    fn click_only_sounds_at_beat_boundaries() {
+        let rate = 48_000.0;
+        let near_downbeat = metronome_click_sample(12.0, rate, 120.0, 4, 4, -6.0);
+        let between_beats = metronome_click_sample(12_000.0, rate, 120.0, 4, 4, -6.0);
+        assert!(near_downbeat.abs() > 0.0001);
+        assert_eq!(between_beats, 0.0);
+    }
+
+    #[test]
+    fn meter_changes_the_downbeat_cycle() {
+        let rate = 48_000.0;
+        let phase = 6.0;
+        let fourth_beat = 3.0 * 24_000.0 + phase;
+        let in_three = metronome_click_sample(fourth_beat, rate, 120.0, 3, 4, -6.0);
+        let in_four = metronome_click_sample(fourth_beat, rate, 120.0, 4, 4, -6.0);
+        assert!(in_three.abs() > in_four.abs());
     }
 }

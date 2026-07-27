@@ -227,6 +227,26 @@ fn default_tempo_percent() -> f32 {
     100.0
 }
 
+fn default_project_start_bar() -> i32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeSignature {
+    pub numerator: u8,
+    pub denominator: u8,
+}
+
+impl Default for TimeSignature {
+    fn default() -> Self {
+        Self {
+            numerator: 4,
+            denominator: 4,
+        }
+    }
+}
+
 impl Default for VideoLayout {
     /// A full-frame layer: fills the canvas with no crop or color adjustments.
     fn default() -> Self {
@@ -344,6 +364,10 @@ pub struct Track {
     pub clips: Vec<ClipRegion>,
     #[serde(default)]
     pub video_clips: Vec<VideoClipRegion>,
+    /// Default layout and color grade for the live camera on this track.
+    /// Recorded clips without their own layout inherit this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_layout: Option<VideoLayout>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera_device_id: Option<String>,
     #[serde(default)]
@@ -453,6 +477,13 @@ pub struct MixSession {
     #[serde(default = "default_tempo_percent")]
     pub tempo_percent: f32,
     pub bpm: Option<f32>,
+    /// Constant project meter. A future tempo track can extend this without
+    /// changing the sample-based clip representation.
+    #[serde(default)]
+    pub time_signature: TimeSignature,
+    /// Musical bar number displayed at timeline sample zero.
+    #[serde(default = "default_project_start_bar")]
+    pub project_start_bar: i32,
     pub source_files: Vec<SourceFile>,
     #[serde(default)]
     pub video_source_files: Vec<VideoSourceFile>,

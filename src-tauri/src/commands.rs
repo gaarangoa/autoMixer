@@ -486,7 +486,14 @@ pub fn import_audio_files(
     for path in paths {
         latest = Some(store.add_source_file(&session_id, Path::new(&path))?);
     }
-    latest.map_or_else(|| store.get_project(&session_id), Ok)
+    let project = latest.map_or_else(|| store.get_project(&session_id), Ok)?;
+    drop(store);
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok(project)
 }
 
 #[tauri::command]
@@ -725,6 +732,7 @@ pub fn reset_session(state: State<'_, AppState>, session_id: String) -> Result<M
     project.redo_stack.clear();
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
         sync_session_to_engine(&mut audio, &project.session);
         audio.publish_automation(&project.session);
     }
@@ -750,6 +758,7 @@ pub fn apply_recorded_patch(
     )?;
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
         sync_session_to_engine(&mut audio, &project.session);
         audio.publish_automation(&project.session);
     }
@@ -1831,6 +1840,20 @@ pub async fn assistant_request(
 }
 
 #[tauri::command]
+pub fn prepare_session_audio(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
+    let mut audio = state.audio.lock().map_err(|error| error.to_string())?;
+    audio.bind_session_sources(&project.session)?;
+    sync_session_to_engine(&mut audio, &project.session);
+    audio.publish_automation(&project.session);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn transport_play(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
     let project = state
         .store
@@ -1872,6 +1895,23 @@ pub fn transport_seek(state: State<'_, AppState>, sample: u64) -> Result<(), Str
         .lock()
         .map_err(|error| error.to_string())?
         .seek(sample);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_metronome(
+    state: State<'_, AppState>,
+    enabled: bool,
+    bpm: f32,
+    numerator: u8,
+    denominator: u8,
+    volume_db: f32,
+) -> Result<(), String> {
+    state
+        .audio
+        .lock()
+        .map_err(|error| error.to_string())?
+        .set_metronome(enabled, bpm, numerator, denominator, volume_db);
     Ok(())
 }
 
@@ -5345,6 +5385,7 @@ fn collect_video_inputs(
                     layout: clip
                         .layout
                         .clone()
+                        .or_else(|| track.video_layout.clone())
                         .unwrap_or_else(|| default_video_layout(track_index)),
                 });
             }

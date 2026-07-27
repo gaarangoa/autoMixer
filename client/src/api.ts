@@ -84,10 +84,13 @@ export const api = {
     tauriInvoke<MixProject>("apply_recorded_patch", { sessionId, forwardPatch, inversePatch, explanation }),
   resetSession: (sessionId: string) => tauriInvoke<MixProject>("reset_session", { sessionId }),
   assistant: (request: AssistantRequest) => tauriInvoke<AssistantResponse>("assistant_request", { request }),
+  preparePlayback: (sessionId: string) => tauriInvoke<void>("prepare_session_audio", { sessionId }),
   play: (sessionId: string) => tauriInvoke<void>("transport_play", { sessionId }),
   pause: () => tauriInvoke<void>("transport_pause"),
   stop: () => tauriInvoke<void>("transport_stop"),
   seek: (sample: number) => tauriInvoke<void>("transport_seek", { sample }),
+  setMetronome: (enabled: boolean, bpm: number, numerator: number, denominator: number, volumeDb: number) =>
+    tauriInvoke<void>("set_metronome", { enabled, bpm, numerator, denominator, volumeDb }),
   startRecording: (sessionId: string, startSample: number, targetTrackId?: string, inputDevice?: string, inputGainDb?: number, inputChannels?: number[]) =>
     tauriInvoke<void>("start_recording", { sessionId, startSample, targetTrackId, inputDevice, inputGainDb, inputChannels }),
   recordingMeters: () => tauriInvoke<{ peaks: number[]; channelPeaks: number[] }>("poll_recording_meters"),

@@ -219,6 +219,8 @@ export type Track = {
   clipsMaterialized?: boolean;
   clips: ClipRegion[];
   videoClips?: VideoClipRegion[];
+  /** Default live-camera layout/grade; clips can override it. */
+  videoLayout?: VideoLayout;
   cameraDeviceId?: string;
   recordCameraAudio?: boolean;
 };
@@ -257,6 +259,11 @@ export type MixAlbum = {
   songOrder: Id[];
 };
 
+export type TimeSignature = {
+  numerator: number;
+  denominator: number;
+};
+
 export type MixSession = {
   id: Id;
   name: string;
@@ -267,6 +274,8 @@ export type MixSession = {
   /** Current speed vs the original audio (100 = untouched). */
   tempoPercent?: number;
   bpm?: number;
+  timeSignature?: TimeSignature;
+  projectStartBar?: number;
   sourceFiles: SourceFile[];
   videoSourceFiles?: VideoSourceFile[];
   tracks: Track[];

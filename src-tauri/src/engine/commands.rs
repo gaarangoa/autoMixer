@@ -77,4 +77,11 @@ pub enum EngineCommand {
     SetMasterBypass {
         enabled: bool,
     },
+    SetMetronome {
+        enabled: bool,
+        bpm: f32,
+        numerator: u8,
+        denominator: u8,
+        volume_db: f32,
+    },
 }

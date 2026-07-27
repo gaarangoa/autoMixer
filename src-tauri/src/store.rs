@@ -122,7 +122,9 @@ impl SessionStore {
             sample_rate: 48000,
             minimum_timeline_seconds: Some(SCRATCH_SESSION_MINIMUM_TIMELINE_SECONDS),
             tempo_percent: 100.0,
-            bpm: None,
+            bpm: Some(120.0),
+            time_signature: crate::model::TimeSignature::default(),
+            project_start_bar: 1,
             source_files: Vec::new(),
             video_source_files: Vec::new(),
             tracks: Vec::new(),
@@ -985,6 +987,7 @@ impl SessionStore {
         } else {
             start_sample.saturating_add((-offset_samples) as u64)
         };
+        let video_layout = track.video_layout.clone();
         track.video_clips.push(VideoClipRegion {
             id: Uuid::new_v4().to_string(),
             video_source_file_id: source_id.clone(),
@@ -992,7 +995,7 @@ impl SessionStore {
             start_sample: adjusted_start,
             end_sample: adjusted_start + duration_samples.max(1),
             source_offset_ms,
-            layout: None,
+            layout: video_layout,
             pristine_video_source_file_id: None,
             pristine_source_offset_ms: None,
             pristine_duration_samples: None,
