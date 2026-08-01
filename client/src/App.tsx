@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactP
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AlertCircle, Aperture, ArrowDown, ArrowUp, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Copy, Download, FilePlus2, Focus, FolderOpen, Gauge, GitCompareArrows, GripVertical, Info, Keyboard, Magnet, Maximize2, MessageSquare, Mic, MoveRight, Music2, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, Repeat, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X, ZoomIn, ZoomOut } from "lucide-react";
-import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixAlbum, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
+import type { AbJudgeResponse, AgentColorGrade, AgentCreativeFreedom, AgentEditBrief, AgentEditPacing, AgentEditSourceRole, AgentEditValidation, AgentLookMode, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixAlbum, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -199,6 +199,8 @@ type VideoEditHistoryItem = {
   intervalSeconds: number;
   instructions: string;
   script: AgentVideoScriptEntry[];
+  editBrief?: AgentEditBrief;
+  validation?: AgentEditValidation;
 };
 
 type VideoChatMessage = {
@@ -213,6 +215,356 @@ type MainVideoEdit = {
   createdAt?: string;
   rangeStartSeconds?: number;
 };
+
+function isAgentVideoOutput(track: Track): boolean {
+  return track.name === "Agent video edit" || track.name.startsWith("Agent Edit");
+}
+
+function emptyDirectedEditBrief(): AgentEditBrief {
+  return {
+    sources: [],
+    creativeFreedom: "balanced",
+    pacing: "follow_music",
+    lookMode: "original",
+    customInstructions: null,
+  };
+}
+
+function reconcileDirectedEditBrief(brief: AgentEditBrief, tracks: Track[]): AgentEditBrief {
+  const sourceTracks = tracks.filter((track) => track.kind === "video" && !isAgentVideoOutput(track));
+  const existing = new Map(brief.sources.map((source) => [source.trackId, source]));
+  let hasMain = sourceTracks.some((track) => existing.get(track.id)?.role === "main");
+  const sources = sourceTracks.map((track, index) => {
+    const saved = existing.get(track.id);
+    if (saved) return { ...saved, trackName: track.name };
+    const role: AgentEditSourceRole = !hasMain && index === 0 ? "main" : "insert";
+    if (role === "main") hasMain = true;
+    return {
+      trackId: track.id,
+      trackName: track.name,
+      role,
+      minimumCoverage: role === "main" ? 0.7 : null,
+      maximumCoverage: null,
+      maximumInsertSeconds: role === "insert" ? 3 : null,
+      targetInsertCount: role === "insert" ? 3 : null,
+    };
+  });
+  return { ...brief, sources };
+}
+
+function directedBriefSummary(brief: AgentEditBrief): string[] {
+  const sourceLines = brief.sources.map((source) => {
+    if (source.role === "main") {
+      return `${source.trackName} · Main · ≥${Math.round((source.minimumCoverage ?? 0.7) * 100)}%`;
+    }
+    if (source.role === "insert") {
+      const count = source.targetInsertCount ? `${source.targetInsertCount} target cuts` : "selective cuts";
+      const length = source.maximumInsertSeconds ? `≤${source.maximumInsertSeconds}s each` : "brief inserts";
+      return `${source.trackName} · Insert · ${count} · ${length}`;
+    }
+    return `${source.trackName} · ${source.role === "exclude" ? "Excluded" : "Secondary"}`;
+  });
+  const creativity = brief.creativeFreedom === "faithful" ? "Faithful" : brief.creativeFreedom === "director" ? "Director" : "Balanced";
+  const pacing = brief.pacing === "follow_music" ? "Follow music" : brief.pacing === "energetic" ? "Energetic" : "Relaxed";
+  const look = brief.lookMode === "original" ? "Original visuals" : brief.lookMode === "agent" ? "Agent-designed look" : "Selected preset";
+  return [...sourceLines, `${creativity} creativity`, pacing, look];
+}
+
+function validateDirectedPlan(script: AgentVideoScriptEntry[], brief: AgentEditBrief): AgentEditValidation {
+  const ordered = [...script].sort((a, b) => a.startSeconds - b.startSeconds);
+  const durations = new Map<string, number>();
+  let total = 0;
+  const trackIdFor = (entry: AgentVideoScriptEntry) => entry.chosenTrackId
+    ?? entry.candidates.find((candidate) => candidate.trackIndex === entry.chosenTrackIndex)?.trackId
+    ?? null;
+  for (const entry of ordered) {
+    const trackId = trackIdFor(entry);
+    const seconds = Math.max(0, entry.endSeconds - entry.startSeconds);
+    if (!trackId || seconds <= 0) continue;
+    durations.set(trackId, (durations.get(trackId) ?? 0) + seconds);
+    total += seconds;
+  }
+  const messages: string[] = [];
+  const sourceCoverage = brief.sources.map((source) => {
+    const seconds = durations.get(source.trackId) ?? 0;
+    const fraction = total > 0 ? seconds / total : 0;
+    if (source.role === "exclude" && seconds > 0.001) messages.push(`${source.trackName} is excluded but appears for ${seconds.toFixed(1)}s.`);
+    if (source.minimumCoverage != null && fraction + 0.0001 < source.minimumCoverage) {
+      messages.push(`${source.trackName} coverage is ${Math.round(fraction * 100)}%; the brief requires at least ${Math.round(source.minimumCoverage * 100)}%.`);
+    }
+    if (source.maximumCoverage != null && fraction - 0.0001 > source.maximumCoverage) {
+      messages.push(`${source.trackName} coverage is ${Math.round(fraction * 100)}%; the brief allows at most ${Math.round(source.maximumCoverage * 100)}%.`);
+    }
+    if (source.maximumInsertSeconds != null) {
+      let run = 0;
+      let longest = 0;
+      for (const entry of ordered) {
+        if (trackIdFor(entry) === source.trackId) {
+          run += Math.max(0, entry.endSeconds - entry.startSeconds);
+          longest = Math.max(longest, run);
+        } else {
+          run = 0;
+        }
+      }
+      if (longest > source.maximumInsertSeconds + 0.001) {
+        messages.push(`${source.trackName} has a ${longest.toFixed(1)}s continuous insert; the maximum is ${source.maximumInsertSeconds.toFixed(1)}s.`);
+      }
+    }
+    return { trackId: source.trackId, trackName: source.trackName, role: source.role, seconds, fraction };
+  });
+  if (total <= 0) messages.push("The plan contains no visible source selections.");
+  return { valid: messages.length === 0, messages, sourceCoverage };
+}
+
+function VideoPlanReview({
+  plan,
+  validation,
+  busy,
+  onRender,
+  onSelectCamera,
+}: {
+  plan: AgentVideoScriptEntry[];
+  validation?: AgentEditValidation | null;
+  busy: boolean;
+  onRender: () => void;
+  onSelectCamera: (windowIndex: number, trackIndex: number) => void;
+}) {
+  return (
+    <div className="plan-view chat-plan-view">
+      <div className="plan-head">
+        <div>
+          <strong>Edit plan ready</strong>
+          <span>{plan.length} shots · your original directions are already applied</span>
+        </div>
+        <button
+          type="button"
+          className="primary"
+          onClick={onRender}
+          disabled={busy || validation?.valid === false}
+          title="Render this plan and add it to the session"
+        >
+          Render video
+        </button>
+      </div>
+      {validation?.valid === false ? (
+        <p className="plan-warning">The plan needs attention: {validation.messages.join(" ")}</p>
+      ) : null}
+      <details className="plan-script-review">
+        <summary>Review or change the script (optional)</summary>
+        <div className="plan-list">
+          {plan.map((entry) => {
+            const candidates = Array.from(new Map(entry.candidates.map((candidate) => [candidate.trackIndex, candidate])).values());
+            const selectedCandidate = candidates.find((candidate) => candidate.trackId === entry.chosenTrackId)
+              ?? candidates.find((candidate) => candidate.trackIndex === entry.chosenTrackIndex);
+            const visualSummary = entry.dataProvided
+              ?.find((item) => item.startsWith("Frame-analysis summary:"))
+              ?.replace("Frame-analysis summary:", "")
+              .trim();
+            return (
+              <div className="plan-row" key={entry.windowIndex}>
+                <div className="plan-row-choice">
+                  <span className="plan-time">{formatTime(entry.startSeconds)}–{formatTime(entry.endSeconds)}</span>
+                  {candidates.length > 0 ? (
+                    <select
+                      aria-label={`Camera from ${formatTime(entry.startSeconds)} to ${formatTime(entry.endSeconds)}`}
+                      value={entry.chosenTrackIndex ?? ""}
+                      onChange={(event) => onSelectCamera(entry.windowIndex, Number(event.target.value))}
+                    >
+                      {entry.chosenTrackIndex == null ? <option value="">No camera</option> : null}
+                      {candidates.map((candidate) => (
+                        <option key={candidate.trackIndex} value={candidate.trackIndex}>
+                          {candidate.trackName}{candidate.angleLabel ? ` · ${candidate.angleLabel}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <span className="plan-fixed">{entry.chosenTrackName ?? "No camera"}</span>
+                  )}
+                </div>
+                <p className="plan-reason">{entry.reason || "Selected by the editing agent."}</p>
+                {visualSummary ? <span className="plan-visual">Visual: {visualSummary}</span> : selectedCandidate?.note ? <span className="plan-visual">Visual: {selectedCandidate.note}</span> : null}
+              </div>
+            );
+          })}
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function DirectedEditBriefPanel({
+  tracks,
+  brief,
+  validation,
+  onChange,
+}: {
+  tracks: Track[];
+  brief: AgentEditBrief;
+  validation?: AgentEditValidation | null;
+  onChange: (brief: AgentEditBrief) => void;
+}) {
+  const reconciled = reconcileDirectedEditBrief(brief, tracks);
+  const mainSource = reconciled.sources.find((source) => source.role === "main") ?? reconciled.sources[0];
+  const updateSource = (trackId: string, patch: Partial<AgentEditBrief["sources"][number]>) => {
+    let sources = reconciled.sources.map((source) => source.trackId === trackId ? { ...source, ...patch } : source);
+    if (patch.role === "main") {
+      sources = sources.map((source) => source.trackId === trackId
+        ? { ...source, role: "main", minimumCoverage: source.minimumCoverage ?? 0.7 }
+        : source.role === "main"
+          ? { ...source, role: "insert", minimumCoverage: null, maximumInsertSeconds: source.maximumInsertSeconds ?? 3, targetInsertCount: source.targetInsertCount ?? 3 }
+          : source);
+    }
+    onChange({ ...reconciled, sources });
+  };
+
+  return (
+    <div className="video-editor-card directed-edit-brief simple-edit-setup">
+      <div className="simple-edit-intro">
+        <strong>Set up your edit</strong>
+        <span>Choose the anchor camera and a style. Then describe the result you want below.</span>
+      </div>
+
+      <section className="simple-edit-step">
+        <span className="simple-step-number">1</span>
+        <div className="simple-step-content">
+          <label htmlFor="main-edit-camera">Which camera is the main view?</label>
+          <select
+            id="main-edit-camera"
+            value={mainSource?.trackId ?? ""}
+            disabled={reconciled.sources.length === 0}
+            onChange={(event) => updateSource(event.target.value, { role: "main" })}
+          >
+            {reconciled.sources.map((source) => (
+              <option key={source.trackId} value={source.trackId}>{source.trackName}</option>
+            ))}
+          </select>
+          <p>
+            {mainSource
+              ? `${mainSource.trackName} stays on screen most of the time. Other cameras are used only when they add something useful.`
+              : "Select at least one video track to begin."}
+          </p>
+        </div>
+      </section>
+
+      <section className="simple-edit-step">
+        <span className="simple-step-number">2</span>
+        <div className="simple-step-content">
+          <strong>How much freedom should the editor have?</strong>
+          <div className="simple-freedom-options" role="group" aria-label="Editing freedom">
+            {([
+              ["faithful", "Follow me", "Stay very close to my words."],
+              ["balanced", "Professional", "Make tasteful choices where I leave room."],
+              ["director", "Be creative", "Take bolder chances without breaking my rules."],
+            ] as const).map(([value, label, description]) => (
+              <button
+                type="button"
+                className={reconciled.creativeFreedom === value ? "active" : ""}
+                key={value}
+                onClick={() => onChange({ ...reconciled, creativeFreedom: value as AgentCreativeFreedom })}
+              >
+                <strong>{label}</strong>
+                <span>{description}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {validation ? (
+        <div className={`simple-plan-check ${validation.valid ? "valid" : "invalid"}`}>
+          {validation.valid ? "✓ The plan follows your choices." : "This plan needs a small fix before it can render."}
+        </div>
+      ) : null}
+
+      <details className="simple-edit-advanced">
+        <summary>Advanced camera and look controls</summary>
+        <p>Only open this when you need exact percentages, insert limits, pacing, or color treatment.</p>
+        <div className="directed-source-list">
+          {reconciled.sources.map((source) => (
+            <div className={`directed-source role-${source.role}`} key={source.trackId}>
+              <div className="directed-source-top">
+                <span className="directed-source-color" style={{ background: tracks.find((track) => track.id === source.trackId)?.color }} />
+                <strong>{source.trackName}</strong>
+                <select
+                  aria-label={`${source.trackName} role`}
+                  value={source.role}
+                  onChange={(event) => updateSource(source.trackId, { role: event.target.value as AgentEditSourceRole })}
+                >
+                  <option value="main">Main camera</option>
+                  <option value="secondary">Regular camera</option>
+                  <option value="insert">Brief insert only</option>
+                  <option value="exclude">Do not use</option>
+                </select>
+              </div>
+              {source.role === "main" ? (
+                <label className="directed-inline-control">
+                  Keep on screen at least
+                  <input
+                    type="range"
+                    min="50"
+                    max="100"
+                    step="5"
+                    value={Math.round((source.minimumCoverage ?? 0.7) * 100)}
+                    onChange={(event) => updateSource(source.trackId, { minimumCoverage: Number(event.target.value) / 100 })}
+                  />
+                  <b>{Math.round((source.minimumCoverage ?? 0.7) * 100)}%</b>
+                </label>
+              ) : source.role === "insert" ? (
+                <div className="directed-insert-controls">
+                  <label>
+                    About this many cuts
+                    <input
+                      type="number"
+                      min="1"
+                      max="30"
+                      value={source.targetInsertCount ?? 3}
+                      onChange={(event) => updateSource(source.trackId, { targetInsertCount: Math.max(1, Number(event.target.value) || 1) })}
+                    />
+                  </label>
+                  <label>
+                    No longer than
+                    <input
+                      type="number"
+                      min="0.5"
+                      max="30"
+                      step="0.5"
+                      value={source.maximumInsertSeconds ?? 3}
+                      onChange={(event) => updateSource(source.trackId, { maximumInsertSeconds: Math.max(0.5, Number(event.target.value) || 0.5) })}
+                    />
+                    seconds
+                  </label>
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+        <div className="directed-mode-grid">
+          <label>
+            Cutting pace
+            <select value={reconciled.pacing} onChange={(event) => onChange({ ...reconciled, pacing: event.target.value as AgentEditPacing })}>
+              <option value="relaxed">Calm, longer shots</option>
+              <option value="follow_music">Follow the music</option>
+              <option value="energetic">Fast and energetic</option>
+            </select>
+          </label>
+          <label>
+            Color and effects
+            <select value={reconciled.lookMode} onChange={(event) => onChange({ ...reconciled, lookMode: event.target.value as AgentLookMode })}>
+              <option value="original">Keep the recording unchanged</option>
+              <option value="agent">Let the editor choose a look</option>
+              <option value="preset">Use my current look</option>
+            </select>
+          </label>
+        </div>
+        {validation?.messages?.length ? (
+          <div className="directed-validation-messages">
+            {validation.messages.map((message) => <span key={message}>{message}</span>)}
+          </div>
+        ) : null}
+      </details>
+    </div>
+  );
+}
 
 export function App() {
   const initialOllamaUrlRef = useRef(localStorage.getItem("autoMixer.ollamaUrl"));
@@ -357,6 +709,8 @@ export function App() {
   const [agentEditStatus, setAgentEditStatus] = useState<string | null>(null);
   const [agentEditProgress, setAgentEditProgress] = useState<{ stage: string; message: string; current: number; total: number; elapsedSeconds: number } | null>(null);
   const [agentEditScript, setAgentEditScript] = useState<AgentVideoScriptEntry[]>([]);
+  const [agentEditBrief, setAgentEditBrief] = useState<AgentEditBrief>(() => emptyDirectedEditBrief());
+  const [agentEditValidation, setAgentEditValidation] = useState<AgentEditValidation | null>(null);
   const [agentEditContext, setAgentEditContext] = useState<{ trackId: string; clipId: string; sourceTrackIds: string[] } | null>(null);
   const [agentEditLook, setAgentEditLook] = useState<VideoFilterPreset>("none");
   // Custom color grade the agent emits from user instructions ("epic cinematic teal-and-orange",
@@ -377,7 +731,7 @@ export function App() {
   // The plan the agent produced from the last Send. The user reviews/edits it then
   // clicks Process to actually render. Null = no plan pending.
   const [agentPlan, setAgentPlan] = useState<AgentVideoScriptEntry[] | null>(null);
-  const [agentPlanContext, setAgentPlanContext] = useState<{ sourceTrackIds: string[]; startSample?: number; endSample?: number; intervalSeconds: number } | null>(null);
+  const [agentPlanContext, setAgentPlanContext] = useState<{ sourceTrackIds: string[]; startSample?: number; endSample?: number; intervalSeconds: number; editBrief: AgentEditBrief } | null>(null);
   const [, setMainVideoEdit] = useState<MainVideoEdit>({ script: [] });
   const [videoEditHistory, setVideoEditHistory] = useState<VideoEditHistoryItem[]>([]);
   const [videoChatMessages, setVideoChatMessages] = useState<VideoChatMessage[]>([]);
@@ -873,6 +1227,36 @@ export function App() {
       const next = updateMessagesForSession(event.sessionId, (items) => [...items, { role: "video", path: event.path, cuts: event.cuts, lookPreset: event.lookPreset }]);
       void api.saveChatMessages(event.sessionId, next).catch(() => undefined);
     }));
+    reg(api.onVideoPlanReady((event) => {
+      if (event.sessionId === currentSessionIdRef.current) {
+        setAgentEditScript(event.script);
+        setAgentPlan(event.script);
+        setAgentPlanContext({
+          sourceTrackIds: event.sourceTrackIds,
+          startSample: event.startSample,
+          endSample: event.endSample,
+          intervalSeconds: event.intervalSeconds,
+          editBrief: event.editBrief,
+        });
+        setAgentEditBrief(event.editBrief);
+        setAgentEditValidation(event.validation);
+        setAgentEditLook(event.lookPreset ?? "none");
+        setAgentColorGrade(event.colorGrade ?? null);
+        setAgentVideoEffects(event.videoEffects ?? null);
+        setAgentEditProgress(null);
+        setAgentEditStatus(`Edit plan ready — ${event.script.length} shots. Render when you are happy with it.`);
+        setVideoChatMessages((items) => [...items, {
+          role: "agent",
+          text: `Your edit plan is ready with ${event.script.length} shots. ${event.validation.valid ? "It follows your camera choices." : event.validation.messages.join(" ")} Review it if you want, then render the video.`,
+          createdAt: new Date().toISOString(),
+        }]);
+      }
+      const next = updateMessagesForSession(event.sessionId, (items) => [...items, {
+        role: "system",
+        text: `Video plan ready: ${event.script.length} shots. The optional script review and Render video button are below.`,
+      }]);
+      void api.saveChatMessages(event.sessionId, next).catch(() => undefined);
+    }));
     // Spacebar pressed in a secondary window (mixer / monitor / video editor) — the
     // main window owns the transport, so toggle play here.
     reg(listen("transport:toggle", () => { void togglePlayRef.current(); }));
@@ -981,8 +1365,8 @@ export function App() {
     return () => clearInterval(t);
   }, [visibleBusy, autoMixRunning]);
 
-  // Live reasoning (the agent's "thinking") and the tool calls it has made this
-  // turn — surfaced inline in the chat so long operations never look frozen.
+  // Show the complete reasoning stream alongside the tools so the user can audit
+  // exactly how the agent reached its decisions.
   const liveReasoning = useMemo(
     () => reasoning.filter((r) => r.phase === "think").map((r) => r.text).join("").trim(),
     [reasoning],
@@ -1002,9 +1386,8 @@ export function App() {
     [reasoning],
   );
 
-  // Mirror the live reasoning into a ref so handleAssistantResponse (which runs
-  // after the async turn resolves, when its closure's `reasoning` is stale) can
-  // snapshot the full thinking + tool track and persist it onto the turn card.
+  // Mirror turn telemetry into a ref so handleAssistantResponse (which runs after
+  // the async turn resolves) can persist the reasoning, tool track, and usage.
   const reasoningRef = useRef(reasoning);
   useEffect(() => { reasoningRef.current = reasoning; }, [reasoning]);
 
@@ -1030,6 +1413,20 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("autoMixer.agentVideoInstructions", agentVideoInstructions);
   }, [agentVideoInstructions]);
+
+  useEffect(() => {
+    if (!session) return;
+    const tracks = session.tracks.filter((track) => selectedTrackIds.includes(track.id) && track.kind === "video" && !isAgentVideoOutput(track));
+    setAgentEditBrief((current) => {
+      const next = reconcileDirectedEditBrief(current, tracks);
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
+    });
+  }, [session?.tracks, selectedTrackIds]);
+
+  useEffect(() => {
+    if (!agentPlan || !agentPlanContext) return;
+    setAgentEditValidation(validateDirectedPlan(agentPlan, agentPlanContext.editBrief));
+  }, [agentPlan, agentPlanContext]);
 
   useEffect(() => {
     if (!session) return;
@@ -3570,9 +3967,8 @@ export function App() {
     if (response.status === "ok") {
       setProject((current) => current && current.session.id === sessionId ? { ...current, session: response.session, history: response.history } : current);
       const turnEntry = response.history[response.history.length - 1];
-      // Snapshot this turn's full track — the agent's thinking and the tools it
-      // called — so the activity feedback persists in the chat instead of
-      // vanishing when the turn ends.
+      // Snapshot the full reasoning and tool track so it remains auditable after
+      // the live activity card closes.
       const snap = turnSnapshot;
       const turnReasoning = snap.filter((r) => r.phase === "think").map((r) => r.text).join("").trim();
       const turnTools = snap.filter((r) => r.phase === "tool").map((r) => r.text.trim()).filter(Boolean);
@@ -4112,7 +4508,7 @@ export function App() {
 
   async function renderCurrentVideo() {
     if (!session) return;
-    const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video"));
+    const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video" && !isAgentVideoOutput(track)));
     if (selectedVideoTrackIds.length === 0) {
       pushSystem("Select one or more video tracks in the canvas before exporting MP4.");
       return;
@@ -4143,7 +4539,7 @@ export function App() {
 
   async function renderAutoVideoEdit() {
     if (!session) return;
-    const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video"));
+    const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video" && !isAgentVideoOutput(track)));
     if (selectedVideoTrackIds.length === 0) {
       pushSystem("Select one or more video tracks before running Auto Video Edit.");
       return;
@@ -4180,7 +4576,7 @@ export function App() {
   // is rendered yet — the user clicks Process to render from the (possibly edited) plan.
   async function renderAgentVideoEdit(sampleIntervalSeconds: number, instructionsOverride?: string) {
     if (!session) return;
-    const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video"));
+    const selectedVideoTrackIds = selectedTrackIds.filter((id) => session.tracks.some((track) => track.id === id && track.kind === "video" && !isAgentVideoOutput(track)));
     if (selectedVideoTrackIds.length === 0) {
       pushSystem("Select one or more video tracks before running Agent Video Edit.");
       setAgentEditStatus("Select one or more video tracks first.");
@@ -4194,6 +4590,13 @@ export function App() {
     const visionModel = agentVideoModel.trim() || DEFAULT_AGENT_VIDEO_MODEL;
     const editModel = agentVideoEditModel.trim() || ollamaModel.trim() || DEFAULT_OLLAMA_MODEL;
     const instructions = (instructionsOverride ?? agentVideoInstructions).trim();
+    const directedBrief = {
+      ...reconcileDirectedEditBrief(
+        agentEditBrief,
+        session.tracks.filter((track) => selectedVideoTrackIds.includes(track.id) && !isAgentVideoOutput(track)),
+      ),
+      customInstructions: instructions || null,
+    };
     const range = selectedRange
       ? {
           startSample: Math.round(Math.max(0, Math.min(selectedRange.start, selectedRange.end)) * session.sampleRate),
@@ -4210,7 +4613,7 @@ export function App() {
       // planOnly = true: backend runs vision + edit models and returns the script,
       // skipping the ffmpeg render step. The user reviews/edits the plan, then clicks
       // Process to render.
-      const result = await api.renderAgentVideoEdit(session.id, undefined, range?.startSample, range?.endSample, selectedVideoTrackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, instructions, true);
+      const result = await api.renderAgentVideoEdit(session.id, undefined, range?.startSample, range?.endSample, selectedVideoTrackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, instructions, directedBrief, true);
       const rangeText = range ? ` (${formatTime(range.startSample / session.sampleRate)}-${formatTime(range.endSample / session.sampleRate)})` : "";
       setAgentEditScript(result.script);
       setAgentPlan(result.script);
@@ -4219,7 +4622,10 @@ export function App() {
         startSample: range?.startSample,
         endSample: range?.endSample,
         intervalSeconds: sampleIntervalSeconds,
+        editBrief: result.editBrief,
       });
+      setAgentEditBrief(result.editBrief);
+      setAgentEditValidation(result.validation);
       // Agent inferred a color look from instructions ("cinematic", "moody", etc.).
       // Sync the chip so the Process render applies it, and tell the user about it.
       if (result.lookPreset && result.lookPreset !== "none") {
@@ -4231,10 +4637,10 @@ export function App() {
       const planSummary = summarizeAgentPlan(result.script, result.lookPreset, result.colorGrade, result.videoEffects);
       setVideoChatMessages((items) => [...items, {
         role: "agent",
-        text: `Planned ${result.script.length} shots${rangeText}.\n\n${planSummary}\n\nReview the plan and click Process to render.`,
+        text: `Your edit plan is ready with ${result.script.length} shots${rangeText}. ${result.validation.valid ? "It follows your camera choices." : result.validation.messages.join(" ")}\n\n${planSummary}\n\nReview it if you want, then render the video.`,
         createdAt: new Date().toISOString(),
       }]);
-      setAgentEditStatus(`Plan ready — ${result.script.length} shots. Review and click Process.`);
+      setAgentEditStatus(`Edit plan ready — ${result.script.length} shots. Render when you are happy with it.`);
     } catch (error) {
       pushSystem(error);
       setAgentEditStatus(`Error: ${error instanceof Error ? error.message : String(error)}`);
@@ -4246,7 +4652,12 @@ export function App() {
   // Change which camera/track a single shot (script window) uses while reviewing the plan.
   function setPlanShot(windowIndex: number, trackIndex: number) {
     setAgentPlan((plan) => plan?.map((entry) => entry.windowIndex === windowIndex
-      ? { ...entry, chosenTrackIndex: trackIndex, chosenTrackName: entry.candidates.find((c) => c.trackIndex === trackIndex)?.trackName ?? entry.chosenTrackName }
+      ? {
+          ...entry,
+          chosenTrackId: entry.candidates.find((candidate) => candidate.trackIndex === trackIndex)?.trackId ?? entry.chosenTrackId,
+          chosenTrackIndex: trackIndex,
+          chosenTrackName: entry.candidates.find((candidate) => candidate.trackIndex === trackIndex)?.trackName ?? entry.chosenTrackName,
+        }
       : entry) ?? null);
   }
 
@@ -4267,9 +4678,10 @@ export function App() {
         agentPlanContext.startSample,
         agentPlanContext.endSample,
         agentPlan,
-        agentEditLook && agentEditLook !== "none" ? agentEditLook : undefined,
-        agentColorGrade ?? undefined,
-        agentVideoEffects ?? undefined,
+        agentPlanContext.editBrief.lookMode === "original" ? undefined : agentEditLook && agentEditLook !== "none" ? agentEditLook : undefined,
+        agentPlanContext.editBrief.lookMode === "original" ? undefined : agentColorGrade ?? undefined,
+        agentPlanContext.editBrief.lookMode === "original" ? undefined : agentVideoEffects ?? undefined,
+        agentPlanContext.editBrief,
       );
       const existingTrack = agentEditContext
         ? session.tracks.find((track) => track.id === agentEditContext.trackId)
@@ -4282,6 +4694,7 @@ export function App() {
           text: `Updated "${existingTrack.name}" with the new edit.`,
           createdAt: new Date().toISOString(),
         }]);
+        pushSystem(`Rendered the approved script and updated "${existingTrack.name}".`);
       } else {
         const startSample = agentPlanContext.startSample ?? 0;
         const existingAgentTracks = session.tracks.filter((track) => (track.name ?? "").startsWith("Agent Edit")).length;
@@ -4299,6 +4712,7 @@ export function App() {
           text: `Added "${trackName}" as a new video track.`,
           createdAt: new Date().toISOString(),
         }]);
+        pushSystem(`Rendered the approved script and added "${trackName}" to the timeline.`);
       }
       setAgentEditStatus("Rendered.");
       setAgentPlan(null);
@@ -4396,6 +4810,7 @@ export function App() {
           agentEditLook && agentEditLook !== "none" ? agentEditLook : undefined,
           agentColorGrade ?? undefined,
           agentVideoEffects ?? undefined,
+          agentPlanContext.editBrief,
           "high",
         );
         intermediateSource = hq.path;
@@ -4454,15 +4869,6 @@ export function App() {
     } finally {
       setBusy(false);
     }
-  }
-
-  function sendVideoEditorChat() {
-    const text = videoChatDraft.trim();
-    if (!text) return;
-    const now = new Date().toISOString();
-    setVideoChatMessages((items) => [...items, { role: "user", text, createdAt: now }]);
-    setAgentVideoInstructions((current) => current.trim() ? `${current.trim()}\n${text}` : text);
-    setVideoChatDraft("");
   }
 
   // Pull the focused video clip out of selectedClip — only when it points at a video
@@ -4915,51 +5321,31 @@ export function App() {
           <div className="video-editor-shell">
             <div className="video-editor-head">
               <div>
-                <strong>Video Editor</strong>
+                <strong>Create video edit</strong>
                 <span>
-                  {selectedVideoTracksForEditor.length} video track{selectedVideoTracksForEditor.length === 1 ? "" : "s"} selected
-                  {selectedRange ? ` · ${formatTime(videoEditorStartSeconds)}-${formatTime(videoEditorEndSeconds)}` : " · full timeline"}
+                  Using {selectedVideoTracksForEditor.length} camera{selectedVideoTracksForEditor.length === 1 ? "" : "s"}
+                  {selectedRange ? ` · ${formatTime(videoEditorStartSeconds)}-${formatTime(videoEditorEndSeconds)}` : " · whole song"}
                 </span>
               </div>
               <div className="video-editor-actions">
-                <button type="button" onClick={() => void toggleVideoMonitor(true)} disabled={selectedVideoTracksForEditor.length === 0}>
-                  Show Video Monitor
-                </button>
-                <select
-                  className="aspect-select"
-                  value={exportAspect}
-                  onChange={(event) => setExportAspect(event.target.value as ExportAspect)}
-                  title="Output aspect ratio for export (black bars added; source not cropped)"
-                  disabled={busy}
-                >
-                  <option value="original">Original</option>
-                  <option value="square">Square 1:1</option>
-                  <option value="portrait916">Portrait 9:16</option>
-                </select>
-                <select
-                  className="aspect-select"
-                  value={exportQuality}
-                  onChange={(event) => setExportQuality(event.target.value as ExportQuality)}
-                  title="Encoder quality. Hi-Q = -preset slow -crf 17 -b:a 320k (visually lossless). Fast = -preset veryfast (~3-5x faster, smaller file)."
-                  disabled={busy}
-                >
-                  <option value="high">Hi-Q (slow)</option>
-                  <option value="fast">Fast</option>
-                </select>
-                <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
-                  <Download size={15} /> Export MP4
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void renderAutoVideoEdit()}
-                  disabled={busy || selectedVideoTracksForEditor.length === 0}
-                  title={`Auto-cut between the selected cameras every ${agentIntervalSeconds || "2"}s (no AI) and export the result`}
-                >
-                  Quick Edit
-                </button>
-                <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
-                  Run Agent Edit
-                </button>
+                <details className="video-editor-header-more">
+                  <summary>Options</summary>
+                  <div>
+                    <button type="button" onClick={() => void toggleVideoMonitor(true)} disabled={selectedVideoTracksForEditor.length === 0}>Show preview window</button>
+                    <select className="aspect-select" value={exportAspect} onChange={(event) => setExportAspect(event.target.value as ExportAspect)} disabled={busy}>
+                      <option value="original">Original shape</option>
+                      <option value="square">Square 1:1</option>
+                      <option value="portrait916">Vertical 9:16</option>
+                    </select>
+                    <select className="aspect-select" value={exportQuality} onChange={(event) => setExportQuality(event.target.value as ExportQuality)} disabled={busy}>
+                      <option value="high">Best quality</option>
+                      <option value="fast">Faster render</option>
+                    </select>
+                    <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedVideoTracksForEditor.length === 0}><Download size={15} /> Export current timeline</button>
+                    <button type="button" onClick={() => void renderAutoVideoEdit()} disabled={busy || selectedVideoTracksForEditor.length === 0}>Quick automatic cut</button>
+                  </div>
+                </details>
+                {agentPlan ? <button type="button" className="primary" onClick={() => void processPlan()} disabled={busy || agentEditValidation?.valid === false}>Render video</button> : null}
                 <button type="button" className="video-editor-close" onClick={() => setVideoEditorOpen(false)}>×</button>
               </div>
             </div>
@@ -4973,20 +5359,22 @@ export function App() {
                     ) : videoEditorScript.find((entry) => entry.chosenTrackName) ? (
                       <div className="video-editor-program">
                         <Video size={38} />
-                        <strong>{videoEditorScript.find((entry) => entry.chosenTrackName)?.chosenTrackName}</strong>
-                        <span>{videoEditorScript.length} agent decisions on the timeline</span>
+                        <strong>Your edit plan is ready</strong>
+                        <span>{videoEditorScript.length} shots are ready to review or render.</span>
                       </div>
                     ) : (
                       <div className="video-editor-program">
                         <Video size={38} />
-                        <strong>{videoCanvas.width}×{videoCanvas.height}</strong>
-                        <span>Run the agent to build the edit script.</span>
+                        <strong>Your edited video will appear here</strong>
+                        <span>Choose the main camera, describe what you want, then make an edit plan.</span>
                       </div>
                     )}
                   </div>
                 </div>
 
-                <div className="video-editor-timeline">
+                <details className="video-editor-advanced-panel">
+                  <summary>View timeline (optional)</summary>
+                  <div className="video-editor-timeline">
                   <div className="video-editor-ruler">
                     <span>{formatTime(videoEditorStartSeconds)}</span>
                     <span>{formatTime(videoEditorStartSeconds + videoEditorSpanSeconds / 2)}</span>
@@ -5050,7 +5438,8 @@ export function App() {
                       </div>
                     </div>
                   ))}
-                </div>
+                  </div>
+                </details>
 
                 {agentEditProgress ? (
                   <div className={`agent-editor-progress stage-${agentEditProgress.stage}`}>
@@ -5067,7 +5456,9 @@ export function App() {
                 ) : agentEditStatus ? <div className="agent-editor-status">{agentEditStatus}</div> : null}
 
                 {videoEditorScript.length > 0 ? (
-                  <div className="agent-editor-script">
+                  <details className="video-editor-advanced-panel plan-review">
+                    <summary>Review individual cuts ({videoEditorScript.length})</summary>
+                    <div className="agent-editor-script">
                     <div className="agent-editor-script-head">
                       <strong>Edit script</strong>
                       <span>{videoEditorScript.length} decisions</span>
@@ -5105,15 +5496,27 @@ export function App() {
                         </div>
                       ))}
                     </div>
-                  </div>
+                    </div>
+                  </details>
                 ) : null}
               </section>
 
               <aside className="video-editor-side">
+                <DirectedEditBriefPanel
+                  tracks={selectedVideoTracksForEditor.filter((track) => !isAgentVideoOutput(track))}
+                  brief={agentEditBrief}
+                  validation={agentEditValidation}
+                  onChange={(brief) => {
+                    setAgentEditBrief(brief);
+                    setAgentEditValidation(null);
+                  }}
+                />
                 <div className="video-editor-card video-editor-chat">
-                  <strong>Video agent</strong>
+                  <div className="simple-chat-heading">
+                    <span className="simple-step-number">3</span>
+                    <div><strong>Describe the edit you want</strong><span>Write normally. The editor will follow your camera choice above.</span></div>
+                  </div>
                   <label className="video-editor-command">
-                    Instructions
                     <textarea
                       value={videoChatDraft}
                       onChange={(event) => setVideoChatDraft(event.target.value)}
@@ -5123,31 +5526,33 @@ export function App() {
                           void runAgentVideoEditFromDraft();
                         }
                       }}
-                      placeholder="Example: use the overhead view during dense guitar parts, hold closeups through phrases, and avoid sudden cuts unless the music changes."
+                      placeholder="Example: Keep Camera 2 for most of the performance. Use Camera 1 briefly for guitar details. Keep the original color and cut with the music."
                     />
                   </label>
                   <div className="video-editor-command-actions">
-                    <button type="button" onClick={sendVideoEditorChat} disabled={!videoChatDraft.trim()}>
-                      Add instruction
-                    </button>
                     <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedVideoTracksForEditor.length === 0}>
-                      Run Agent Edit
+                      Make edit plan
                     </button>
+                    {agentPlan ? <button type="button" onClick={() => void processPlan()} disabled={busy || agentEditValidation?.valid === false}>Render video</button> : null}
                   </div>
-                  <div className="video-editor-chat-log">
-                    {videoChatMessages.length === 0 ? (
-                      <span className="video-editor-empty">Select tracks, choose a range, then describe the edit in plain language.</span>
-                    ) : videoChatMessages.map((message, index) => (
-                      <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
-                        <span>{message.role}</span>
-                        <p>{message.text}</p>
+                  {videoChatMessages.length > 0 ? (
+                    <details className="simple-direction-history">
+                      <summary>Past directions and results</summary>
+                      <div className="video-editor-chat-log">
+                        {videoChatMessages.map((message, index) => (
+                          <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
+                            <span>{message.role}</span>
+                            <p>{message.text}</p>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
+                    </details>
+                  ) : null}
                 </div>
 
-                <div className="video-editor-card video-editor-settings">
-                  <strong>Agent settings</strong>
+                <details className="video-editor-card simple-side-details">
+                  <summary>Technical settings</summary>
+                  <div className="video-editor-settings">
                   <label>
                     Interval
                     <input value={agentIntervalSeconds} onChange={(event) => setAgentIntervalSeconds(event.target.value)} inputMode="decimal" />
@@ -5164,10 +5569,12 @@ export function App() {
                       {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
                     </select>
                   </label>
-                </div>
+                  </div>
+                </details>
 
-                <div className="video-editor-card video-editor-history">
-                  <strong>History</strong>
+                <details className="video-editor-card simple-side-details">
+                  <summary>Previous edits</summary>
+                  <div className="video-editor-history">
                   {videoEditHistory.length === 0 ? (
                     <span className="video-editor-empty">No saved video edit runs yet.</span>
                   ) : videoEditHistory.map((item) => (
@@ -5179,6 +5586,8 @@ export function App() {
                         setAgentVideoInstructions(item.instructions);
                         setAgentVideoModel(item.visionModel);
                         setAgentVideoEditModel(item.editModel);
+                        if (item.editBrief) setAgentEditBrief(item.editBrief);
+                        setAgentEditValidation(item.validation ?? null);
                       }}
                     >
                       <span>{new Date(item.createdAt).toLocaleString()}</span>
@@ -5186,7 +5595,8 @@ export function App() {
                       <em>{item.outputPath}</em>
                     </button>
                   ))}
-                </div>
+                  </div>
+                </details>
               </aside>
             </div>
           </div>
@@ -5879,10 +6289,10 @@ export function App() {
                     disabled={busy}
                     title="Render the (possibly edited) plan into a video and attach it to the session"
                   >
-                    Process
+                    Render video
                   </button>
                 </div>
-                <p className="plan-hint">Adjust any shot's camera, then click Process to render. No agent run.</p>
+                <p className="plan-hint">Optional: change any camera below, then render the video.</p>
                 <div className="plan-list">
                   {agentPlan.map((entry) => {
                     const candidates = Array.from(new Map(entry.candidates.map((c) => [c.trackIndex, c])).values());
@@ -6051,6 +6461,15 @@ export function App() {
                 </div>
               ) : null}
             </div>
+            {agentPlan && agentPlan.length > 0 ? (
+              <VideoPlanReview
+                plan={agentPlan}
+                validation={agentEditValidation}
+                busy={busy}
+                onRender={() => void processPlan()}
+                onSelectCamera={setPlanShot}
+              />
+            ) : null}
             {/* Standalone video-render progress — shows while the background edit runs,
                 independent of the chat turn (which ends immediately now). */}
             {agentEditProgress && agentEditProgress.stage !== "done" && agentEditProgress.stage !== "error" ? (
@@ -8315,6 +8734,13 @@ export function VideoEditorWindowApp() {
   const [agentVideoInstructions, setAgentVideoInstructions] = useState(() => initialAgentVideoInstructionsRef.current ?? "");
   const [agentEditProgress, setAgentEditProgress] = useState<{ stage: string; message: string; current: number; total: number; elapsedSeconds: number } | null>(null);
   const [agentEditScript, setAgentEditScript] = useState<AgentVideoScriptEntry[]>([]);
+  const [agentEditBrief, setAgentEditBrief] = useState<AgentEditBrief>(() => emptyDirectedEditBrief());
+  const [agentEditValidation, setAgentEditValidation] = useState<AgentEditValidation | null>(null);
+  const [agentPlan, setAgentPlan] = useState<AgentVideoScriptEntry[] | null>(null);
+  const [agentPlanContext, setAgentPlanContext] = useState<{ sourceTrackIds: string[]; startSample?: number; endSample?: number; editBrief: AgentEditBrief } | null>(null);
+  const [agentEditLook, setAgentEditLook] = useState<VideoFilterPreset>("none");
+  const [agentColorGrade, setAgentColorGrade] = useState<AgentColorGrade | null>(null);
+  const [agentVideoEffects, setAgentVideoEffects] = useState<AgentVideoEffects | null>(null);
   const [mainVideoEdit, setMainVideoEdit] = useState<MainVideoEdit>({ script: [] });
   // Export aspect ratio for the editor window (separate state from the main App).
   // "original" copies bytes; "square"/"portrait916" reencode with letterbox/pillarbox.
@@ -8359,6 +8785,31 @@ export function VideoEditorWindowApp() {
   }, []);
 
   useEffect(() => {
+    if (!session) return;
+    let unlisten: (() => void) | undefined;
+    void api.onVideoPlanReady((event) => {
+      if (event.sessionId !== session.id) return;
+      setAgentEditScript(event.script);
+      setAgentPlan(event.script);
+      setAgentPlanContext({
+        sourceTrackIds: event.sourceTrackIds,
+        startSample: event.startSample,
+        endSample: event.endSample,
+        editBrief: event.editBrief,
+      });
+      setAgentEditBrief(event.editBrief);
+      setAgentEditValidation(event.validation);
+      setAgentEditLook(event.lookPreset ?? "none");
+      setAgentColorGrade(event.colorGrade ?? null);
+      setAgentVideoEffects(event.videoEffects ?? null);
+      setMainVideoEdit({ script: event.script, rangeStartSeconds: event.startSample ? event.startSample / session.sampleRate : 0 });
+      setStatus(`Edit plan ready — ${event.script.length} shots. Render when you are happy with it.`);
+      setAgentEditProgress(null);
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [session?.id, session?.sampleRate]);
+
+  useEffect(() => {
     localStorage.setItem("autoMixer.ollamaUrl", ollamaUrl);
   }, [ollamaUrl]);
 
@@ -8375,6 +8826,20 @@ export function VideoEditorWindowApp() {
   useEffect(() => {
     localStorage.setItem("autoMixer.agentVideoInstructions", agentVideoInstructions);
   }, [agentVideoInstructions]);
+
+  useEffect(() => {
+    if (!session) return;
+    const tracks = session.tracks.filter((track) => selectedTrackIds.includes(track.id) && track.kind === "video" && !isAgentVideoOutput(track));
+    setAgentEditBrief((current) => {
+      const next = reconcileDirectedEditBrief(current, tracks);
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
+    });
+  }, [session?.tracks, selectedTrackIds]);
+
+  useEffect(() => {
+    if (!agentPlan || !agentPlanContext) return;
+    setAgentEditValidation(validateDirectedPlan(agentPlan, agentPlanContext.editBrief));
+  }, [agentPlan, agentPlanContext]);
 
   useEffect(() => {
     if (!session) return;
@@ -8475,12 +8940,12 @@ export function VideoEditorWindowApp() {
 
   function selectedVideoTracks() {
     if (!session) return [];
-    return session.tracks.filter((track) => track.kind === "video" && selectedTrackIds.includes(track.id));
+    return session.tracks.filter((track) => track.kind === "video" && !isAgentVideoOutput(track) && selectedTrackIds.includes(track.id));
   }
 
   function allVideoTracks() {
     if (!session) return [];
-    return session.tracks.filter((track) => track.kind === "video");
+    return session.tracks.filter((track) => track.kind === "video" && !isAgentVideoOutput(track));
   }
 
   function selectedVideoTrackIds() {
@@ -8711,37 +9176,35 @@ export function VideoEditorWindowApp() {
     const editModel = agentVideoEditModel.trim() || ollamaModel.trim() || DEFAULT_OLLAMA_MODEL;
     const instructions = (instructionsOverride ?? agentVideoInstructions).trim();
     const range = renderRangeSamples();
-    const outputPath = await save({
-      defaultPath: `${session.name.replace(/[^a-z0-9-]+/gi, "_") || "automix"}_agent_edit.mp4`,
-      filters: [{ name: "MP4", extensions: ["mp4"] }]
-    });
-    if (!outputPath) return;
+    const directedBrief = {
+      ...reconcileDirectedEditBrief(agentEditBrief, selectedVideoTracks()),
+      customInstructions: instructions || null,
+    };
     setBusy(true);
     setAgentEditScript([]);
-    setAgentEditProgress({ stage: "starting", message: "Starting Agent Video Edit...", current: 0, total: 1, elapsedSeconds: 0 });
-    setStatus(`Running ${visionModel} for vision and ${editModel} for edit decisions...`);
+    setAgentPlan(null);
+    setAgentPlanContext(null);
+    setAgentEditProgress({ stage: "starting", message: "Planning the directed edit...", current: 0, total: 1, elapsedSeconds: 0 });
+    setStatus(`Building your edit plan with ${visionModel}...`);
     try {
-      const result = await api.renderAgentVideoEdit(session.id, outputPath, range?.startSample, range?.endSample, trackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, instructions);
+      const result = await api.renderAgentVideoEdit(session.id, undefined, range?.startSample, range?.endSample, trackIds, sampleIntervalSeconds, ollamaUrl, visionModel, editModel, instructions, directedBrief, true);
       const createdAt = new Date().toISOString();
       const rangeStartSeconds = range ? range.startSample / session.sampleRate : 0;
       setAgentEditScript(result.script);
-      setMainVideoEdit({ script: result.script, outputPath, createdAt, rangeStartSeconds });
-      setVideoEditHistory((items) => [{
-        id: `${Date.now()}`,
-        createdAt,
-        outputPath,
-        visionModel,
-        editModel,
-        intervalSeconds: sampleIntervalSeconds,
-        instructions,
-        script: result.script,
-      }, ...items].slice(0, 20));
+      setAgentPlan(result.script);
+      setAgentPlanContext({ sourceTrackIds: trackIds, startSample: range?.startSample, endSample: range?.endSample, editBrief: result.editBrief });
+      setAgentEditBrief(result.editBrief);
+      setAgentEditValidation(result.validation);
+      setAgentEditLook(result.lookPreset ?? "none");
+      setAgentColorGrade(result.colorGrade ?? null);
+      setAgentVideoEffects(result.videoEffects ?? null);
+      setMainVideoEdit({ script: result.script, createdAt, rangeStartSeconds });
       setVideoChatMessages((items) => [...items, {
         role: "agent",
-        text: `Rendered ${result.script.length} decisions into the Main video lane with ${visionModel} + ${editModel}.`,
+        text: `Your edit plan is ready with ${result.script.length} shots. ${result.validation.valid ? "It follows your camera choices." : result.validation.messages.join(" ")} Review it if you want, then render the video.`,
         createdAt,
       }]);
-      setStatus(`Done: ${result.path}`);
+      setStatus(`Edit plan ready — ${result.script.length} shots. Render when you are happy with it.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -8749,13 +9212,70 @@ export function VideoEditorWindowApp() {
     }
   }
 
-  function sendVideoEditorChat() {
-    const text = videoChatDraft.trim();
-    if (!text) return;
-    const now = new Date().toISOString();
-    setVideoChatMessages((items) => [...items, { role: "user", text, createdAt: now }]);
-    setAgentVideoInstructions((current) => current.trim() ? `${current.trim()}\n${text}` : text);
-    setVideoChatDraft("");
+  async function processVideoEditorPlan() {
+    if (!session || !agentPlan || !agentPlanContext) {
+      setStatus("Generate a plan first.");
+      return;
+    }
+    setBusy(true);
+    setAgentEditProgress({ stage: "rendering", message: "Rendering the approved directed edit...", current: 0, total: 1, elapsedSeconds: 0 });
+    try {
+      const original = agentPlanContext.editBrief.lookMode === "original";
+      const result = await api.renderVideoFromScript(
+        session.id,
+        agentPlanContext.sourceTrackIds,
+        agentPlanContext.startSample,
+        agentPlanContext.endSample,
+        agentPlan,
+        original ? undefined : agentEditLook !== "none" ? agentEditLook : undefined,
+        original ? undefined : agentColorGrade ?? undefined,
+        original ? undefined : agentVideoEffects ?? undefined,
+        agentPlanContext.editBrief,
+      );
+      const createdAt = new Date().toISOString();
+      const rangeStartSeconds = agentPlanContext.startSample ? agentPlanContext.startSample / session.sampleRate : 0;
+      setMainVideoEdit({ script: agentPlan, outputPath: result.path, createdAt, rangeStartSeconds });
+      setAgentEditScript(agentPlan);
+      setVideoEditHistory((items) => [{
+        id: `${Date.now()}`,
+        createdAt,
+        outputPath: result.path,
+        visionModel: agentVideoModel,
+        editModel: agentVideoEditModel,
+        intervalSeconds: Number(agentIntervalSeconds),
+        instructions: agentVideoInstructions,
+        script: agentPlan,
+        editBrief: agentPlanContext.editBrief,
+        validation: agentEditValidation ?? undefined,
+      }, ...items].slice(0, 20));
+      setVideoChatMessages((items) => [...items, { role: "agent", text: "Your video is rendered and follows the camera choices you approved.", createdAt }]);
+      setStatus("Rendered. Use Export MP4 for the delivery file.");
+      setAgentPlan(null);
+      setAgentPlanContext(null);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function setVideoEditorPlanShot(windowIndex: number, trackId: string) {
+    const update = (entry: AgentVideoScriptEntry): AgentVideoScriptEntry => {
+      if (entry.windowIndex !== windowIndex) return entry;
+      const candidate = entry.candidates.find((item) => item.trackId === trackId);
+      if (!candidate) return entry;
+      return {
+        ...entry,
+        chosenTrackId: candidate.trackId,
+        chosenTrackIndex: candidate.trackIndex,
+        chosenTrackName: candidate.trackName,
+        decision: "manual",
+        reason: `User selected ${candidate.trackName} while reviewing the plan.`,
+      };
+    };
+    setAgentPlan((plan) => plan?.map(update) ?? null);
+    setAgentEditScript((script) => script.map(update));
+    setMainVideoEdit((current) => ({ ...current, script: current.script.map(update), outputPath: undefined }));
   }
 
   async function runAgentVideoEditFromDraft() {
@@ -8810,42 +9330,31 @@ export function VideoEditorWindowApp() {
       <div className="video-editor-shell windowed">
         <div className="video-editor-head">
           <div>
-            <strong>Video Editor</strong>
+            <strong>Create video edit</strong>
             <span>
-              {selectedTracks.length} video track{selectedTracks.length === 1 ? "" : "s"} selected
-              {selectedRange ? ` · edit range ${formatTime(selectedRange.start)}-${formatTime(selectedRange.end)}` : " · full timeline"}
+              Using {selectedTracks.length} camera{selectedTracks.length === 1 ? "" : "s"}
+              {selectedRange ? ` · ${formatTime(selectedRange.start)}-${formatTime(selectedRange.end)}` : " · whole song"}
             </span>
           </div>
           <div className="video-editor-actions">
             <button type="button" onClick={toggleProgramPlayback} disabled={mainVideoEdit.script.length === 0}>
               {programPlaying ? <Pause size={15} /> : <Play size={15} />} {programPlaying ? "Pause" : "Play"}
             </button>
-            <button type="button" onClick={() => void bootstrapVideoEditor({ sessionId: session.id, trackIds: selectedTrackIds, range: selectedRange, playhead })}>
-              Refresh
-            </button>
-            <button type="button" onClick={() => void openVideoMonitorFromEditor()} disabled={selectedTracks.length === 0}>
-              Show Video Monitor
-            </button>
-            <select
-              className="aspect-select"
-              value={exportAspect}
-              onChange={(event) => setExportAspect(event.target.value as ExportAspect)}
-              title="Output aspect ratio for export (black bars added; source not cropped)"
-              disabled={busy}
-            >
-              <option value="original">Original</option>
-              <option value="square">Square 1:1</option>
-              <option value="portrait916">Portrait 9:16</option>
-            </select>
-            <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedTracks.length === 0}>
-              <Download size={15} /> Export MP4
-            </button>
-            <button type="button" onClick={() => void renderAutoVideoEdit()} disabled={busy || selectedTracks.length === 0}>
-              Quick Edit
-            </button>
-            <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedTracks.length === 0}>
-              Run Agent Edit
-            </button>
+            <details className="video-editor-header-more">
+              <summary>Options</summary>
+              <div>
+                <button type="button" onClick={() => void bootstrapVideoEditor({ sessionId: session.id, trackIds: selectedTrackIds, range: selectedRange, playhead })}>Refresh</button>
+                <button type="button" onClick={() => void openVideoMonitorFromEditor()} disabled={selectedTracks.length === 0}>Show preview window</button>
+                <select className="aspect-select" value={exportAspect} onChange={(event) => setExportAspect(event.target.value as ExportAspect)} disabled={busy}>
+                  <option value="original">Original shape</option>
+                  <option value="square">Square 1:1</option>
+                  <option value="portrait916">Vertical 9:16</option>
+                </select>
+                <button type="button" onClick={() => void renderCurrentVideo()} disabled={busy || selectedTracks.length === 0}><Download size={15} /> Export current timeline</button>
+                <button type="button" onClick={() => void renderAutoVideoEdit()} disabled={busy || selectedTracks.length === 0}>Quick automatic cut</button>
+              </div>
+            </details>
+            {agentPlan ? <button type="button" className="primary" onClick={() => void processVideoEditorPlan()} disabled={busy || agentEditValidation?.valid === false}>Render video</button> : null}
           </div>
         </div>
 
@@ -8875,20 +9384,22 @@ export function VideoEditorWindowApp() {
                 ) : videoEditorScript.find((entry) => entry.chosenTrackName) ? (
                   <div className="video-editor-program">
                     <Video size={38} />
-                    <strong>Render the Main video</strong>
-                    <span>Run Agent Edit to create the MP4, then the canvas will play that rendered video.</span>
+                    <strong>Your edit plan is ready</strong>
+                    <span>{videoEditorScript.length} shots are ready to review or render.</span>
                   </div>
                 ) : (
                   <div className="video-editor-program">
                     <Video size={38} />
-                    <strong>{videoCanvas.width}x{videoCanvas.height}</strong>
-                    <span>Run the agent to build the edit script.</span>
+                    <strong>Your edited video will appear here</strong>
+                    <span>Choose the main camera, describe what you want, then make an edit plan.</span>
                   </div>
                 )}
               </div>
             </div>
 
-            <div className="video-editor-rangebar">
+            <details className="video-editor-advanced-panel">
+              <summary>Choose a section or view timeline (optional)</summary>
+              <div className="video-editor-rangebar">
               <label>
                 Start
                 <input
@@ -8920,9 +9431,9 @@ export function VideoEditorWindowApp() {
               <button type="button" onClick={() => setEditorRange(0, editorEndSeconds, editorEndSeconds)}>Whole Timeline</button>
               <button type="button" onClick={() => setSelectedRange(undefined)}>Clear Range</button>
               <span>{selectedRange ? `Edits use ${formatTime(selectedRange.start)}-${formatTime(selectedRange.end)}` : "Edits use the full timeline"}</span>
-            </div>
+              </div>
 
-            <div className="video-editor-timeline">
+              <div className="video-editor-timeline">
               <div className="video-editor-ruler">
                 <span>{formatTime(editorStartSeconds)}</span>
                 <span>{formatTime(editorStartSeconds + editorSpanSeconds / 2)}</span>
@@ -9027,7 +9538,8 @@ export function VideoEditorWindowApp() {
                   </div>
                 </div>
               ))}
-            </div>
+              </div>
+            </details>
 
             {agentEditProgress ? (
               <div className={`agent-editor-progress stage-${agentEditProgress.stage}`}>
@@ -9044,7 +9556,9 @@ export function VideoEditorWindowApp() {
             ) : status ? <div className="agent-editor-status">{status}</div> : null}
 
             {videoEditorScript.length > 0 ? (
-              <div className="agent-editor-script">
+              <details className="video-editor-advanced-panel plan-review">
+                <summary>Review individual cuts ({videoEditorScript.length})</summary>
+                <div className="agent-editor-script">
                 <div className="agent-editor-script-head">
                   <strong>Edit script</strong>
                   <span>{videoEditorScript.length} decisions</span>
@@ -9060,6 +9574,16 @@ export function VideoEditorWindowApp() {
                           {entry.varietyOverride ? " · variation override" : ""}
                         </span>
                       </div>
+                      {entry.candidates.length > 1 ? (
+                        <label className="agent-editor-shot-picker">
+                          Camera for this shot
+                          <select value={entry.chosenTrackId ?? ""} onChange={(event) => setVideoEditorPlanShot(entry.windowIndex, event.target.value)}>
+                            {entry.candidates.map((candidate) => (
+                              <option key={candidate.trackId ?? `${candidate.trackIndex}`} value={candidate.trackId ?? ""}>{candidate.trackName}</option>
+                            ))}
+                          </select>
+                        </label>
+                      ) : null}
                       <p>{entry.reason}</p>
                       {entry.dataProvided?.length > 0 ? (
                         <div className="agent-editor-script-data">
@@ -9072,13 +9596,15 @@ export function VideoEditorWindowApp() {
                     </div>
                   ))}
                 </div>
-              </div>
+                </div>
+              </details>
             ) : null}
           </section>
 
           <aside className="video-editor-side">
             <div className="video-editor-card video-editor-track-picker">
-              <strong>Video tracks</strong>
+              <strong>Cameras in this edit</strong>
+              <span className="video-editor-card-help">Uncheck any camera you do not want the editor to use.</span>
               {availableVideoTracks.length === 0 ? (
                 <span className="video-editor-empty">No video tracks in this session.</span>
               ) : availableVideoTracks.map((track) => (
@@ -9104,10 +9630,22 @@ export function VideoEditorWindowApp() {
               ))}
             </div>
 
+            <DirectedEditBriefPanel
+              tracks={selectedTracks.filter((track) => !isAgentVideoOutput(track))}
+              brief={agentEditBrief}
+              validation={agentEditValidation}
+              onChange={(brief) => {
+                setAgentEditBrief(brief);
+                setAgentEditValidation(null);
+              }}
+            />
+
             <div className="video-editor-card video-editor-chat">
-              <strong>Video agent</strong>
+              <div className="simple-chat-heading">
+                <span className="simple-step-number">3</span>
+                <div><strong>Describe the edit you want</strong><span>Write normally. The editor will follow your camera choice above.</span></div>
+              </div>
               <label className="video-editor-command">
-                Instructions
                 <textarea
                   value={videoChatDraft}
                   onChange={(event) => setVideoChatDraft(event.target.value)}
@@ -9117,31 +9655,33 @@ export function VideoEditorWindowApp() {
                       void runAgentVideoEditFromDraft();
                     }
                   }}
-                  placeholder="Example: use the overhead view during dense guitar parts, hold closeups through phrases, and avoid sudden cuts unless the music changes."
+                  placeholder="Example: Keep Camera 2 for most of the performance. Use Camera 1 briefly for guitar details. Keep the original color and cut with the music."
                 />
               </label>
               <div className="video-editor-command-actions">
-                <button type="button" onClick={sendVideoEditorChat} disabled={!videoChatDraft.trim()}>
-                  Add instruction
-                </button>
                 <button type="button" className="primary" onClick={() => void runAgentVideoEditFromDraft()} disabled={busy || selectedTracks.length === 0}>
-                  Run Agent Edit
+                  Make edit plan
                 </button>
+                {agentPlan ? <button type="button" onClick={() => void processVideoEditorPlan()} disabled={busy || agentEditValidation?.valid === false}>Render video</button> : null}
               </div>
-              <div className="video-editor-chat-log">
-                {videoChatMessages.length === 0 ? (
-                  <span className="video-editor-empty">Select tracks, choose a range, then describe the edit in plain language.</span>
-                ) : videoChatMessages.map((message, index) => (
-                  <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
-                    <span>{message.role}</span>
-                    <p>{message.text}</p>
+              {videoChatMessages.length > 0 ? (
+                <details className="simple-direction-history">
+                  <summary>Past directions and results</summary>
+                  <div className="video-editor-chat-log">
+                    {videoChatMessages.map((message, index) => (
+                      <div className={`video-editor-message ${message.role}`} key={`${message.createdAt}-${index}`}>
+                        <span>{message.role}</span>
+                        <p>{message.text}</p>
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
+                </details>
+              ) : null}
             </div>
 
-            <div className="video-editor-card video-editor-settings">
-              <strong>Agent settings</strong>
+            <details className="video-editor-card simple-side-details">
+              <summary>Technical settings</summary>
+              <div className="video-editor-settings">
               <label>
                 Interval
                 <input value={agentIntervalSeconds} onChange={(event) => setAgentIntervalSeconds(event.target.value)} inputMode="decimal" />
@@ -9158,10 +9698,12 @@ export function VideoEditorWindowApp() {
                   {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
                 </select>
               </label>
-            </div>
+              </div>
+            </details>
 
-            <div className="video-editor-card video-editor-history">
-              <strong>History</strong>
+            <details className="video-editor-card simple-side-details">
+              <summary>Previous edits</summary>
+              <div className="video-editor-history">
               {videoEditHistory.length === 0 ? (
                 <span className="video-editor-empty">No saved video edit runs yet.</span>
               ) : videoEditHistory.map((item) => (
@@ -9175,6 +9717,8 @@ export function VideoEditorWindowApp() {
                     setAgentVideoInstructions(item.instructions);
                     setAgentVideoModel(item.visionModel);
                     setAgentVideoEditModel(item.editModel);
+                    if (item.editBrief) setAgentEditBrief(item.editBrief);
+                    setAgentEditValidation(item.validation ?? null);
                   }}
                 >
                   <span>{new Date(item.createdAt).toLocaleString()}</span>
@@ -9182,7 +9726,8 @@ export function VideoEditorWindowApp() {
                   <em>{item.outputPath}</em>
                 </button>
               ))}
-            </div>
+              </div>
+            </details>
           </aside>
         </div>
       </div>

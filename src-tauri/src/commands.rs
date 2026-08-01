@@ -90,6 +90,11 @@ struct ClipEffectsChoice {
 pub struct AgentVideoEditResponse {
     pub path: String,
     pub script: Vec<AgentVideoScriptEntry>,
+    /// The normalized, machine-enforced directing contract used for this plan.
+    /// Returning it lets the UI show exactly how natural-language direction was
+    /// interpreted before the user commits to a render.
+    pub edit_brief: AgentEditBrief,
+    pub validation: AgentEditValidation,
     // Color-look preset the agent inferred from the user's instructions (e.g. "cinema",
     // "warm", "moody"), so the frontend can sync its Look chip and reuse it on re-renders.
     // Serialized as `lookPreset` (camelCase) for the TS client. None = no preset applied.
@@ -101,10 +106,84 @@ pub struct AgentVideoEditResponse {
     pub video_effects: Option<AgentVideoEffects>,
 }
 
+/// A structured directing contract. Creative decisions stay with the model, while
+/// source roles, coverage, insert length, pacing mode, and visual-treatment rules are
+/// explicit enough for the backend to validate and enforce.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEditBrief {
+    #[serde(default)]
+    pub sources: Vec<AgentEditSourceRule>,
+    #[serde(default = "default_creative_freedom")]
+    pub creative_freedom: String,
+    #[serde(default = "default_edit_pacing")]
+    pub pacing: String,
+    #[serde(default = "default_look_mode")]
+    pub look_mode: String,
+    #[serde(default)]
+    pub custom_instructions: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEditSourceRule {
+    pub track_id: String,
+    #[serde(default)]
+    pub track_name: String,
+    #[serde(default = "default_source_role")]
+    pub role: String,
+    #[serde(default)]
+    pub minimum_coverage: Option<f32>,
+    #[serde(default)]
+    pub maximum_coverage: Option<f32>,
+    #[serde(default)]
+    pub maximum_insert_seconds: Option<f32>,
+    #[serde(default)]
+    pub target_insert_count: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEditValidation {
+    pub valid: bool,
+    #[serde(default)]
+    pub messages: Vec<String>,
+    #[serde(default)]
+    pub source_coverage: Vec<AgentEditSourceCoverage>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEditSourceCoverage {
+    pub track_id: String,
+    pub track_name: String,
+    pub role: String,
+    pub seconds: f64,
+    pub fraction: f64,
+}
+
+fn default_creative_freedom() -> String {
+    "balanced".into()
+}
+
+fn default_edit_pacing() -> String {
+    "follow_music".into()
+}
+
+fn default_look_mode() -> String {
+    "original".into()
+}
+
+fn default_source_role() -> String {
+    "secondary".into()
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentVideoScriptCandidate {
     image_number: usize,
+    #[serde(default)]
+    track_id: Option<String>,
     track_index: usize,
     track_name: String,
     timeline_seconds: f64,
@@ -121,6 +200,8 @@ pub struct AgentVideoScriptEntry {
     end_seconds: f64,
     decision: String,
     candidates: Vec<AgentVideoScriptCandidate>,
+    #[serde(default)]
+    chosen_track_id: Option<String>,
     chosen_track_index: Option<usize>,
     chosen_track_name: Option<String>,
     reason: String,
@@ -236,7 +317,10 @@ struct AgentMergedChoice {
     candidate_labels: Option<Vec<String>>,
     candidate_notes: Option<Vec<String>>,
     window_summary: Option<String>,
-    choice: usize,
+    #[serde(default)]
+    choice: Option<usize>,
+    #[serde(default)]
+    chosen_track_id: Option<String>,
     decision: Option<String>,
     reason: Option<String>,
     edit_intent: Option<String>,
@@ -1739,7 +1823,7 @@ pub fn apply_video_effects(
 /// The agent owns the loop (reasoning, tool execution, memory). Its tool calls
 /// flow through the in-process control surface (`control.rs`), which mutates the
 /// live session and refreshes the UI via `session:externally-updated` — so faders
-/// move mid-turn. We stream the agent's tokens/thoughts/tool events onto the same
+/// move mid-turn. We stream the agent's final message, reasoning, and tool events onto the same
 /// `llm:turn-start`/`llm:chunk`/`llm:turn-end` events the chat UI already renders.
 #[tauri::command]
 pub async fn assistant_request(
@@ -4330,6 +4414,38 @@ pub fn revert_clip_video(
 }
 
 #[tauri::command]
+pub fn interpret_agent_edit_brief(
+    state: State<'_, AppState>,
+    session_id: String,
+    track_ids: Vec<String>,
+    instructions: String,
+    edit_brief: Option<AgentEditBrief>,
+) -> Result<AgentEditBrief, String> {
+    let project = state
+        .store
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_project(&session_id)?;
+    let selected_track_ids = track_ids
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect::<HashSet<_>>();
+    if selected_track_ids.is_empty() {
+        return Err("Select at least one source video track before interpreting the brief.".into());
+    }
+    let full_end = session_duration_samples(&project.session).max(1);
+    let clips = collect_video_inputs(&project.session, 0, full_end, &selected_track_ids);
+    if clips.is_empty() {
+        return Err("The selected source tracks have no video clips.".into());
+    }
+    Ok(normalize_agent_edit_brief(
+        edit_brief,
+        Some(instructions.trim()),
+        &clips,
+    ))
+}
+
+#[tauri::command]
 pub async fn render_agent_video_edit(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -4344,6 +4460,7 @@ pub async fn render_agent_video_edit(
     vision_model: Option<String>,
     edit_model: Option<String>,
     instructions: Option<String>,
+    edit_brief: Option<AgentEditBrief>,
     // When true, run the agent's decision phase only and return the script — no ffmpeg
     // render. The frontend uses this to show a plan that the user can review/edit before
     // clicking Process to actually render.
@@ -4452,6 +4569,7 @@ pub async fn render_agent_video_edit(
     let instructions = instructions
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let edit_brief = normalize_agent_edit_brief(edit_brief, instructions.as_deref(), &video_inputs);
 
     let total_windows = range_end
         .saturating_sub(range_start)
@@ -4537,6 +4655,7 @@ pub async fn render_agent_video_edit(
             &vision_model,
             &edit_model,
             instructions.as_deref(),
+            &edit_brief,
             Some(&audio_analysis),
             &temp_dir,
         )
@@ -4568,13 +4687,22 @@ pub async fn render_agent_video_edit(
                 &error,
             );
             // Even on agent failure, honor explicit keyword effects from the instructions.
-            let kw_effects = instructions
-                .as_deref()
-                .and_then(infer_effects_from_instructions);
-            let (kw_look, kw_grade) = instructions
-                .as_deref()
-                .map(infer_look_from_instructions)
-                .unwrap_or((None, None));
+            let preserve_original = edit_brief.look_mode == "original";
+            let kw_effects = (!preserve_original)
+                .then(|| {
+                    instructions
+                        .as_deref()
+                        .and_then(infer_effects_from_instructions)
+                })
+                .flatten();
+            let (kw_look, kw_grade) = if preserve_original {
+                (None, None)
+            } else {
+                instructions
+                    .as_deref()
+                    .map(infer_look_from_instructions)
+                    .unwrap_or((None, None))
+            };
             (segments, script, kw_look, kw_grade, kw_effects)
         });
     let _ = fs::remove_dir_all(&temp_dir);
@@ -4594,6 +4722,7 @@ pub async fn render_agent_video_edit(
     }
 
     if plan_only.unwrap_or(false) {
+        let validation = validate_agent_edit_script(&script, &edit_brief);
         emit_agent_progress(
             &app,
             &session_id,
@@ -4606,6 +4735,8 @@ pub async fn render_agent_video_edit(
         return Ok(AgentVideoEditResponse {
             path: String::new(),
             script,
+            edit_brief,
+            validation,
             look_preset: agent_look_preset,
             color_grade: agent_color_grade,
             video_effects: agent_effects,
@@ -4683,9 +4814,12 @@ pub async fn render_agent_video_edit(
         total_windows,
         total_windows,
     );
+    let validation = validate_agent_edit_script(&script, &edit_brief);
     Ok(AgentVideoEditResponse {
         path: path.to_string_lossy().to_string(),
         script,
+        edit_brief,
+        validation,
         look_preset: agent_look_preset,
         color_grade: agent_color_grade,
         video_effects: agent_effects,
@@ -4857,9 +4991,9 @@ fn build_segments_from_script(
 ) -> Vec<AutoEditSegment> {
     let mut segments = Vec::new();
     for entry in script {
-        let Some(track_index) = entry.chosen_track_index else {
+        if entry.chosen_track_id.is_none() && entry.chosen_track_index.is_none() {
             continue;
-        };
+        }
         let window_start =
             ((entry.start_seconds * sample_rate as f64).round() as u64).max(range_start);
         let window_end = ((entry.end_seconds * sample_rate as f64).round() as u64).min(range_end);
@@ -4867,7 +5001,11 @@ fn build_segments_from_script(
             continue;
         }
         let Some((input_index, clip)) = clips.iter().enumerate().find(|(_, clip)| {
-            clip.track_index == track_index
+            entry
+                .chosen_track_id
+                .as_deref()
+                .map(|track_id| clip.track_id == track_id)
+                .unwrap_or_else(|| entry.chosen_track_index == Some(clip.track_index))
                 && clip.start_sample < window_end
                 && clip.end_sample > window_start
         }) else {
@@ -4914,10 +5052,28 @@ pub fn render_video_from_script(
     look_preset: Option<crate::model::VideoFilterPreset>,
     color_grade: Option<AgentColorGrade>,
     video_effects: Option<AgentVideoEffects>,
+    edit_brief: Option<AgentEditBrief>,
     // "high" = final-export encoder (slow + CRF 17 + AAC 320k); anything else
     // (None / "fast" / "preview") = fast preview encoder.
     quality: Option<String>,
 ) -> Result<RenderFromScriptResponse, String> {
+    if let Some(brief) = edit_brief.as_ref() {
+        let validation = validate_agent_edit_script(&script, brief);
+        if !validation.valid {
+            return Err(format!(
+                "The edit plan does not satisfy the directing contract: {}",
+                validation.messages.join(" ")
+            ));
+        }
+    }
+    let preserve_original = edit_brief
+        .as_ref()
+        .is_some_and(|brief| brief.look_mode == "original");
+    let (look_preset, color_grade, video_effects) = if preserve_original {
+        (None, None, None)
+    } else {
+        (look_preset, color_grade, video_effects)
+    };
     let project = state
         .store
         .lock()
@@ -5399,6 +5555,375 @@ fn collect_video_inputs(
             .then_with(|| a.start_sample.cmp(&b.start_sample))
     });
     clips
+}
+
+fn normalize_edit_text(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn instruction_preserves_original_visuals(instructions: Option<&str>) -> bool {
+    let text = normalize_edit_text(instructions.unwrap_or_default());
+    [
+        "no visual effects",
+        "no effects",
+        "no color grading",
+        "no colour grading",
+        "no filters",
+        "without effects",
+        "without filters",
+        "exactly as recorded",
+        "as recorded",
+        "original footage",
+        "sin efectos",
+        "sin filtros",
+        "videos originales",
+        "tal como esta",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+fn instruction_primary_fraction(instructions: Option<&str>) -> Option<f32> {
+    let text = instructions.unwrap_or_default();
+    let bytes = text.as_bytes();
+    let mut best_percent: Option<f32> = None;
+    for (percent_index, byte) in bytes.iter().enumerate() {
+        if *byte != b'%' {
+            continue;
+        }
+        let mut start = percent_index;
+        while start > 0 && (bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'.') {
+            start -= 1;
+        }
+        if start == percent_index {
+            continue;
+        }
+        if let Ok(value) = text[start..percent_index].parse::<f32>() {
+            if (50.0..=100.0).contains(&value) {
+                best_percent = Some(best_percent.map_or(value, |current| current.max(value)));
+            }
+        }
+    }
+    best_percent.map(|value| value / 100.0)
+}
+
+fn inferred_primary_track_id(
+    instructions: Option<&str>,
+    clips: &[VideoRenderClip],
+) -> Option<String> {
+    let text = normalize_edit_text(instructions.unwrap_or_default());
+    if text.is_empty() {
+        return None;
+    }
+    let marker_positions = [
+        "primary",
+        "main",
+        "principal",
+        "dominant",
+        "default",
+        "base",
+    ]
+    .iter()
+    .flat_map(|marker| text.match_indices(marker).map(|(index, _)| index))
+    .collect::<Vec<_>>();
+    if marker_positions.is_empty() {
+        return None;
+    }
+
+    let mut unique_tracks: Vec<(&str, &str)> = Vec::new();
+    for clip in clips {
+        if !unique_tracks.iter().any(|(id, _)| *id == clip.track_id) {
+            unique_tracks.push((&clip.track_id, &clip.track_name));
+        }
+    }
+    unique_tracks
+        .into_iter()
+        .filter_map(|(track_id, track_name)| {
+            let full = normalize_edit_text(track_name);
+            let short = normalize_edit_text(
+                track_name
+                    .split(['-', '–', '—'])
+                    .next()
+                    .unwrap_or(track_name),
+            );
+            let aliases = if short.len() >= 4 && short != full {
+                vec![full, short]
+            } else {
+                vec![full]
+            };
+            let distance = aliases
+                .iter()
+                .flat_map(|alias| text.match_indices(alias).map(|(index, _)| index))
+                .flat_map(|track_position| {
+                    marker_positions
+                        .iter()
+                        .map(move |marker_position| track_position.abs_diff(*marker_position))
+                })
+                .min()?;
+            (distance <= 180).then(|| (distance, track_id.to_string()))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, track_id)| track_id)
+}
+
+fn normalize_agent_edit_brief(
+    provided: Option<AgentEditBrief>,
+    instructions: Option<&str>,
+    clips: &[VideoRenderClip],
+) -> AgentEditBrief {
+    let brief_was_provided = provided.is_some();
+    let mut brief = provided.unwrap_or_default();
+    brief.creative_freedom = match brief.creative_freedom.trim().to_lowercase().as_str() {
+        "faithful" => "faithful",
+        "director" => "director",
+        _ => "balanced",
+    }
+    .into();
+    brief.pacing = match brief.pacing.trim().to_lowercase().as_str() {
+        "relaxed" => "relaxed",
+        "energetic" => "energetic",
+        _ => "follow_music",
+    }
+    .into();
+    brief.look_mode = match brief.look_mode.trim().to_lowercase().as_str() {
+        "agent" => "agent",
+        "preset" => "preset",
+        _ => "original",
+    }
+    .into();
+    if instruction_preserves_original_visuals(instructions) {
+        brief.look_mode = "original".into();
+    } else if !brief_was_provided
+        && instructions.is_some_and(|text| {
+            let (look, grade) = infer_look_from_instructions(text);
+            look.is_some() || grade.is_some() || infer_effects_from_instructions(text).is_some()
+        })
+    {
+        brief.look_mode = "agent".into();
+    }
+    if brief
+        .custom_instructions
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        brief.custom_instructions = instructions
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+    }
+
+    let inferred_primary = inferred_primary_track_id(instructions, clips);
+    let inferred_fraction = instruction_primary_fraction(instructions);
+    let mut normalized_sources = Vec::new();
+    let mut seen = HashSet::new();
+    for clip in clips {
+        if !seen.insert(clip.track_id.clone()) {
+            continue;
+        }
+        let supplied = brief
+            .sources
+            .iter()
+            .find(|rule| rule.track_id == clip.track_id);
+        let mut role = supplied
+            .map(|rule| rule.role.trim().to_lowercase())
+            .unwrap_or_default();
+        if !matches!(role.as_str(), "main" | "secondary" | "insert" | "exclude") {
+            role = if inferred_primary.as_deref() == Some(clip.track_id.as_str()) {
+                "main".into()
+            } else {
+                "secondary".into()
+            };
+        }
+        if inferred_primary.as_deref() == Some(clip.track_id.as_str()) {
+            role = "main".into();
+        } else if inferred_primary.is_some() && role == "main" {
+            role = "insert".into();
+        }
+        let default_minimum = if role == "main" {
+            Some(inferred_fraction.unwrap_or_else(|| {
+                let text = normalize_edit_text(instructions.unwrap_or_default());
+                if text.contains("few")
+                    || text.contains("brief")
+                    || text.contains("minimal")
+                    || text.contains("pocos")
+                {
+                    0.85
+                } else {
+                    0.70
+                }
+            }))
+        } else {
+            None
+        };
+        normalized_sources.push(AgentEditSourceRule {
+            track_id: clip.track_id.clone(),
+            track_name: clip.track_name.clone(),
+            role: role.clone(),
+            minimum_coverage: if role == "main" {
+                supplied
+                    .and_then(|rule| rule.minimum_coverage)
+                    .or(default_minimum)
+                    .map(|value| value.clamp(0.0, 1.0))
+            } else {
+                None
+            },
+            maximum_coverage: supplied
+                .and_then(|rule| rule.maximum_coverage)
+                .map(|value| value.clamp(0.0, 1.0)),
+            maximum_insert_seconds: supplied
+                .and_then(|rule| rule.maximum_insert_seconds)
+                .or_else(|| {
+                    let text = normalize_edit_text(instructions.unwrap_or_default());
+                    (role == "insert"
+                        && (text.contains("few seconds")
+                            || text.contains("brief cuts")
+                            || text.contains("pocos segundos")))
+                    .then_some(3.0)
+                })
+                .map(|value| value.clamp(0.25, 60.0)),
+            target_insert_count: supplied
+                .and_then(|rule| rule.target_insert_count)
+                .or_else(|| {
+                    let text = normalize_edit_text(instructions.unwrap_or_default());
+                    (role == "insert"
+                        && (text.contains("2 3 brief")
+                            || text.contains("few cuts")
+                            || text.contains("pocos cortes")))
+                    .then_some(3)
+                })
+                .map(|value| value.clamp(1, 100)),
+        });
+    }
+    if normalized_sources.len() == 1 {
+        normalized_sources[0].role = "main".into();
+        normalized_sources[0].minimum_coverage = Some(1.0);
+    }
+    // Only one home-base source is meaningful. Preserve the first explicit/inferred main
+    // and make any extras secondary so the contract never contains competing mandates.
+    let mut found_main = false;
+    for rule in &mut normalized_sources {
+        if rule.role == "main" {
+            if found_main {
+                rule.role = "secondary".into();
+                rule.minimum_coverage = None;
+            } else {
+                found_main = true;
+            }
+        }
+    }
+    brief.sources = normalized_sources;
+    brief
+}
+
+fn validate_agent_edit_script(
+    script: &[AgentVideoScriptEntry],
+    brief: &AgentEditBrief,
+) -> AgentEditValidation {
+    let mut durations: HashMap<String, f64> = HashMap::new();
+    let mut total = 0.0_f64;
+    let mut sorted = script.iter().collect::<Vec<_>>();
+    sorted.sort_by(|a, b| a.start_seconds.total_cmp(&b.start_seconds));
+    for entry in &sorted {
+        let duration = (entry.end_seconds - entry.start_seconds).max(0.0);
+        if duration <= 0.0 {
+            continue;
+        }
+        let track_id = entry.chosen_track_id.clone().or_else(|| {
+            entry.chosen_track_index.and_then(|index| {
+                entry
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.track_index == index)
+                    .and_then(|candidate| candidate.track_id.clone())
+            })
+        });
+        if let Some(track_id) = track_id {
+            *durations.entry(track_id).or_insert(0.0) += duration;
+            total += duration;
+        }
+    }
+
+    let mut messages = Vec::new();
+    let mut source_coverage = Vec::new();
+    for rule in &brief.sources {
+        let seconds = durations.get(&rule.track_id).copied().unwrap_or(0.0);
+        let fraction = if total > 0.0 { seconds / total } else { 0.0 };
+        source_coverage.push(AgentEditSourceCoverage {
+            track_id: rule.track_id.clone(),
+            track_name: rule.track_name.clone(),
+            role: rule.role.clone(),
+            seconds,
+            fraction,
+        });
+        if rule.role == "exclude" && seconds > 0.001 {
+            messages.push(format!(
+                "{} is excluded but appears for {:.1}s.",
+                rule.track_name, seconds
+            ));
+        }
+        if let Some(minimum) = rule.minimum_coverage {
+            if fraction + 0.0001 < minimum as f64 {
+                messages.push(format!(
+                    "{} coverage is {:.0}%; the brief requires at least {:.0}%.",
+                    rule.track_name,
+                    fraction * 100.0,
+                    minimum * 100.0
+                ));
+            }
+        }
+        if let Some(maximum) = rule.maximum_coverage {
+            if fraction - 0.0001 > maximum as f64 {
+                messages.push(format!(
+                    "{} coverage is {:.0}%; the brief allows at most {:.0}%.",
+                    rule.track_name,
+                    fraction * 100.0,
+                    maximum * 100.0
+                ));
+            }
+        }
+        if let Some(maximum_insert_seconds) = rule.maximum_insert_seconds {
+            let mut run = 0.0_f64;
+            let mut longest = 0.0_f64;
+            for entry in &sorted {
+                let is_track = entry.chosen_track_id.as_deref() == Some(rule.track_id.as_str())
+                    || entry.chosen_track_index.is_some_and(|index| {
+                        entry.candidates.iter().any(|candidate| {
+                            candidate.track_index == index
+                                && candidate.track_id.as_deref() == Some(rule.track_id.as_str())
+                        })
+                    });
+                if is_track {
+                    run += (entry.end_seconds - entry.start_seconds).max(0.0);
+                    longest = longest.max(run);
+                } else {
+                    run = 0.0;
+                }
+            }
+            if longest > maximum_insert_seconds as f64 + 0.001 {
+                messages.push(format!(
+                    "{} has a {:.1}s continuous insert; the maximum is {:.1}s.",
+                    rule.track_name, longest, maximum_insert_seconds
+                ));
+            }
+        }
+    }
+    if total <= 0.0 {
+        messages.push("The plan contains no visible source selections.".into());
+    }
+    AgentEditValidation {
+        valid: messages.is_empty(),
+        messages,
+        source_coverage,
+    }
 }
 
 fn video_track_is_enabled(
@@ -6314,6 +6839,7 @@ fn build_fallback_agent_script(
                 end_seconds: segment.timeline_start as f64 / sample_rate as f64,
                 decision: "black".into(),
                 candidates: Vec::new(),
+                chosen_track_id: None,
                 chosen_track_index: None,
                 chosen_track_name: None,
                 reason: "No selected video clip is active in this gap, so it remains black to preserve sync.".into(),
@@ -6336,12 +6862,14 @@ fn build_fallback_agent_script(
             decision: "fallback-cut".into(),
             candidates: vec![AgentVideoScriptCandidate {
                 image_number: 1,
+                track_id: Some(clip.track_id.clone()),
                 track_index: clip.track_index,
                 track_name: clip.track_name.clone(),
                 timeline_seconds: segment.timeline_start as f64 / sample_rate as f64,
                 angle_label: Some(clip.track_name.clone()),
                 note: Some("Automatic fallback candidate.".into()),
             }],
+            chosen_track_id: Some(clip.track_id.clone()),
             chosen_track_index: Some(clip.track_index),
             chosen_track_name: Some(clip.track_name.clone()),
             reason: format!("Vision model failed, so the automatic cutter selected this active angle. Error: {error}"),
@@ -6364,6 +6892,7 @@ fn build_fallback_agent_script(
             end_seconds: range_end as f64 / sample_rate as f64,
             decision: "black".into(),
             candidates: Vec::new(),
+            chosen_track_id: None,
             chosen_track_index: None,
             chosen_track_name: None,
             reason: "No selected video clip is active in this final gap, so it remains black to preserve sync.".into(),
@@ -6549,6 +7078,7 @@ async fn build_agent_edit_segments(
     vision_model: &str,
     edit_model: &str,
     instructions: Option<&str>,
+    edit_brief: &AgentEditBrief,
     audio_analysis: Option<&RenderedAudioAnalysis>,
     temp_dir: &Path,
 ) -> Result<
@@ -6576,7 +7106,9 @@ async fn build_agent_edit_segments(
     // user's text BEFORE we hit the vision model. The model can override per window
     // (its votes go into look_votes and first_color_grade above) but if it doesn't,
     // we fall back to this so the user always sees a real grade when they asked for one.
+    let preserve_original = edit_brief.look_mode == "original";
     let (keyword_look, keyword_grade) = match instructions {
+        _ if preserve_original => (None, None),
         Some(text) if !text.is_empty() => infer_look_from_instructions(text),
         _ => (None, None),
     };
@@ -6588,6 +7120,7 @@ async fn build_agent_edit_segments(
     // Same idea for whole-edit effects (fade in/out, speed). LLM can override per
     // window via the `video_effects` field; otherwise the keyword detector wins.
     let keyword_effects = match instructions {
+        _ if preserve_original => None,
         Some(text) if !text.is_empty() => infer_effects_from_instructions(text),
         _ => None,
     };
@@ -6601,6 +7134,9 @@ async fn build_agent_edit_segments(
     let mut previous_input_index: Option<usize> = None;
     let mut consecutive_same = 0_u32;
     let mut usage_counts: HashMap<usize, u32> = HashMap::new();
+    let primary_rule = edit_brief.sources.iter().find(|rule| rule.role == "main");
+    let mut primary_eligible_windows = 0_u32;
+    let mut primary_chosen_windows = 0_u32;
     // Once the video model fails to analyze a frame (e.g. a text-only endpoint that
     // can't see images), stop calling it for the rest of the edit and fall back to
     // deterministic multicam cuts — otherwise every window would eat the full timeout.
@@ -6616,11 +7152,24 @@ async fn build_agent_edit_segments(
         window_index += 1;
         let next = (cursor + interval_samples).min(range_end);
         let audio_features = audio_features_for_window(audio_analysis, cursor, next, sample_rate);
-        let active = clips
+        let mut active = clips
             .iter()
             .enumerate()
-            .filter(|(_, clip)| clip.start_sample < next && clip.end_sample > cursor)
+            .filter(|(_, clip)| {
+                clip.start_sample < next
+                    && clip.end_sample > cursor
+                    && !edit_brief
+                        .sources
+                        .iter()
+                        .any(|rule| rule.track_id == clip.track_id && rule.role == "exclude")
+            })
             .collect::<Vec<_>>();
+        // Put the explicit home-base source first. This makes frame ordering predictable
+        // and prevents a generic JSON example/default from accidentally favoring whichever
+        // camera happened to be first in the session's track list.
+        if let Some(primary) = primary_rule {
+            active.sort_by_key(|(_, clip)| (clip.track_id != primary.track_id) as u8);
+        }
         if active.is_empty() {
             emit_agent_progress(
                 app,
@@ -6638,6 +7187,7 @@ async fn build_agent_edit_segments(
                 end_seconds: next as f64 / sample_rate as f64,
                 decision: "black".into(),
                 candidates: Vec::new(),
+                chosen_track_id: None,
                 chosen_track_index: None,
                 chosen_track_name: None,
                 reason: "No selected video clip is active in this window, so the export keeps this section black to preserve sync.".into(),
@@ -6714,8 +7264,9 @@ async fn build_agent_edit_segments(
                     labels.push((
                         *input_index,
                         format!(
-                            "{} (track {}, timeline {:.2}s, {})",
+                            "{} [track_id={}] (track {}, timeline {:.2}s, {})",
                             clip.track_name,
+                            clip.track_id,
                             clip.track_index + 1,
                             sample as f64 / sample_rate as f64,
                             layout_summary(&clip.layout)
@@ -6723,6 +7274,7 @@ async fn build_agent_edit_segments(
                     ));
                     candidates.push(AgentVideoScriptCandidate {
                         image_number: labels.len(),
+                        track_id: Some(clip.track_id.clone()),
                         track_index: clip.track_index,
                         track_name: clip.track_name.clone(),
                         timeline_seconds: sample as f64 / sample_rate as f64,
@@ -6756,6 +7308,7 @@ async fn build_agent_edit_segments(
                 end_seconds: next as f64 / sample_rate as f64,
                 decision: "black".into(),
                 candidates: Vec::new(),
+                chosen_track_id: None,
                 chosen_track_index: None,
                 chosen_track_name: None,
                 reason: format!(
@@ -6812,7 +7365,10 @@ async fn build_agent_edit_segments(
                 consecutive_same,
                 instructions,
                 &history_text,
-                first_color_grade.is_none() && look_votes.is_empty(),
+                first_color_grade.is_none() && look_votes.is_empty() && !preserve_original,
+                edit_brief,
+                primary_chosen_windows,
+                primary_eligible_windows,
             )
             .await
             {
@@ -6841,7 +7397,10 @@ async fn build_agent_edit_segments(
                 candidate_labels: None,
                 candidate_notes: None,
                 window_summary: Some("Single available angle.".into()),
-                choice: 1,
+                choice: Some(1),
+                chosen_track_id: candidates
+                    .first()
+                    .and_then(|candidate| candidate.track_id.clone()),
                 decision: Some("cut".into()),
                 reason: Some(
                     "Only one readable camera angle was available for this window.".into(),
@@ -6872,26 +7431,50 @@ async fn build_agent_edit_segments(
                 }
             }
         }
-        let frame_summary = merged
+        let returned_frame_summary = merged
             .as_ref()
             .and_then(|m| m.window_summary.as_deref())
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("No visual summary returned.");
+            .filter(|value| !value.is_empty());
+        let synthesized_frame_summary = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .note
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|note| !note.is_empty())
+                    .map(|note| format!("{}: {note}", candidate.track_name))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let frame_summary = returned_frame_summary
+            .map(str::to_string)
+            .or_else(|| (!synthesized_frame_summary.is_empty()).then_some(synthesized_frame_summary))
+            .unwrap_or_else(|| {
+                if vision_off {
+                    "Visual analysis was unavailable for this window; the fallback cut logic was used."
+                        .into()
+                } else {
+                    "The visual model selected a camera but did not describe the scene.".into()
+                }
+            });
         let model_choice = merged.as_ref().map(|m| AgentShotChoice {
-            choice: m.choice,
+            choice: m.choice.unwrap_or(0),
             decision: m.decision.clone(),
             reason: m.reason.clone(),
             edit_intent: m.edit_intent.clone(),
             continuity_plan: m.continuity_plan.clone(),
         });
-        if let Some(preset_name) = merged.as_ref().and_then(|m| m.look_preset.as_deref()) {
-            let normalized = preset_name.trim().to_lowercase();
-            if !normalized.is_empty() {
-                *look_votes.entry(normalized).or_insert(0) += 1;
+        if !preserve_original {
+            if let Some(preset_name) = merged.as_ref().and_then(|m| m.look_preset.as_deref()) {
+                let normalized = preset_name.trim().to_lowercase();
+                if !normalized.is_empty() {
+                    *look_votes.entry(normalized).or_insert(0) += 1;
+                }
             }
         }
-        if first_color_grade.is_none() {
+        if !preserve_original && first_color_grade.is_none() {
             if let Some(grade) = merged.as_ref().and_then(|m| m.color_grade.clone()) {
                 // Only adopt the grade if it would actually produce a filter — skip
                 // empty/neutral objects the model emits when no look is requested.
@@ -6900,7 +7483,7 @@ async fn build_agent_edit_segments(
                 }
             }
         }
-        if first_video_effects.is_none() {
+        if !preserve_original && first_video_effects.is_none() {
             if let Some(effects) = merged.as_ref().and_then(|m| m.video_effects.clone()) {
                 // Only adopt if any field is actually populated.
                 if effects.fade_in_seconds.is_some()
@@ -6916,10 +7499,23 @@ async fn build_agent_edit_segments(
             .and_then(|choice| choice.decision.as_deref())
             .map(|decision| decision.eq_ignore_ascii_case("hold"))
             .unwrap_or(false);
-        let mut chosen_label_index = model_choice
+        let model_track_id = merged
             .as_ref()
-            .and_then(|choice| choice.choice.checked_sub(1))
-            .filter(|index| *index < labels.len())
+            .and_then(|choice| choice.chosen_track_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut chosen_label_index = model_track_id
+            .and_then(|track_id| {
+                labels
+                    .iter()
+                    .position(|(input_index, _)| clips[*input_index].track_id == track_id)
+            })
+            .or_else(|| {
+                model_choice
+                    .as_ref()
+                    .and_then(|choice| choice.choice.checked_sub(1))
+                    .filter(|index| *index < labels.len())
+            })
             .unwrap_or(0);
         if model_requested_hold {
             if let Some(previous_label) = previous_label {
@@ -6934,7 +7530,7 @@ async fn build_agent_edit_segments(
         // no forced variety/coverage cuts. The deterministic rules below only kick in as
         // a FALLBACK when there's no model decision (vision unavailable), otherwise a
         // single camera would play for the whole edit.
-        if model_choice.is_none() && labels.len() > 1 {
+        if model_choice.is_none() && primary_rule.is_none() && labels.len() > 1 {
             if let Some(previous) = previous_input_index {
                 let chosen_input_index = labels[chosen_label_index].0;
                 if chosen_input_index == previous && consecutive_same >= MAX_DYNAMIC_HOLD_WINDOWS {
@@ -6969,6 +7565,7 @@ async fn build_agent_edit_segments(
             }
         }
         if model_choice.is_none()
+            && primary_rule.is_none()
             && !variety_override
             && labels.len() > 1
             && window_index >= MIN_WINDOWS_BEFORE_COVERAGE_CUT
@@ -6999,6 +7596,58 @@ async fn build_agent_edit_segments(
                     chosen_label_index = alternate_index;
                     coverage_override = true;
                     variety_override = true;
+                }
+            }
+        }
+        let mut direction_override_reason: Option<String> = None;
+        if let Some(primary) = primary_rule {
+            if let Some(primary_label_index) = labels
+                .iter()
+                .position(|(input_index, _)| clips[*input_index].track_id == primary.track_id)
+            {
+                primary_eligible_windows += 1;
+                let chosen_clip = &clips[labels[chosen_label_index].0];
+                let minimum = primary.minimum_coverage.unwrap_or(0.70).clamp(0.0, 1.0);
+                let required_primary =
+                    ((minimum * primary_eligible_windows as f32) - 0.0001).ceil() as u32;
+                if chosen_clip.track_id != primary.track_id
+                    && primary_chosen_windows < required_primary
+                {
+                    chosen_label_index = primary_label_index;
+                    direction_override_reason = Some(format!(
+                        "Enforced the directing contract: {} must remain at or above {:.0}% coverage.",
+                        primary.track_name,
+                        minimum * 100.0
+                    ));
+                } else if chosen_clip.track_id != primary.track_id {
+                    if let Some(insert_rule) = edit_brief
+                        .sources
+                        .iter()
+                        .find(|rule| rule.track_id == chosen_clip.track_id && rule.role == "insert")
+                    {
+                        if let Some(maximum_seconds) = insert_rule.maximum_insert_seconds {
+                            let prior_same_seconds = previous_input_index
+                                .filter(|previous| {
+                                    clips[*previous].track_id == chosen_clip.track_id
+                                })
+                                .map(|_| {
+                                    consecutive_same as f64 * interval_samples as f64
+                                        / sample_rate as f64
+                                })
+                                .unwrap_or(0.0);
+                            let this_seconds = (next - cursor) as f64 / sample_rate as f64;
+                            if prior_same_seconds + this_seconds > maximum_seconds as f64 + 0.001 {
+                                chosen_label_index = primary_label_index;
+                                direction_override_reason = Some(format!(
+                                    "Enforced the directing contract: {} inserts are limited to {:.1}s.",
+                                    insert_rule.track_name, maximum_seconds
+                                ));
+                            }
+                        }
+                    }
+                }
+                if clips[labels[chosen_label_index].0].track_id == primary.track_id {
+                    primary_chosen_windows += 1;
                 }
             }
         }
@@ -7051,7 +7700,9 @@ async fn build_agent_edit_segments(
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
             let chosen_image_number = chosen_label_index + 1;
-            let model_decision = if coverage_override {
+            let model_decision = if direction_override_reason.is_some() {
+                "contract"
+            } else if coverage_override {
                 "coverage-cut"
             } else if variety_override {
                 "dynamic-cut"
@@ -7093,7 +7744,12 @@ async fn build_agent_edit_segments(
                 .and_then(|choice| choice.continuity_plan.as_deref())
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            let reason = if coverage_override {
+            let reason = if let Some(contract_reason) = direction_override_reason.as_deref() {
+                format!(
+                    "Decision contract. Image {chosen_image_number} ({}). {contract_reason} Model rationale: {model_reason}",
+                    clip.track_name
+                )
+            } else if coverage_override {
                 let model_pick = model_choice
                     .as_ref()
                     .map(|choice| choice.choice)
@@ -7192,6 +7848,7 @@ async fn build_agent_edit_segments(
                 end_seconds: segment_end as f64 / sample_rate as f64,
                 decision: model_decision.into(),
                 candidates,
+                chosen_track_id: Some(clip.track_id.clone()),
                 chosen_track_index: Some(clip.track_index),
                 chosen_track_name: Some(clip.track_name.clone()),
                 reason,
@@ -7371,7 +8028,7 @@ async fn decide_agent_shot(
         })
         .unwrap_or_else(|| "No previous shot has been chosen yet.".to_string());
     let instruction_note = instructions
-        .map(|value| format!("User edit instructions. Treat these as creative guidelines unless they would force a black/unusable shot:\n{value}\n"))
+        .map(|value| format!("User edit instructions. Explicit source roles, percentages, limits, exclusions, and no-effects language are binding; apply professional taste only inside those boundaries:\n{value}\n"))
         .unwrap_or_else(|| "User edit instructions: none.\n".to_string());
     let candidate_text = candidates
         .iter()
@@ -7396,13 +8053,13 @@ async fn decide_agent_shot(
          Window visual summary: {frame_summary}\n\
          Audio features: {audio_text}\n\
          Candidate frame analysis:\n{candidate_text}\n\
-         CUT only when the new shot creates a coherent edit: a meaningfully different angle, better performance detail, face/reaction, clearer action, or a sensible pacing change. HOLD when changing would feel arbitrary or sudden, but do not park the whole edit on one camera when another usable angle exists.\n\
+         CUT only when the new shot creates a coherent edit: a meaningfully different angle, better performance detail, face/reaction, clearer action, or a sensible pacing change. HOLD when changing would feel arbitrary or sudden. If the user established a main camera, use it as the home base and never cut merely to distribute screen time.\n\
          Use audio to support pacing: high transient activity or loud sections can justify a cut; quiet/low-transient sections should favor holds unless the new visual is clearly better.\n\
-         With two or more readable cameras, aim for visual dynamics over the section: after several held windows, prefer a clean alternate angle even if the current angle is still good.\n\
+         With two or more readable cameras, use an alternate only when it improves the story, performance detail, continuity, or requested pacing.\n\
          {continuity_note}\n\
          Candidate index mapping:\n{label_text}\n\
          Reply only as JSON with this shape:\n\
-         {{\"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"hold continuity | wide context | hands detail | face/reaction | motion accent | pacing variation\", \"reason\": \"one specific sentence explaining why this is a hold or cut using visual + audio data\", \"continuity_plan\": \"how this decision supports the surrounding edit\", \"confidence\": \"low|medium|high\"}}"
+         {{\"decision\": \"hold|cut\", \"choice\": <matching 1-based image number>, \"edit_intent\": \"hold continuity | wide context | hands detail | face/reaction | motion accent | pacing variation\", \"reason\": \"one specific sentence explaining why this is a hold or cut using visual + audio data\", \"continuity_plan\": \"how this decision supports the surrounding edit\", \"confidence\": \"low|medium|high\"}}"
     );
     let parsed = call_ollama_chat(base_url, model, prompt, None).await?;
     let extracted = crate::assistant::extract_json_object(&parsed.message.content)
@@ -7431,6 +8088,9 @@ async fn analyze_and_decide_window(
     // grade once for the whole edit). Later windows return a minimal shot decision —
     // ~80 output tokens instead of ~400 — which is the dominant per-window cost.
     request_grade: bool,
+    edit_brief: &AgentEditBrief,
+    primary_chosen_windows: u32,
+    primary_eligible_windows: u32,
 ) -> Result<AgentMergedChoice, String> {
     let label_text = labels
         .iter()
@@ -7440,43 +8100,51 @@ async fn analyze_and_decide_window(
         .join("\n");
     let continuity_note = previous_label
         .map(|label| format!(
-            "Previous chosen image number was {label}, held for {consecutive_same} consecutive edit window(s). You have full creative freedom: HOLD it as long as it serves the edit, and CUT only when another angle genuinely improves the sequence. There is no required cutting cadence and no coverage quota — follow the user's direction (e.g. \"keep camera X as the main shot, only complement with the others\") over any urge to add variety."
+            "Previous chosen image number was {label}, held for {consecutive_same} consecutive edit window(s). HOLD it while it serves the sequence. CUT only for a specific story, performance, continuity, or musical reason that is allowed by the directing contract."
         ))
         .unwrap_or_else(|| "No previous shot has been chosen yet.".to_string());
     let instruction_note = instructions
-        .map(|value| format!("User edit instructions (treat as creative guidelines unless they force a black/unusable shot):\n{value}\n"))
+        .map(|value| format!("USER DIRECTION — highest editorial priority:\n{value}\n"))
         .unwrap_or_else(|| "User edit instructions: none.\n".to_string());
+    let brief_json = serde_json::to_string(edit_brief).unwrap_or_else(|_| "{}".into());
     let audio_text = audio_features_text(audio_features);
     let history_note = format!(
         "EDIT SO FAR (oldest to newest — the shots already on screen and what was in them):\n{edit_history}\n\
-         Cut like an editor shaping a SEQUENCE, not someone rating one frame in isolation. Base this shot on how the performance/action is EVOLVING across the edit: develop what is becoming interesting, follow the energy, introduce a fresh angle when the moment shifts, keep balanced coverage over time (don't keep returning to the same angle or repeat the recent rhythm), and let cuts breathe with the music. The goal is a coherent arc, not a string of locally-best frames.\n"
+         Cut like a professional editor shaping a complete sequence, not someone rating isolated frames. Track performance development, eyelines, screen direction, action continuity, phrase boundaries, and musical energy. Let strong shots breathe. Never cut merely to create variety, and never pursue balanced camera coverage unless the directing contract requests it. A source marked `main` is the home base; sources marked `insert` must earn every appearance with a specific visible or musical reason, then return promptly to the main source.\n"
     );
     // The full color-grade/effects spec is large; only ask for it on the first window
     // (we adopt the grade once for the whole edit). Every other window returns a small
     // shot decision, which is far faster to generate.
     let grade_block = if request_grade {
-        "Also design a color grade for the WHOLE edit that fits the user's instructions. Use a named `look_preset` and/or a custom `color_grade` (numeric, clamped server-side): brightness(-0.5..0.5), contrast(0.4..2), saturation(0..2.5), gamma(0.5..1.8), rgbMix{rr,gg,bb each 0.4..1.6}, hueShift(-180..180), vignette(0..1), blur(0..8), sharpen(0..2), grain(0..30). Presets: none,warm,cool,mono,punch,dream,cinema,noir,moody,vintage,golden,cold (cinematic/epic->cinema; teal-and-orange->cinema rr>1 bb<1; warm->warm/golden; cool->cool; b&w->mono; punchy->punch; dreamy->dream). Also pick `video_effects` (fadeInSeconds 0..10, fadeOutSeconds 0..10, speedFactor 0.25..4) only if the user asked. If no look direction, use look_preset \"none\".\n"
+        "The contract authorizes an agent-designed visual treatment. Design one restrained, coherent color grade for the WHOLE edit that supports the material and the user's words. `look_preset` may be none,warm,cool,mono,punch,dream,cinema,noir,moody,vintage,golden,cold. Optional `color_grade` fields are name,reason,brightness(-0.5..0.5),contrast(0.4..2),saturation(0..2.5),gamma(0.5..1.8),rgbMix{rr,gg,bb each 0.4..1.6},hueShift(-180..180),vignette(0..1),blur(0..8),sharpen(0..2),grain(0..30). Emit `video_effects` only when explicitly requested.\n"
     } else {
-        ""
+        "The visual-treatment contract is not asking for a new grade in this decision. Do not invent filters, color grading, fades, speed changes, crop, or visual effects.\n"
     };
-    let json_shape = if request_grade {
-        "{{\"window_summary\": \"one sentence\", \"candidate_labels\": [\"label1\", \"label2\"], \"candidate_notes\": [\"note1\", \"note2\"], \"decision\": \"hold|cut\", \"choice\": 1, \"edit_intent\": \"...\", \"reason\": \"one sentence\", \"continuity_plan\": \"...\", \"look_preset\": \"cinema\", \"color_grade\": {{\"name\": \"epic cinema\", \"reason\": \"...\", \"contrast\": 1.12, \"saturation\": 1.05, \"rgbMix\": {{\"rr\": 1.10, \"bb\": 0.85}}, \"vignette\": 0.25, \"sharpen\": 0.4}}, \"video_effects\": {{\"fadeInSeconds\": 1.0}}}}"
+    let response_fields = if request_grade {
+        "Also include edit_intent, continuity_plan, look_preset, and optional color_grade/video_effects."
     } else {
-        // Minimal per-window response — no grade/effects (already set for the edit).
-        "{{\"candidate_labels\": [\"label1\", \"label2\"], \"candidate_notes\": [\"note1\", \"note2\"], \"decision\": \"hold|cut\", \"choice\": 1, \"reason\": \"one short sentence\"}}"
+        "Do not include look_preset, color_grade, or video_effects in this window."
     };
     let prompt = format!(
-        "You are a multicam editor cutting a continuous sequence. Look at each simultaneous camera frame and decide the strongest shot for THIS window given everything that has come before.\n\
+        "You are the senior multicamera picture editor for a continuous music-performance sequence. Your job is to make a deliberate, broadcast-quality editorial decision for THIS window while preserving the user's authorship.\n\
          {instruction_note}\
+         DIRECTING CONTRACT (machine-enforced JSON):\n{brief_json}\n\
+         Priority hierarchy:\n\
+         1. Explicit source roles, minimum/maximum coverage, insert duration, exclusions, and original-look rules are NON-NEGOTIABLE.\n\
+         2. The user's creative and pacing direction controls the edit inside those boundaries.\n\
+         3. Your professional taste resolves only choices the user left open. Never override levels 1 or 2 to add variety or show a locally prettier frame.\n\
+         Creative-freedom mode `{}` means: faithful = conservative and literal; balanced = tasteful initiative inside the contract; director = bold storytelling inside the same hard constraints. Pacing mode is `{}`.\n\
+         Primary-camera compliance before this window: {primary_chosen_windows}/{primary_eligible_windows} eligible decisions.\n\
          Images are in this order:\n{label_text}\n\
          For each image, derive a short angle label (e.g. \"wide room\", \"guitar hands\", \"fretboard close-up\", \"face/profile\", \"dark/weak\") and a concise 6-12 word visual note (framing, hands, instrument, motion, focus, exposure).\n\
-         Then pick the best image. CUT only when the new shot creates a coherent edit (different angle, better detail, face/reaction, clearer action, pacing change). HOLD when changing would feel arbitrary. Use audio for pacing: loud sections justify cuts; quiet sections favor holds.\n\
+         Choose by exact track_id. If the main source is readable, it remains the default. An insert is justified only by concrete evidence in its attached image: a meaningful performance detail, reaction, action accent, reveal, or continuity improvement. Loudness alone does not require a cut. HOLD when a change would be arbitrary, redundant, or contrary to the contract.\n\
          {grade_block}\
          --- CONTEXT FOR THIS WINDOW ---\n\
          Audio features: {audio_text}\n\
          {continuity_note}\n\
          {history_note}\n\
-         Reply ONLY as compact JSON (no prose) with this exact shape:\n{json_shape}"
+         Reply ONLY as one compact JSON object, with no prose or markdown. Required fields: `window_summary` (one concise sentence describing the visible choices), `candidate_labels` (one string per image), `candidate_notes` (one string per image), `decision` (`hold` or `cut`), `chosen_track_id` (copy the exact chosen track_id from the image mapping), `choice` (the matching 1-based image number), and `reason` (one concise, evidence-based sentence). {response_fields}"
+        , edit_brief.creative_freedom, edit_brief.pacing
     );
     let parsed = call_ollama_chat(base_url, model, prompt, Some(images)).await?;
     let extracted = crate::assistant::extract_json_object(&parsed.message.content)
@@ -8085,5 +8753,131 @@ mod video_solo_tests {
         two.solo = true;
         assert!(!video_track_is_enabled(&one, &selected, true));
         assert!(!video_track_is_enabled(&two, &selected, true));
+    }
+}
+
+#[cfg(test)]
+mod directed_video_edit_tests {
+    use std::path::PathBuf;
+
+    use super::{
+        normalize_agent_edit_brief, validate_agent_edit_script, AgentEditBrief,
+        AgentEditSourceRule, AgentVideoScriptCandidate, AgentVideoScriptEntry, VideoRenderClip,
+    };
+    use crate::model::VideoLayout;
+
+    fn clip(track_id: &str, track_name: &str, track_index: usize) -> VideoRenderClip {
+        VideoRenderClip {
+            track_id: track_id.into(),
+            track_index,
+            track_name: track_name.into(),
+            path: PathBuf::from("/tmp/source.mp4"),
+            start_sample: 0,
+            end_sample: 480_000,
+            source_offset_ms: 0,
+            layout: VideoLayout::default(),
+        }
+    }
+
+    #[test]
+    fn natural_language_can_correct_the_default_main_camera_contract() {
+        let clips = vec![
+            clip("cam-1", "Camera 1", 6),
+            clip("cam-2", "Camera 2 - desk view", 7),
+        ];
+        let mut brief = AgentEditBrief {
+            sources: Vec::new(),
+            creative_freedom: "balanced".into(),
+            pacing: "follow_music".into(),
+            look_mode: "original".into(),
+            custom_instructions: None,
+        };
+        brief.sources = vec![
+            AgentEditSourceRule {
+                track_id: "cam-1".into(),
+                track_name: "Camera 1".into(),
+                role: "main".into(),
+                minimum_coverage: Some(0.7),
+                maximum_coverage: None,
+                maximum_insert_seconds: None,
+                target_insert_count: None,
+            },
+            AgentEditSourceRule {
+                track_id: "cam-2".into(),
+                track_name: "Camera 2 - desk view".into(),
+                role: "insert".into(),
+                minimum_coverage: None,
+                maximum_coverage: None,
+                maximum_insert_seconds: Some(3.0),
+                target_insert_count: Some(3),
+            },
+        ];
+        let instructions = "CRITICAL: Camera 2 (desk view) is the PRIMARY/main camera and must be used for 90%+ of the video. Camera 1 should only appear in 2-3 brief cuts of a few seconds. NO visual effects, NO color grading, NO filters; keep footage exactly as recorded.";
+        let normalized = normalize_agent_edit_brief(Some(brief), Some(instructions), &clips);
+        let camera_two = normalized
+            .sources
+            .iter()
+            .find(|rule| rule.track_id == "cam-2")
+            .unwrap();
+        let camera_one = normalized
+            .sources
+            .iter()
+            .find(|rule| rule.track_id == "cam-1")
+            .unwrap();
+        assert_eq!(camera_two.role, "main");
+        assert_eq!(camera_two.minimum_coverage, Some(0.9));
+        assert_eq!(camera_one.role, "insert");
+        assert_eq!(camera_one.maximum_insert_seconds, Some(3.0));
+        assert_eq!(normalized.look_mode, "original");
+    }
+
+    #[test]
+    fn validation_uses_stable_track_ids_for_coverage() {
+        let clips = vec![clip("cam-1", "Camera 1", 6), clip("cam-2", "Camera 2", 7)];
+        let instructions = "Camera 2 is the main camera for 90% of the video.";
+        let brief = normalize_agent_edit_brief(None, Some(instructions), &clips);
+        let candidates = vec![
+            AgentVideoScriptCandidate {
+                image_number: 1,
+                track_id: Some("cam-2".into()),
+                track_index: 7,
+                track_name: "Camera 2".into(),
+                timeline_seconds: 0.0,
+                angle_label: None,
+                note: None,
+            },
+            AgentVideoScriptCandidate {
+                image_number: 2,
+                track_id: Some("cam-1".into()),
+                track_index: 6,
+                track_name: "Camera 1".into(),
+                timeline_seconds: 0.0,
+                angle_label: None,
+                note: None,
+            },
+        ];
+        let script = (0..10)
+            .map(|window| {
+                let insert = window == 9;
+                AgentVideoScriptEntry {
+                    window_index: window + 1,
+                    total_windows: 10,
+                    start_seconds: window as f64 * 2.0,
+                    end_seconds: window as f64 * 2.0 + 2.0,
+                    decision: "cut".into(),
+                    candidates: candidates.clone(),
+                    chosen_track_id: Some(if insert { "cam-1" } else { "cam-2" }.into()),
+                    chosen_track_index: Some(if insert { 6 } else { 7 }),
+                    chosen_track_name: Some(if insert { "Camera 1" } else { "Camera 2" }.into()),
+                    reason: "test".into(),
+                    data_provided: Vec::new(),
+                    model_choice: None,
+                    variety_override: false,
+                    source_offset_seconds: Some(0.0),
+                }
+            })
+            .collect::<Vec<_>>();
+        let validation = validate_agent_edit_script(&script, &brief);
+        assert!(validation.valid, "{:?}", validation.messages);
     }
 }

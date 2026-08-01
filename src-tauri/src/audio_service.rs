@@ -100,21 +100,38 @@ impl AudioService {
         let stderr_target = log_handle.map(Stdio::from).unwrap_or_else(Stdio::null);
 
         let child = match service_dir() {
-            Some(dir) if dir.exists() => Command::new(crate::media_tools::uv_path())
-                .arg("run")
-                .arg("--directory")
-                .arg(&dir)
-                .arg("--quiet")
-                .arg("uvicorn")
-                .arg("main:app")
-                .arg("--host")
-                .arg("127.0.0.1")
-                .arg("--port")
-                .arg(port.to_string())
-                .stdout(stdout_target)
-                .stderr(stderr_target)
-                .spawn()
-                .ok(),
+            Some(dir) if dir.exists() => {
+                let installed_uvicorn = if cfg!(windows) {
+                    dir.join(".venv").join("Scripts").join("uvicorn.exe")
+                } else {
+                    dir.join(".venv").join("bin").join("uvicorn")
+                };
+                let mut command = if installed_uvicorn.is_file() {
+                    Command::new(installed_uvicorn)
+                } else {
+                    let mut command = Command::new(crate::media_tools::uv_path());
+                    command
+                        .arg("run")
+                        .arg("--directory")
+                        .arg(&dir)
+                        .arg("--quiet")
+                        .arg("uvicorn");
+                    command
+                };
+                command
+                    // Finder/LaunchServices can occasionally hand a relaunched app a
+                    // stale inherited working directory after its bundle is replaced.
+                    .current_dir(&dir)
+                    .arg("main:app")
+                    .arg("--host")
+                    .arg("127.0.0.1")
+                    .arg("--port")
+                    .arg(port.to_string())
+                    .stdout(stdout_target)
+                    .stderr(stderr_target)
+                    .spawn()
+                    .ok()
+            }
             Some(_) | None => {
                 eprintln!("[audio-service] could not locate audio-service/ directory");
                 None

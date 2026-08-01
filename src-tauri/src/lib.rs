@@ -307,6 +307,7 @@ pub fn run() {
             commands::export_rendered_video,
             commands::export_video,
             commands::render_auto_video_edit,
+            commands::interpret_agent_edit_brief,
             commands::render_agent_video_edit,
             commands::apply_clip_effects,
             commands::revert_clip_video,

@@ -121,28 +121,45 @@ impl HermesService {
         let stderr_target = log_handle.map(Stdio::from).unwrap_or_else(Stdio::null);
 
         let child = match service_dir() {
-            Some(dir) if dir.exists() => Command::new(crate::media_tools::uv_path())
-                .arg("run")
-                .arg("--directory")
-                .arg(&dir)
-                .arg("--quiet")
-                .arg("uvicorn")
-                .arg("main:app")
-                .arg("--host")
-                .arg("127.0.0.1")
-                .arg("--port")
-                .arg(port.to_string())
-                // The sidecar uses uv to spawn the automixer-mcp server.
-                .env("AUTOMIXER_UV", crate::media_tools::uv_path())
-                // Point the embedded Hermes agent at AutoMixer's dedicated home
-                // (isolated config + no shared skills). The sidecar forwards this to
-                // the `hermes acp` process it spawns.
-                .env("HERMES_HOME", bootstrap_hermes_home())
-                .env("AUTOMIXER_HERMES_BIN", hermes_bin_path())
-                .stdout(stdout_target)
-                .stderr(stderr_target)
-                .spawn()
-                .ok(),
+            Some(dir) if dir.exists() => {
+                let installed_uvicorn = if cfg!(windows) {
+                    dir.join(".venv").join("Scripts").join("uvicorn.exe")
+                } else {
+                    dir.join(".venv").join("bin").join("uvicorn")
+                };
+                let mut command = if installed_uvicorn.is_file() {
+                    Command::new(installed_uvicorn)
+                } else {
+                    let mut command = Command::new(crate::media_tools::uv_path());
+                    command
+                        .arg("run")
+                        .arg("--directory")
+                        .arg(&dir)
+                        .arg("--quiet")
+                        .arg("uvicorn");
+                    command
+                };
+                command
+                    // Keep the sidecar independent of LaunchServices' inherited cwd,
+                    // which may be stale immediately after an in-place app update.
+                    .current_dir(&dir)
+                    .arg("main:app")
+                    .arg("--host")
+                    .arg("127.0.0.1")
+                    .arg("--port")
+                    .arg(port.to_string())
+                    // The sidecar uses uv to spawn the automixer-mcp server.
+                    .env("AUTOMIXER_UV", crate::media_tools::uv_path())
+                    // Point the embedded Hermes agent at AutoMixer's dedicated home
+                    // (isolated config + no shared skills). The sidecar forwards this to
+                    // the `hermes acp` process it spawns.
+                    .env("HERMES_HOME", bootstrap_hermes_home())
+                    .env("AUTOMIXER_HERMES_BIN", hermes_bin_path())
+                    .stdout(stdout_target)
+                    .stderr(stderr_target)
+                    .spawn()
+                    .ok()
+            }
             Some(_) | None => {
                 eprintln!("[hermes-service] could not locate hermes-service/ directory");
                 None
@@ -409,6 +426,18 @@ fn repair_hermes_config(cfg: &PathBuf) {
     let Ok(text) = std::fs::read_to_string(cfg) else {
         return;
     };
+    let automixer_mcp_dir = runnable_dir("hermes-service").map(|dir| dir.join("automixer-mcp"));
+    let automixer_mcp_python = automixer_mcp_dir.as_ref().map(|dir| {
+        if cfg!(windows) {
+            dir.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            dir.join(".venv").join("bin").join("python")
+        }
+    });
+    let use_direct_mcp_python = automixer_mcp_python
+        .as_ref()
+        .is_some_and(|path| path.is_file());
+    let automixer_mcp_server = automixer_mcp_dir.as_ref().map(|dir| dir.join("server.py"));
     let mut changed = false;
     let mut in_agent = false;
     let mut in_auxiliary = false;
@@ -416,6 +445,7 @@ fn repair_hermes_config(cfg: &PathBuf) {
     let mut title_generation_has_enabled = false;
     let mut in_mcp_servers = false;
     let mut in_automixer = false;
+    let mut in_automixer_args = false;
     let mut out = Vec::with_capacity(text.lines().count());
 
     for line in text.lines() {
@@ -437,14 +467,45 @@ fn repair_hermes_config(cfg: &PathBuf) {
             in_mcp_servers = trimmed == "mcp_servers:";
             in_title_generation = false;
             in_automixer = false;
+            in_automixer_args = false;
         } else if in_auxiliary && indent == 2 && trimmed.ends_with(':') {
             in_title_generation = trimmed == "title_generation:";
             title_generation_has_enabled = false;
         } else if in_mcp_servers && indent == 2 && trimmed.ends_with(':') {
             in_automixer = trimmed == "automixer:";
+            in_automixer_args = false;
         }
 
-        let replacement = if in_agent && indent == 2 && trimmed.starts_with("gateway_timeout:") {
+        if in_automixer_args && !(indent == 4 && trimmed.starts_with("- ")) {
+            in_automixer_args = false;
+        }
+        if in_mcp_servers
+            && in_automixer
+            && use_direct_mcp_python
+            && indent == 4
+            && trimmed == "args:"
+        {
+            out.push(line.to_string());
+            if let Some(server) = automixer_mcp_server.as_ref() {
+                // Hermes starts globally configured MCP processes from its own
+                // working directory, not from the ACP session cwd. Always pass an
+                // absolute script path when invoking the MCP venv's Python.
+                out.push(format!("    - {}", server.to_string_lossy()));
+            }
+            in_automixer_args = true;
+            changed = true;
+            continue;
+        }
+        if in_automixer_args && indent == 4 && trimmed.starts_with("- ") {
+            changed = true;
+            continue;
+        }
+
+        let replacement = if indent == 0 && trimmed.starts_with("mcp_discovery_timeout:") {
+            // Do not let the first ACP session snapshot its tools before the
+            // bundled AutoMixer MCP server has finished registering.
+            Some("mcp_discovery_timeout: 15".to_string())
+        } else if in_agent && indent == 2 && trimmed.starts_with("gateway_timeout:") {
             Some(format!("  gateway_timeout: {AUTOMIXER_LONG_TIMEOUT_SECS}"))
         } else if in_agent && indent == 2 && trimmed.starts_with("gateway_timeout_warning:") {
             Some(format!(
@@ -460,6 +521,24 @@ fn repair_hermes_config(cfg: &PathBuf) {
             Some("    timeout: 1".to_string())
         } else if in_mcp_servers && in_automixer && indent == 4 && trimmed.starts_with("timeout:") {
             Some(format!("    timeout: {AUTOMIXER_LONG_TIMEOUT_SECS}"))
+        } else if in_mcp_servers
+            && in_automixer
+            && indent == 4
+            && trimmed.starts_with("command:")
+            && use_direct_mcp_python
+        {
+            automixer_mcp_python
+                .as_ref()
+                .map(|path| format!("    command: {}", path.to_string_lossy()))
+        } else if in_mcp_servers
+            && in_automixer
+            && indent == 4
+            && trimmed.starts_with("- ")
+            && trimmed.contains("automixer-mcp")
+        {
+            automixer_mcp_dir
+                .as_ref()
+                .map(|path| format!("    - {}", path.to_string_lossy()))
         } else {
             None
         };
@@ -510,7 +589,14 @@ fn service_dir() -> Option<PathBuf> {
 ///   there. Subsequent launches reuse it (and its built env).
 pub fn runnable_dir(name: &str) -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if manifest.exists() {
+    let running_from_app_bundle = std::env::current_exe().ok().is_some_and(|executable| {
+        executable.ancestors().any(|ancestor| {
+            ancestor
+                .extension()
+                .is_some_and(|extension| extension == "app")
+        })
+    });
+    if !running_from_app_bundle && manifest.exists() {
         if let Some(dev) = manifest.parent().map(|p| p.join(name)) {
             if dev.join("pyproject.toml").exists() {
                 return Some(dev);
@@ -521,22 +607,23 @@ pub fn runnable_dir(name: &str) -> Option<PathBuf> {
     let bundled = resolve_bundled_source(name)?;
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let dest = home.join(".automixer").join("sidecars").join(name);
-    if !dest.join("pyproject.toml").exists() {
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::remove_dir_all(&dest);
-        let copied = std::process::Command::new("cp")
-            .arg("-R")
-            .arg(&bundled)
-            .arg(&dest)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !copied {
-            eprintln!("[sidecar] failed to stage {name} from {bundled:?}");
-            return None;
-        }
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::create_dir_all(&dest);
+    // Refresh the signed bundle's source on every launch so app upgrades also
+    // upgrade their Python services. A recursive merge intentionally preserves
+    // the destination-only `.venv` created by the installer/first run.
+    let copied = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(bundled.join("."))
+        .arg(&dest)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !copied && !dest.join("pyproject.toml").exists() {
+        eprintln!("[sidecar] failed to stage {name} from {bundled:?}");
+        return None;
     }
     Some(dest)
 }

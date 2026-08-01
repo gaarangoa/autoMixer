@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AbJudgeResponse, AgentColorGrade, AgentVideoEffects, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixAlbum, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog, VideoFilterPreset } from "../../shared/types";
+import type { AbJudgeResponse, AgentColorGrade, AgentEditBrief, AgentEditValidation, AgentVideoEffects, AgentVideoScriptEntry, AssistantRequest, AssistantResponse, JsonPatch, MixAction, MixAlbum, MixerProfile, MixProject, MixSession, ProfilePreset, SkillCatalog, VideoFilterPreset } from "../../shared/types";
 
 function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {
@@ -13,6 +13,19 @@ export type PlayheadEvent = { sample: number; running: boolean };
 export type MetersEvent = { masterPeak: number; trackPeaks: number[] };
 export type AudioProgressEvent = { stage: string; message: string; elapsedSeconds: number };
 export type AgentVideoProgressEvent = { sessionId?: string; stage: string; message: string; current: number; total: number; elapsedSeconds: number };
+export type VideoPlanReadyEvent = {
+  sessionId: string;
+  sourceTrackIds: string[];
+  startSample?: number;
+  endSample?: number;
+  intervalSeconds: number;
+  script: AgentVideoScriptEntry[];
+  editBrief: AgentEditBrief;
+  validation: AgentEditValidation;
+  lookPreset?: VideoFilterPreset;
+  colorGrade?: AgentColorGrade;
+  videoEffects?: AgentVideoEffects;
+};
 export type SamSplitProgressEvent = { previewId: string; sessionId: string; phase: string; message: string; progress: number; chunk?: number; chunks?: number; elapsedSeconds: number };
 export type SplitTrackPreview = {
   previewId: string;
@@ -155,14 +168,16 @@ export const api = {
     tauriInvoke<{ path: string }>("export_video", { sourcePath, outputPath, aspect, maxDimension, mode, deleteSourceAfter }),
   renderAutoVideoEdit: (sessionId: string, outputPath: string, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number) =>
     tauriInvoke<{ path: string }>("render_auto_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds }),
-  renderAgentVideoEdit: (sessionId: string, outputPath: string | undefined, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number, ollamaBaseUrl: string, visionModel: string, editModel: string, instructions: string, planOnly?: boolean) =>
-    tauriInvoke<{ path: string; script: AgentVideoScriptEntry[]; lookPreset?: VideoFilterPreset; colorGrade?: AgentColorGrade; videoEffects?: AgentVideoEffects }>("render_agent_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds, ollamaBaseUrl, visionModel, editModel, instructions, planOnly }),
+  interpretAgentEditBrief: (sessionId: string, trackIds: string[], instructions: string, editBrief: AgentEditBrief) =>
+    tauriInvoke<AgentEditBrief>("interpret_agent_edit_brief", { sessionId, trackIds, instructions, editBrief }),
+  renderAgentVideoEdit: (sessionId: string, outputPath: string | undefined, startSample: number | undefined, endSample: number | undefined, trackIds: string[], sampleIntervalSeconds: number, ollamaBaseUrl: string, visionModel: string, editModel: string, instructions: string, editBrief: AgentEditBrief, planOnly?: boolean) =>
+    tauriInvoke<{ path: string; script: AgentVideoScriptEntry[]; editBrief: AgentEditBrief; validation: AgentEditValidation; lookPreset?: VideoFilterPreset; colorGrade?: AgentColorGrade; videoEffects?: AgentVideoEffects }>("render_agent_video_edit", { sessionId, outputPath, startSample, endSample, trackIds, sampleIntervalSeconds, ollamaBaseUrl, visionModel, editModel, instructions, editBrief, planOnly }),
   applyClipEffects: (sessionId: string, trackId: string, clipId: string, instructions: string, ollamaBaseUrl?: string, visionModel?: string) =>
     tauriInvoke<{ project: MixProject; lookPreset?: VideoFilterPreset; colorGrade?: AgentColorGrade; videoEffects?: AgentVideoEffects; sourceSummary: string }>("apply_clip_effects", { sessionId, trackId, clipId, instructions, ollamaBaseUrl, visionModel }),
   revertClipVideo: (sessionId: string, trackId: string, clipId: string) =>
     tauriInvoke<MixProject>("revert_clip_video", { sessionId, trackId, clipId }),
-  renderVideoFromScript: (sessionId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade, videoEffects?: AgentVideoEffects, quality?: ExportQuality) =>
-    tauriInvoke<{ path: string; durationMs: number }>("render_video_from_script", { sessionId, sourceTrackIds, startSample, endSample, script, lookPreset, colorGrade, videoEffects, quality }),
+  renderVideoFromScript: (sessionId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade, videoEffects?: AgentVideoEffects, editBrief?: AgentEditBrief, quality?: ExportQuality) =>
+    tauriInvoke<{ path: string; durationMs: number }>("render_video_from_script", { sessionId, sourceTrackIds, startSample, endSample, script, lookPreset, colorGrade, videoEffects, editBrief, quality }),
   rerenderAgentEdit: (sessionId: string, trackId: string, clipId: string, sourceTrackIds: string[], startSample: number | undefined, endSample: number | undefined, script: AgentVideoScriptEntry[], lookPreset?: VideoFilterPreset, colorGrade?: AgentColorGrade, videoEffects?: AgentVideoEffects) =>
     tauriInvoke<MixProject>("rerender_agent_edit", { sessionId, trackId, clipId, sourceTrackIds, startSample, endSample, script, lookPreset, colorGrade, videoEffects }),
   fitCanvasToFootage: (sessionId: string) => tauriInvoke<MixProject>("fit_canvas_to_footage", { sessionId }),
@@ -216,6 +231,8 @@ export const api = {
   // Fired by the control surface when an agent video edit finishes rendering.
   onVideoRendered: (cb: (event: { sessionId: string; path: string; cuts: number; lookPreset?: string }) => void): Promise<UnlistenFn> =>
     listen<{ sessionId: string; path: string; cuts: number; lookPreset?: string }>("video:rendered", e => cb(e.payload)),
+  onVideoPlanReady: (cb: (event: VideoPlanReadyEvent) => void): Promise<UnlistenFn> =>
+    listen<VideoPlanReadyEvent>("video:plan-ready", e => cb(e.payload)),
   onPlayhead: (cb: (event: PlayheadEvent) => void): Promise<UnlistenFn> =>
     listen<PlayheadEvent>("engine:playhead", e => cb(e.payload)),
   onMeters: (cb: (event: MetersEvent) => void): Promise<UnlistenFn> =>

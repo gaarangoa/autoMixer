@@ -70,14 +70,14 @@ pub fn get_selection(session_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// True while a background video edit is rendering. Guards against launching a second
-/// concurrent edit (they'd fight over the single model slot and the agent-edit track).
+/// True while a background video plan is being generated. Guards against launching a
+/// concurrent analysis that would fight over the single model slot and progress events.
 static VIDEO_EDIT_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// RAII guard that releases VIDEO_EDIT_RUNNING on drop — including if the render task
+/// RAII guard that releases VIDEO_EDIT_RUNNING on drop — including if the planning task
 /// PANICS or is dropped mid-flight. Without this, a panic would leave the flag stuck
-/// true forever and every future edit would 409 ("already rendering") with nothing
+/// true forever and every future edit would 409 ("already planning") with nothing
 /// actually running — which looks like the agent is permanently stuck.
 struct EditRunningGuard;
 impl Drop for EditRunningGuard {
@@ -345,10 +345,9 @@ struct VideoEditResult {
     message: String,
 }
 
-/// The video-edit skill: run AutoMixer's agent video pipeline (frame analysis via
-/// the configured video VLM + ffmpeg multicam cut), then add the rendered result to
-/// the session. This is how the text-only Hermes agent "processes video" — it calls
-/// this tool; the vision happens here against the separately-configured endpoint.
+/// The video-edit skill: run AutoMixer's review-first planning pipeline (frame analysis
+/// via the configured video VLM), then surface the directing contract and editable
+/// timeline. Rendering is an explicit user-approved second step.
 async fn post_video_edit(
     AxumState(state): AxumState<ControlState>,
     headers: HeaderMap,
@@ -431,14 +430,13 @@ async fn post_video_edit(
     if VIDEO_EDIT_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err((
             StatusCode::CONFLICT,
-            "A video edit is already rendering. Wait for it to finish (a chat chip appears when it's ready).".into(),
+            "A video edit plan is already being generated. Wait for it to appear in the Video Editor.".into(),
         ));
     }
 
-    // Render in a DETACHED background task so it survives the agent's chat turn ending.
-    // (Previously the render was awaited inside the turn, so if the turn was cancelled
-    // or timed out mid-render the whole job was dropped and the UI froze.) The task
-    // emits its own progress + the terminal `video:rendered` event independently.
+    // Plan in a DETACHED background task so it survives the agent's chat turn ending.
+    // The result is surfaced in the same review-first editor used by direct UI requests;
+    // the user approves/adjusts the plan before any expensive final render begins.
     let instructions = body.instructions.clone();
     let interval_seconds = body.interval_seconds;
     let task_session = session_id.clone();
@@ -458,7 +456,7 @@ async fn post_video_edit(
         .await;
         if let Err(error) = result {
             // Surface the failure to the UI as a terminal progress event so the
-            // "rendering…" overlay clears instead of hanging.
+            // planning overlay clears instead of hanging.
             let _ = app.emit(
                 "video:edit-failed",
                 serde_json::json!({ "sessionId": task_session, "error": error }),
@@ -468,12 +466,13 @@ async fn post_video_edit(
 
     Ok(Json(VideoEditResult {
         status: "started".into(),
-        message: "Video edit started and is now rendering in the background (the user sees a live progress bar; a result chip appears automatically when done). YOUR TURN IS COMPLETE: reply with ONE short sentence telling the user the edit has started, then STOP. Do NOT think further, do NOT call any more tools, do NOT call get_session to check for the result, do NOT call edit_video again — there is nothing left to do this turn.".into(),
+        message: "The directed edit plan is being generated in the background. When ready, it opens in the Video Editor with the interpreted source roles, constraints, timeline decisions, and compliance report; the user reviews it and clicks Process to render. YOUR TURN IS COMPLETE: reply with ONE short sentence saying the plan is being generated, then STOP. Do NOT call any more tools or re-run edit_video.".into(),
     }))
 }
 
-/// The actual render, run in a detached background task (see post_video_edit). Renders
-/// the multicam edit, upserts the agent-edit track, and emits `video:rendered`.
+/// The review-first planner, run in a detached background task (see post_video_edit).
+/// Emits the structured contract + editable shot plan; rendering happens only after the
+/// user approves it in the Video Editor.
 #[allow(clippy::too_many_arguments)]
 async fn render_video_edit_job(
     app: AppHandle,
@@ -485,6 +484,7 @@ async fn render_video_edit_job(
     config: crate::config::Config,
     instructions: Option<String>,
 ) -> Result<(), String> {
+    let source_track_ids = track_ids.clone();
     let resp = crate::commands::render_agent_video_edit(
         app.clone(),
         app.state::<AppState>(),
@@ -499,28 +499,24 @@ async fn render_video_edit_job(
         Some(config.video_model.clone()),
         Some(config.video_model),
         instructions,
-        Some(false),
+        None,
+        Some(true),
     )
     .await?;
-
-    let duration_ms = probe_duration_ms(&resp.path);
-    let project = crate::commands::upsert_agent_video_track(
-        &app.state::<AppState>(),
-        &session_id,
-        std::path::Path::new(&resp.path),
-        start_sample.unwrap_or(0),
-        duration_ms,
-    )?;
-    emit_updated(&app, &session_id, &project);
-
-    let look = resp.look_preset.as_ref().map(|p| format!("{p:?}"));
     let _ = app.emit(
-        "video:rendered",
+        "video:plan-ready",
         serde_json::json!({
             "sessionId": session_id,
-            "path": resp.path,
-            "cuts": resp.script.len(),
-            "lookPreset": look,
+            "sourceTrackIds": source_track_ids,
+            "startSample": start_sample,
+            "endSample": end_sample,
+            "intervalSeconds": interval_seconds.unwrap_or(2.0),
+            "script": resp.script,
+            "editBrief": resp.edit_brief,
+            "validation": resp.validation,
+            "lookPreset": resp.look_preset,
+            "colorGrade": resp.color_grade,
+            "videoEffects": resp.video_effects,
         }),
     );
     Ok(())
@@ -569,26 +565,6 @@ async fn post_auto_mix(
         );
     }
     Ok(Json(summary))
-}
-
-/// Probe a rendered file's duration (ms) via ffprobe for the new track's length.
-fn probe_duration_ms(path: &str) -> u64 {
-    std::process::Command::new(crate::media_tools::ffprobe_path())
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .map(|s| (s * 1000.0) as u64)
-        .unwrap_or(0)
 }
 
 #[derive(Deserialize)]

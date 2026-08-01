@@ -21,7 +21,7 @@ scope to specific source cameras before an edit.
 
 | The user wants… | Use | Notes |
 |---|---|---|
-| A multicam cut / "edit the video" / a color **look** ("cinematic", "vivid", "warm") | `edit_video` | Returns IMMEDIATELY ("started") and renders in the background. Tell the user it started; do NOT claim it's done or re-run to "check". Replaces the one "Agent video edit" output in place. Looks are applied at render time — never bake them into source clips. |
+| A multicam cut / "edit the video" / a color **look** ("cinematic", "vivid", "warm") | `edit_video` | Returns IMMEDIATELY ("started") and generates a reviewable plan in the background. Tell the user planning started; do NOT claim rendering is done or re-run to "check". The user reviews source roles, constraints, cuts, and compliance, then clicks Process. Looks are applied only at render time — never bake them into source clips. |
 | **Fade in/out** or **speed** ("fade in 2s, fade out 10s", "half speed") | `apply_video_effects` | Fast, in place, reversible. fadeIn/fadeOut 0–10s, speed 0.25–4. This is the ONLY way to fade — never fake it with audio gain/automation. |
 | A persistent **crop / reframe / rotate** of a SOURCE clip | `set_clip_layout` | Geometry only (see fields below). Modifies the source recording, so use only when the user wants a permanent geometry change. |
 | "Auto-crop to the subject" / "reframe to portrait" (no exact numbers) | `auto_crop` | The video model looks at a frame and chooses the crop. |
@@ -39,10 +39,17 @@ dream. `interval_seconds` sets sampling density (2–3 is a good default; 1 = mo
 slower). Fades/speed can also be requested here, but for fade-only changes prefer
 `apply_video_effects` (no re-edit).
 
+When the user assigns source roles or limits, preserve them precisely in `instructions`:
+name the main camera, the requested minimum coverage, which tracks are inserts/excluded,
+maximum insert length/count, and whether visuals must remain original. These are binding
+directing constraints, not suggestions. The backend compiles them into a visible directing
+contract, validates the plan, and enforces main-camera coverage and insert duration.
+
 ## Editing taste
 - Cut on the energy: hold a shot while it's working; cut when the moment shifts or the
-  music lifts. Keep balanced coverage over time — don't sit on one camera or fall into a
-  repetitive rhythm.
+  music lifts. Do not chase balanced coverage or novelty when the user established a main
+  camera. Inserts must earn their place with a specific performance/story reason and return
+  promptly to the main angle.
 - Match the look to the material: warm for intimate/acoustic, punchy for energetic,
   cinematic (mild teal-orange + contrast + vignette) for "make it look like a film".
 - Keep it reversible; everything here can be undone.

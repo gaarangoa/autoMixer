@@ -182,21 +182,23 @@ def redo(session_id: str) -> dict:
 
 @mcp.tool()
 def edit_video(session_id: str, instructions: str = "", interval_seconds: float = 1.0) -> dict:
-    """Start a multicam video edit. The configured video model "sees" the frames and the
-    tool renders a multicam cut + color grade. `instructions` guides the look/pacing
+    """Start a review-first multicam video plan. The configured video model "sees" the
+    frames and proposes a directed cut plan. `instructions` guides source roles,
+    constraints, look, and pacing
     (e.g. "cinematic, cut on the beat"). `interval_seconds` sets how often it samples a
     frame (smaller = more cuts; 2-3 is a good default — 1 is fine-grained but slower).
 
-    IMPORTANT: this returns IMMEDIATELY with {"status":"started"}. The render runs in the
-    BACKGROUND (it can take a few minutes) and the user sees live progress; a chat chip
-    appears when it's done. So after calling this, tell the user the edit has STARTED and
-    is rendering — do NOT claim it is finished, do NOT call it again to "check", and do
+    IMPORTANT: this returns IMMEDIATELY with {"status":"started"}. Planning runs in the
+    BACKGROUND and the user sees live progress. When ready, AutoMixer opens the editable
+    plan + directing contract; the user reviews it and clicks Process to render. So after
+    calling this, say the PLAN is being generated — do NOT claim rendering is finished,
+    do NOT call it again to "check", and do
     NOT call get_session expecting the new track yet. One edit runs at a time; calling
-    again while one is rendering returns a 409 (already running).
+    again while one is planning returns a 409 (already running).
 
     Scope: automatically targets the user's SELECTED video tracks (see
-    get_session.selectedTrackIds); it does not edit unselected cameras. It REPLACES the
-    single "Agent video edit" output in place — it never stacks a new copy."""
+    get_session.selectedTrackIds); it does not analyze unselected cameras. No output
+    track is created until the user approves the plan and clicks Process."""
     body = {"instructions": instructions, "intervalSeconds": interval_seconds}
     return _request("POST", f"/control/session/{session_id}/video-edit", body, timeout=60)
 

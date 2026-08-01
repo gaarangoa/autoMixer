@@ -8,7 +8,7 @@ Rust backend drives exactly like the audio sidecar:
   GET  /health              -> readiness
   POST /chat {sessionId, userText}  -> Server-Sent Events stream of:
         {"type":"chunk",  "text": "..."}     agent message tokens
-        {"type":"thought","text": "..."}     reasoning tokens
+        {"type":"thought","text": "..."}     full reasoning tokens
         {"type":"tool",   "name": "...", "status": "...", "kind": "..."}
         {"type":"done",   "stopReason": "end_turn"}
         {"type":"error",  "message": "..."}
@@ -54,6 +54,7 @@ def _default_hermes_bin() -> str:
 HERMES = os.environ.get("AUTOMIXER_HERMES_BIN", _default_hermes_bin())
 UV = os.environ.get("AUTOMIXER_UV", str(Path.home() / ".local" / "bin" / "uv"))
 MCP_DIR = os.environ.get("AUTOMIXER_MCP_DIR", str(Path(__file__).parent / "automixer-mcp"))
+MCP_REQUIRED_TOOLS = {"get_session", "select_tracks", "edit_video"}
 
 # Tool-name fragments we trust (our control-surface tools). Anything else the
 # agent tries to call is refused.
@@ -95,6 +96,10 @@ class Bridge:
         # starts a fresh session. Gives the UI a real sense of output + reasoning volume.
         self.out_chars: dict[str, int] = {}             # acp session id -> assistant output chars
         self.think_chars: dict[str, int] = {}           # acp session id -> reasoning chars
+        # Hermes emits AgentMessageChunk for both interim pre-tool narration and the
+        # final answer. Keep it private until the turn ends; a subsequent tool call
+        # proves the preceding text was scratch work, so it is discarded.
+        self.pending_messages: dict[str, str] = {}
 
     COMPACT_AFTER_TURNS = 4
 
@@ -123,6 +128,7 @@ class Bridge:
         old = self.acp_for_mix.pop(mix_session_id, None)
         if old is not None:
             self.queues.pop(old, None)
+            self.pending_messages.pop(old, None)
             try:
                 await self.conn.cancel(session_id=old)
             except Exception:
@@ -147,7 +153,7 @@ class Bridge:
             text = getattr(getattr(update, "content", None), "text", None)
             if text:
                 self.out_chars[session_id] = self.out_chars.get(session_id, 0) + len(text)
-                await queue.put({"type": "chunk", "text": text})
+                self.pending_messages[session_id] = self.pending_messages.get(session_id, "") + text
         elif kind == "AgentThoughtChunk":
             text = getattr(getattr(update, "content", None), "text", None)
             if text:
@@ -156,6 +162,9 @@ class Bridge:
         elif kind in ("ToolCallStart", "ToolCallProgress"):
             tcid = getattr(update, "tool_call_id", None)
             if kind == "ToolCallStart":
+                # Anything the model said before deciding to call a tool is work-log
+                # narration, not the answer. Never leak it into the product chat.
+                self.pending_messages[session_id] = ""
                 name = self._clean_tool(getattr(update, "title", None) or tcid or "")
                 if tcid:
                     self.tool_names[tcid] = name
@@ -268,6 +277,83 @@ class Bridge:
         self.acp_for_mix[mix_session_id] = new.session_id
         return new.session_id
 
+    async def preflight_mcp(self) -> list[str]:
+        """Start the bundled MCP server directly and verify its essential tools.
+
+        This catches broken commands, relative paths, missing environments, and
+        incomplete tool registration before `/health` can report success.
+        """
+        mcp_dir = Path(MCP_DIR).resolve()
+        server = mcp_dir / "server.py"
+        direct_python = mcp_dir / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if direct_python.is_file():
+            command = [str(direct_python), str(server)]
+        else:
+            command = [UV, "run", "--directory", str(mcp_dir), "python", str(server)]
+        if not server.is_file():
+            raise RuntimeError(f"AutoMixer MCP server is missing: {server}")
+
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(mcp_dir),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            requests = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "automixer-preflight", "version": "1"},
+                    },
+                },
+                {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            ]
+            assert proc.stdin is not None
+            for request in requests:
+                proc.stdin.write((json.dumps(request) + "\n").encode())
+            await proc.stdin.drain()
+
+            tools: list[str] = []
+            assert proc.stdout is not None
+            for _ in range(4):
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
+                if not line:
+                    break
+                message = json.loads(line)
+                if message.get("id") == 2:
+                    tools = [item.get("name", "") for item in message.get("result", {}).get("tools", [])]
+                    break
+            missing = sorted(MCP_REQUIRED_TOOLS.difference(tools))
+            if missing:
+                stderr = ""
+                if proc.stderr is not None:
+                    try:
+                        stderr = (await asyncio.wait_for(proc.stderr.read(4096), timeout=0.2)).decode(errors="replace")
+                    except (asyncio.TimeoutError, TimeoutError):
+                        pass
+                raise RuntimeError(
+                    f"AutoMixer MCP preflight did not register {', '.join(missing)}"
+                    + (f": {stderr.strip()}" if stderr.strip() else "")
+                )
+            return tools
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            if proc.returncode is None:
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except (asyncio.TimeoutError, TimeoutError):
+                proc.kill()
+                await proc.wait()
+
     async def probe(self) -> None:
         """Create a throwaway ACP session and run one tiny prompt.
 
@@ -296,6 +382,7 @@ bridge = Bridge()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.mcp_tools = await bridge.preflight_mcp()
     await bridge.start()
     try:
         yield
@@ -308,7 +395,12 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "automixer-hermes"}
+    return {
+        "ok": True,
+        "service": "automixer-hermes",
+        "mcp": "ready",
+        "mcpTools": len(app.state.mcp_tools),
+    }
 
 
 class ResetBody(BaseModel):
@@ -398,14 +490,24 @@ async def chat(body: ChatBody):
 
                 async def run_prompt():
                     try:
+                        bridge.pending_messages[acp_sid] = ""
                         prompt = (
                             f"{recap}"
                             f"The current AutoMixer session id is {body.sessionId}. "
-                            f"Use the automixer tools to inspect and adjust this session "
-                            f"(call get_session first to see the tracks). "
+                            "Work only through the AutoMixer MCP tools (their runtime names may start "
+                            "with mcp_automixer_). Call get_session first. Never use terminal, shell, "
+                            "filesystem, code execution, browser, delegation, or skill-management tools "
+                            "for an AutoMixer operation. Never expose planning, reasoning, tool discovery, "
+                            "or phrases such as 'let me' to the user. If the AutoMixer MCP tools are not "
+                            "available, stop immediately and say only: 'AutoMixer tools are unavailable; "
+                            "please restart the app.' After using tools, return one concise user-facing "
+                            "result and nothing else. "
                             f"User request: {body.userText}"
                         )
                         resp = await bridge.conn.prompt(prompt=[acp.text_block(prompt)], session_id=acp_sid)
+                        final_text = bridge.pending_messages.pop(acp_sid, "").strip()
+                        if final_text:
+                            await queue.put({"type": "chunk", "text": final_text})
                         # Estimated usage + how full the conversation is before the next
                         # auto-compaction — surfaced in the chat UI.
                         await queue.put({
@@ -417,6 +519,7 @@ async def chat(body: ChatBody):
                         })
                         await queue.put({"type": "done", "stopReason": getattr(resp, "stop_reason", "end_turn")})
                     except Exception as exc:  # noqa: BLE001
+                        bridge.pending_messages.pop(acp_sid, None)
                         await queue.put({"type": "error", "message": str(exc)})
                     finally:
                         await queue.put(None)

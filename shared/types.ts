@@ -147,11 +147,49 @@ export type VideoCanvas = {
 
 export type AgentVideoScriptCandidate = {
   imageNumber: number;
+  trackId?: string | null;
   trackIndex: number;
   trackName: string;
   timelineSeconds: number;
   angleLabel?: string | null;
   note?: string | null;
+};
+
+export type AgentEditSourceRole = "main" | "secondary" | "insert" | "exclude";
+export type AgentCreativeFreedom = "faithful" | "balanced" | "director";
+export type AgentEditPacing = "relaxed" | "follow_music" | "energetic";
+export type AgentLookMode = "original" | "agent" | "preset";
+
+export type AgentEditSourceRule = {
+  trackId: string;
+  trackName: string;
+  role: AgentEditSourceRole;
+  minimumCoverage?: number | null;
+  maximumCoverage?: number | null;
+  maximumInsertSeconds?: number | null;
+  targetInsertCount?: number | null;
+};
+
+export type AgentEditBrief = {
+  sources: AgentEditSourceRule[];
+  creativeFreedom: AgentCreativeFreedom;
+  pacing: AgentEditPacing;
+  lookMode: AgentLookMode;
+  customInstructions?: string | null;
+};
+
+export type AgentEditSourceCoverage = {
+  trackId: string;
+  trackName: string;
+  role: AgentEditSourceRole;
+  seconds: number;
+  fraction: number;
+};
+
+export type AgentEditValidation = {
+  valid: boolean;
+  messages: string[];
+  sourceCoverage: AgentEditSourceCoverage[];
 };
 
 // Free-form color grade the agent can pick from user instructions. Every field is
@@ -190,6 +228,7 @@ export type AgentVideoScriptEntry = {
   endSeconds: number;
   decision: string;
   candidates: AgentVideoScriptCandidate[];
+  chosenTrackId?: string | null;
   chosenTrackIndex?: number | null;
   chosenTrackName?: string | null;
   reason: string;
