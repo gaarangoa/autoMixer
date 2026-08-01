@@ -13,6 +13,7 @@ pub mod control;
 pub mod defaults;
 pub mod engine;
 pub mod hermes_service;
+pub mod media_tools;
 pub mod model;
 pub mod recorder;
 pub mod sam_audio;
@@ -132,6 +133,7 @@ pub fn build_and_set_menu(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let config = Config::load();
+    media_tools::log_external_dependency_status();
     let store = SessionStore::new(config.data_dir.clone());
     let block_size = config.audio.block_size as u32;
 
@@ -217,6 +219,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            media_tools::check_external_dependencies,
             commands::get_config,
             commands::get_skill_catalog,
             commands::list_ollama_models,

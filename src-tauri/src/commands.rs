@@ -15,6 +15,7 @@ use crate::{
     actions::{apply_actions, record_patch, redo, undo},
     assistant, audio,
     engine::commands::EngineCommand,
+    media_tools,
     model::{
         AssistantRequest, AssistantResponse, HistorySource, JsonPatchOp, MixAction, MixProject,
         MixSection, MixSession, MixerProfile, SectionAnalysis, SkillCatalog, VideoFilterPreset,
@@ -1143,7 +1144,7 @@ pub async fn warm_up_models(
 /// A tiny 64×64 JPEG to prime the vision encoder. Returns base64 (no data URL prefix).
 fn warmup_frame_b64() -> Result<String, String> {
     let path = std::env::temp_dir().join(format!("automixer-warmup-{}.jpg", uuid::Uuid::new_v4()));
-    let status = Command::new("ffmpeg")
+    let status = Command::new(media_tools::ffmpeg_path())
         .args([
             "-y",
             "-hide_banner",
@@ -1490,7 +1491,7 @@ pub async fn auto_crop_clip(
         .join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&temp_dir).map_err(|e| format!("Could not prepare temp dir: {e}"))?;
     let frame_path = temp_dir.join("frame.jpg");
-    let _ = Command::new("ffmpeg")
+    let _ = Command::new(media_tools::ffmpeg_path())
         .args(["-y", "-hide_banner", "-loglevel", "error"])
         .arg("-ss")
         .arg(format!("{frame_time:.3}"))
@@ -1676,7 +1677,7 @@ pub fn apply_video_effects(
         .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|e| e.to_string())?;
     let out_path = renders_dir.join(format!("fx-{}.mp4", uuid::Uuid::new_v4()));
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(media_tools::ffmpeg_path());
     cmd.arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -2683,7 +2684,7 @@ pub fn render_mix(
         } else {
             requested.with_extension("mp3")
         };
-        let output = Command::new("ffmpeg")
+        let output = Command::new(media_tools::ffmpeg_path())
             .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
             .arg(&wav_path)
             .args(["-codec:a", "libmp3lame", "-b:a", "320k"])
@@ -2898,7 +2899,7 @@ pub async fn stretch_session_tempo(
             unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 4) };
         fs::write(&raw, bytes).map_err(|e| e.to_string())?;
         let out = tmp_dir.join(format!("stretch-{}.wav", uuid::Uuid::new_v4()));
-        let output = Command::new("ffmpeg")
+        let output = Command::new(media_tools::ffmpeg_path())
             .args(["-y", "-hide_banner", "-loglevel", "error"])
             .args([
                 "-f",
@@ -3558,7 +3559,7 @@ pub fn render_video_mix(
     let audio_path = renders_dir.join(format!("{session_id}.video-export.wav"));
     audio::render_mix(&project.session, &audio_path)?;
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(media_tools::ffmpeg_path());
     command
         .arg("-y")
         .arg("-hide_banner")
@@ -3664,7 +3665,7 @@ pub fn export_rendered_video(
             let filter = format!(
                 "scale={t_w}:{t_h}:force_original_aspect_ratio=decrease,pad={t_w}:{t_h}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p"
             );
-            let mut cmd = Command::new("ffmpeg");
+            let mut cmd = Command::new(media_tools::ffmpeg_path());
             cmd.arg("-y")
                 .arg("-hide_banner")
                 .arg("-loglevel")
@@ -3801,7 +3802,7 @@ pub async fn export_video(
 
 /// Total duration in seconds via ffprobe (None if unavailable → indeterminate progress).
 fn probe_video_duration(path: &Path) -> Option<f64> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(media_tools::ffprobe_path())
         .args([
             "-v",
             "error",
@@ -3853,7 +3854,7 @@ fn run_export_blocking(
     };
     emit(0.0, "start");
 
-    let mut child = Command::new("ffmpeg")
+    let mut child = Command::new(media_tools::ffmpeg_path())
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -3988,7 +3989,7 @@ pub fn render_auto_video_edit(
     let audio_path = renders_dir.join(format!("{session_id}.auto-video-edit.wav"));
     audio::render_mix(&project.session, &audio_path)?;
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(media_tools::ffmpeg_path());
     command
         .arg("-y")
         .arg("-hide_banner")
@@ -4121,7 +4122,7 @@ pub async fn apply_clip_effects(
     fs::create_dir_all(&temp_dir).map_err(|e| format!("Could not prepare temp dir: {e}"))?;
     let frame_path = temp_dir.join("frame.jpg");
     let frame_time_in_source = source_offset_s + (duration_s / 2.0);
-    let _ = Command::new("ffmpeg")
+    let _ = Command::new(media_tools::ffmpeg_path())
         .args(["-y", "-hide_banner", "-loglevel", "error"])
         .arg("-ss")
         .arg(format!("{frame_time_in_source:.3}"))
@@ -4230,7 +4231,7 @@ pub async fn apply_clip_effects(
         .renders_dir(&session_id)?;
     fs::create_dir_all(&renders_dir).map_err(|e| e.to_string())?;
     let output_path = renders_dir.join(format!("clip-edit-{}.mp4", uuid::Uuid::new_v4()));
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(media_tools::ffmpeg_path());
     cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
         .arg("-ss")
         .arg(format!("{source_offset_s:.3}"))
@@ -4713,7 +4714,7 @@ fn render_segments_ffmpeg(
     // ~5-10x slower). Used by the final-export path; preview renders pass false.
     high_quality: bool,
 ) -> Result<(), String> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(media_tools::ffmpeg_path());
     command
         .arg("-y")
         .arg("-hide_banner")
@@ -5118,7 +5119,7 @@ pub fn rerender_agent_edit(
 
 /// Read a video file's pixel dimensions via ffprobe.
 fn probe_video_dimensions(path: &Path) -> Result<(u32, u32), String> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(media_tools::ffprobe_path())
         .args([
             "-v",
             "error",
@@ -5306,7 +5307,7 @@ fn extract_video_audio(
     sample_rate: u32,
     source_offset_ms: u64,
 ) -> Result<(), String> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(media_tools::ffmpeg_path());
     command
         .arg("-y")
         .arg("-hide_banner")
@@ -6570,6 +6571,7 @@ async fn build_agent_edit_segments(
     // First non-empty custom color grade from any window. All windows see the same
     // user instructions, so the first response is just as informed as the last.
     let mut first_color_grade: Option<AgentColorGrade> = None;
+    let mut first_frame_extraction_error: Option<String> = None;
     // Deterministic keyword pre-detection — picks a default look + grade from the
     // user's text BEFORE we hit the vision model. The model can override per window
     // (its votes go into look_votes and first_color_grade above) but if it doesn't,
@@ -6673,7 +6675,7 @@ async fn build_agent_edit_segments(
             .enumerate()
             .map(|(slot, _)| temp_dir.join(format!("shot-{}-{slot}.jpg", segments.len())))
             .collect();
-        std::thread::scope(|scope| {
+        let extraction_results = std::thread::scope(|scope| {
             let handles: Vec<_> = active
                 .iter()
                 .enumerate()
@@ -6683,10 +6685,26 @@ async fn build_agent_edit_segments(
                     scope.spawn(move || extract_video_frame(clip, sample, session, &frame_path))
                 })
                 .collect();
-            for handle in handles {
-                let _ = handle.join();
-            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("video frame extraction worker panicked".into()))
+                })
+                .collect::<Vec<_>>()
         });
+        let mut window_frame_errors = Vec::new();
+        for (slot, result) in extraction_results.into_iter().enumerate() {
+            if let Err(error) = result {
+                let detail = format!("{}: {error}", active[slot].1.track_name);
+                eprintln!("[video] {detail}");
+                if first_frame_extraction_error.is_none() {
+                    first_frame_extraction_error = Some(detail.clone());
+                }
+                window_frame_errors.push(detail);
+            }
+        }
         for (slot, (input_index, clip)) in active.iter().enumerate() {
             let sample = sample.clamp(clip.start_sample, clip.end_sample.saturating_sub(1));
             let frame_path = frame_paths[slot].clone();
@@ -6715,12 +6733,19 @@ async fn build_agent_edit_segments(
             }
         }
         if labels.is_empty() {
+            let extraction_detail = if window_frame_errors.is_empty() {
+                "No frame files were produced.".to_string()
+            } else {
+                window_frame_errors.join(" | ")
+            };
             emit_agent_progress(
                 app,
                 &session.id,
                 started,
                 "sampling",
-                &format!("Window {window_index}/{total_windows}: no readable frames; skipping."),
+                &format!(
+                    "Window {window_index}/{total_windows}: no readable frames; {extraction_detail}"
+                ),
                 window_index,
                 total_windows,
             );
@@ -6733,11 +6758,14 @@ async fn build_agent_edit_segments(
                 candidates: Vec::new(),
                 chosen_track_index: None,
                 chosen_track_name: None,
-                reason: "The selected tracks were active here, but no readable frame could be extracted, so the export leaves this window black.".into(),
+                reason: format!(
+                    "The selected tracks were active here, but no readable frame could be extracted: {extraction_detail}"
+                ),
                 data_provided: vec![
                     format!("Window time: {:.2}s-{:.2}s", cursor as f64 / sample_rate as f64, next as f64 / sample_rate as f64),
                     format!("Active selected video candidates: {}", active.len()),
                     "Readable extracted frames: 0".into(),
+                    format!("Extraction error: {extraction_detail}"),
                     format!("Audio features: {}", audio_features_text(&audio_features)),
                 ],
                 model_choice: None,
@@ -7208,6 +7236,11 @@ async fn build_agent_edit_segments(
     // otherwise use the deterministic grade derived from instruction keywords.
     let chosen_grade = first_color_grade.or(keyword_grade);
     let chosen_effects = first_video_effects.or(keyword_effects);
+    if segments.is_empty() {
+        if let Some(error) = first_frame_extraction_error {
+            return Err(format!("Video frame extraction failed: {error}"));
+        }
+    }
     Ok((segments, script, chosen_look, chosen_grade, chosen_effects))
 }
 
@@ -7234,7 +7267,7 @@ fn extract_video_frame(
     let filter = format!(
         "crop=iw*{crop_w:.5}:ih*{crop_h:.5}:iw*{crop_x:.5}:ih*{crop_y:.5},scale=384:384:force_original_aspect_ratio=decrease"
     );
-    let output = Command::new("ffmpeg")
+    let output = Command::new(media_tools::ffmpeg_path())
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")

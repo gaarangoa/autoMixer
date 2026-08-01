@@ -100,7 +100,7 @@ impl AudioService {
         let stderr_target = log_handle.map(Stdio::from).unwrap_or_else(Stdio::null);
 
         let child = match service_dir() {
-            Some(dir) if dir.exists() => Command::new(uv_path())
+            Some(dir) if dir.exists() => Command::new(crate::media_tools::uv_path())
                 .arg("run")
                 .arg("--directory")
                 .arg(&dir)
@@ -207,25 +207,6 @@ impl Drop for AudioService {
             }
         }
     }
-}
-
-fn uv_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AUTOMIXER_UV") {
-        return PathBuf::from(p);
-    }
-    for candidate in [
-        dirs_home().map(|h| h.join(".local/bin/uv")),
-        Some(PathBuf::from("/opt/homebrew/bin/uv")),
-        Some(PathBuf::from("/usr/local/bin/uv")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    PathBuf::from("uv")
 }
 
 fn dirs_home() -> Option<PathBuf> {

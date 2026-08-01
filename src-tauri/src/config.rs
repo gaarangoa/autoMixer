@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     pub data_dir: PathBuf,
+    /// Legacy field name retained for saved-settings compatibility. This is the
+    /// OpenAI-compatible llama.cpp model-service endpoint; AutoMixer does not
+    /// use Ollama.
     pub ollama_base_url: String,
+    /// Legacy field name retained for saved-settings compatibility. This is the
+    /// model alias exposed by llama.cpp.
     pub ollama_model: String,
     /// Endpoint + model for the video/vision VLM that the video-edit skill calls.
     /// Kept separate from the chat agent's model (which lives in Hermes' config).

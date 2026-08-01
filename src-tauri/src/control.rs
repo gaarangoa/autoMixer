@@ -573,7 +573,7 @@ async fn post_auto_mix(
 
 /// Probe a rendered file's duration (ms) via ffprobe for the new track's length.
 fn probe_duration_ms(path: &str) -> u64 {
-    std::process::Command::new("ffprobe")
+    std::process::Command::new(crate::media_tools::ffprobe_path())
         .args([
             "-v",
             "error",

@@ -2015,6 +2015,15 @@ export function App() {
           setModelOptions([config.ollamaModel]);
         }
       }
+      const dependencies = await api.externalDependencies().catch(() => []);
+      const missingDependencies = dependencies.filter((dependency) => !dependency.available);
+      if (missingDependencies.length > 0) {
+        const message = missingDependencies
+          .map((dependency) => `${dependency.name}: ${dependency.error ?? `unavailable at ${dependency.path}`}`)
+          .join("\n");
+        setMessages((items) => [...items, { role: "system", text: `Runtime dependency check failed:\n${message}` }]);
+        pushToast("error", `Missing runtime tools: ${missingDependencies.map((dependency) => dependency.name).join(", ")}`);
+      }
       // Reflect the embedded agent's current orchestration model in the settings.
       void api.getHermesModel().then((m) => {
         setAgentUrl(m.baseUrl);
@@ -2498,8 +2507,8 @@ export function App() {
     }
   }
 
-  async function updateTrack(track: Track, patch: Partial<Track>) {
-    if (!session) return;
+  async function updateTrack(track: Track, patch: Partial<Track>): Promise<boolean> {
+    if (!session) return false;
     // Input latency offset has no mix action — persist it through a direct JSON patch.
     if (patch.inputLatencyMs !== undefined) {
       await setTrackInputLatency(track, patch.inputLatencyMs);
@@ -2517,13 +2526,15 @@ export function App() {
     else if (patch.solo === true && track.muted) actions.push({ tool: "mute_track" as const, trackId: track.id, muted: false });
     if (patch.solo !== undefined) actions.push({ tool: "solo_track" as const, trackId: track.id, solo: patch.solo });
     if (patch.aiGenerated !== undefined) actions.push({ tool: "set_track_ai_generated" as const, trackId: track.id, aiGenerated: patch.aiGenerated });
-    if (!actions.length) return;
+    if (!actions.length) return true;
     try {
       const updated = await api.applyActions(session.id, actions, "Manual control change");
       setProject(updated);
+      return true;
     } catch (error) {
       // Surface the failure instead of letting the control silently snap back.
       pushSystem(error instanceof Error ? error.message : String(error));
+      return false;
     }
   }
 
@@ -5642,7 +5653,7 @@ export function App() {
                       }}
                       onSolo={() => void updateTrack(track, { solo: !track.solo })}
                       onSeek={(seconds) => seekTo(seconds)}
-                      onChange={(patch) => void updateTrack(track, patch)}
+                      onRename={(name) => updateTrack(track, { name })}
                       draggingTrack={draggingTrackIds.includes(track.id)}
                       dropPosition={trackDropTarget?.trackId === track.id ? trackDropTarget.position : undefined}
                       onTrackPointerDragStart={(event) => beginTrackPointerDrag(track.id, event)}
@@ -6490,7 +6501,7 @@ export function App() {
             <div className="settings-modal-body">
               <section className="settings-group">
                 <div className="settings-group-title">Model</div>
-                <p className="settings-group-desc">One OpenAI-compatible endpoint (llama.cpp / vLLM / LM Studio). This is the single source — Apply sets the model for <strong>chat, auto-mix, and vision</strong> all at once.</p>
+                <p className="settings-group-desc">The project-managed llama.cpp endpoint is the single model source. Apply sets it for <strong>chat, auto-mix, and vision</strong> all at once. AutoMixer does not use Ollama, vLLM, or LM Studio.</p>
                 <label className="settings-field"><span>Endpoint URL</span>
                   <input value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://127.0.0.1:2260" />
                 </label>
@@ -10180,7 +10191,7 @@ function TrackRow({
   onSeek,
   onSelectTrack,
   onFocusTrack,
-  onChange,
+  onRename,
   draggingTrack,
   dropPosition,
   onTrackPointerDragStart,
@@ -10223,7 +10234,7 @@ function TrackRow({
   onSeek: (seconds: number) => void;
   onSelectTrack: (additive: boolean) => void;
   onFocusTrack: () => void;
-  onChange: (patch: Partial<Track>) => void;
+  onRename: (name: string) => Promise<boolean>;
   draggingTrack: boolean;
   dropPosition?: "before" | "after";
   onTrackPointerDragStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
@@ -10231,6 +10242,32 @@ function TrackRow({
 }) {
   const dragRef = useRef<{ start: number; moved: boolean } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const nameCommitRef = useRef(false);
+  const cancelNameCommitRef = useRef(false);
+  const [nameDraft, setNameDraft] = useState(track.name);
+  const [nameSaving, setNameSaving] = useState(false);
+  useEffect(() => {
+    setNameDraft(track.name);
+  }, [track.id, track.name]);
+  const commitTrackName = async () => {
+    if (nameCommitRef.current) return;
+    if (cancelNameCommitRef.current) {
+      cancelNameCommitRef.current = false;
+      setNameDraft(track.name);
+      return;
+    }
+    const nextName = nameDraft.trim();
+    if (!nextName || nextName === track.name) {
+      setNameDraft(track.name);
+      return;
+    }
+    nameCommitRef.current = true;
+    setNameSaving(true);
+    const saved = await onRename(nextName);
+    nameCommitRef.current = false;
+    setNameSaving(false);
+    setNameDraft(saved ? nextName : track.name);
+  };
   const secondsFromClientX = (clientX: number) => {
     const rect = wrapRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return 0;
@@ -10329,7 +10366,35 @@ function TrackRow({
           >
             <GripVertical size={13} />
           </button>
-          <strong className="track-fixed-name" title={track.name}>{track.name}</strong>
+          <input
+            className="track-fixed-name"
+            value={nameDraft}
+            maxLength={80}
+            disabled={nameSaving}
+            aria-label={`Rename ${track.name}`}
+            title="Edit track name"
+            spellCheck={false}
+            onChange={(event) => setNameDraft(event.target.value)}
+            onFocus={(event) => {
+              onFocusTrack();
+              event.currentTarget.select();
+            }}
+            onClick={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            onBlur={() => void commitTrackName()}
+            onKeyDown={(event) => {
+              event.stopPropagation();
+              if (event.key === "Enter") {
+                event.preventDefault();
+                event.currentTarget.blur();
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                cancelNameCommitRef.current = true;
+                setNameDraft(track.name);
+                event.currentTarget.blur();
+              }
+            }}
+          />
         </div>
         <div className="track-head-buttons">
           <button

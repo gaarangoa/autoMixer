@@ -4,6 +4,13 @@ This directory tracks how AutoMixer's external language/vision model is served.
 The model weights and runtime stay outside this repository; only reproducible
 configuration and lifecycle scripts live here.
 
+## Runtime policy
+
+**AutoMixer uses llama.cpp (`llama-server`) exclusively.** Ollama, vLLM, and LM
+Studio are not AutoMixer runtimes. Do not start them for AutoMixer or point the
+app at their endpoints. The single expected local endpoint is
+`http://127.0.0.1:2261`, started with `npm run models:start`.
+
 The current Mac deployment uses:
 
 - Runtime: `llama.cpp` (`llama-server`)
@@ -15,8 +22,8 @@ The current Mac deployment uses:
 - Context: 122,880 tokens
 - Apple Metal: all layers offloaded, q8 K/V cache
 
-Despite the external folder being named `vLLM`, this Mac deployment uses
-llama.cpp. Native vLLM is also supported by the runner for CUDA machines.
+The external folder name `~/vLLM` is historical storage naming only. The process
+serving those files is llama.cpp.
 
 ## Commands
 
@@ -62,22 +69,11 @@ installed, it starts again at the next login. `uninstall` removes that behavior.
 
 ## Machine-specific overrides
 
-The checked-in defaults match this Mac. To use different paths, ports, models,
-or the native vLLM backend:
+The checked-in defaults match this Mac. To use different llama.cpp paths, ports,
+or model files:
 
 ```bash
 cp model-service/config.env.example model-service/config.env
 ```
 
 Edit `config.env`; it is intentionally ignored by Git.
-
-For native vLLM on an NVIDIA/CUDA machine:
-
-```bash
-AUTOMIXER_MODEL_RUNTIME="vllm"
-AUTOMIXER_MODEL_VLLM_BIN="/absolute/path/to/vllm"
-AUTOMIXER_MODEL_VLLM_ID="Qwen/Qwen3.6-35B-A3B-FP8"
-```
-
-The same `start`, `status`, and LaunchAgent commands then invoke `vllm serve`
-instead of `llama-server`.

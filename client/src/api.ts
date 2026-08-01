@@ -38,9 +38,17 @@ export type ExportAspect = "original" | "square" | "portrait916";
 // -preset slow -crf 17 -b:a 320k. When a script is present, "high" also re-renders
 // from the original camera sources instead of copying the preview cache.
 export type ExportQuality = "fast" | "high";
+export type ExternalToolStatus = {
+  name: string;
+  available: boolean;
+  path: string;
+  version?: string;
+  error?: string;
+};
 
 export const api = {
   config: () => tauriInvoke<{ ollamaBaseUrl: string; ollamaModel: string }>("get_config"),
+  externalDependencies: () => tauriInvoke<ExternalToolStatus[]>("check_external_dependencies"),
   restartApp: () => tauriInvoke<void>("restart_app"),
   cancelAgent: () => tauriInvoke<void>("cancel_agent"),
   // Lists models from the server at baseUrl — Ollama, vLLM, or llama.cpp (the

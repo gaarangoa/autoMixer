@@ -2,9 +2,9 @@
 
 AutoMixer is a proprietary desktop mixing workstation for assisted and autonomous
 audio mixing. It combines a Tauri 2 desktop shell, a React timeline/mixer UI, a
-Rust audio engine, local LLM control through Ollama / vLLM / llama.cpp, optional
-Gemini A/B mix critique, and a Python audio-analysis sidecar for song-structure
-detection.
+Rust audio engine, local LLM control through the project-managed llama.cpp
+service, optional Gemini A/B mix critique, and a Python audio-analysis sidecar
+for song-structure detection.
 
 The app is designed around real multitrack sessions: import stems, record takes,
 edit track regions, audition pre/post AI processing, ask the agent for mix
@@ -43,16 +43,28 @@ This is proprietary commercial software. See [LICENSE](LICENSE). No commercial
 use, redistribution, derivative work, or commercial derivative use is permitted
 unless separately authorized in writing by the copyright holder.
 
+## Model Runtime Policy
+
+AutoMixer uses **llama.cpp only** for its local language and vision model
+runtime. Start it through the checked-in `model-service` scripts; the expected
+endpoint is `http://127.0.0.1:2261`.
+
+Ollama, vLLM, and LM Studio are not used by this project and should not be
+started or selected for AutoMixer. Some internal fields and local-storage keys
+still contain `ollama` in their names for backward compatibility; those names
+refer to the OpenAI-compatible llama.cpp endpoint and do not indicate an Ollama
+dependency.
+
 ## Requirements
 
 - macOS, Windows, or Linux with the platform dependencies required by Tauri 2.
 - Node.js 20 or newer.
 - Rust stable toolchain with Cargo.
 - `uv` for the Python audio-analysis sidecar.
+- `ffmpeg` and `ffprobe` for video sampling, recording, and rendering.
 - Python 3.11 for the sidecar environment.
-- A local model server if you want local agent/autonomous mixing: Ollama, vLLM,
-  or llama.cpp (`llama-server`). Any server exposing the OpenAI-compatible
-  `/v1` API works; the app detects the protocol automatically.
+- llama.cpp (`llama-server`) for local agent/autonomous mixing, managed through
+  this repository's `model-service` scripts.
 
 Optional:
 
@@ -80,24 +92,11 @@ GGUF through llama.cpp:
 
 ```sh
 npm run models:start
+npm run models:status
 ```
 
-Other OpenAI-compatible servers can also be selected in Settings (the protocol
-is auto-detected). For example:
-
-```sh
-# vLLM (default port 8000)
-vllm serve Qwen/Qwen2.5-32B-Instruct
-
-# Ollama (default port 11434)
-ollama pull gpt-oss:20b
-
-# llama.cpp (default port 8080)
-llama-server -m model.gguf
-```
-
-For the video agent, use a vision-capable model (e.g. `qwen2.5vl` on Ollama, or
-a Qwen-VL model on vLLM / a model with an mmproj file on llama.cpp).
+The video agent uses the same llama.cpp deployment with its configured
+`mmproj` vision projector.
 
 ## Configuration
 
@@ -116,12 +115,22 @@ cp .env.example .env.local
 Useful environment variables:
 
 ```sh
+# Legacy setting names; both point to the llama.cpp OpenAI-compatible endpoint.
 OLLAMA_BASE_URL=http://127.0.0.1:2261
 OLLAMA_MODEL=qwen3.6-35b-a3b
 GEMINI_API_KEY=...
 AUTOMIXER_AUDIO_PORT=7321
 AUTOMIXER_UV=/path/to/uv
+AUTOMIXER_FFMPEG=/path/to/ffmpeg
+AUTOMIXER_FFPROBE=/path/to/ffprobe
 ```
+
+At startup, AutoMixer checks these three external executables and reports their
+resolved paths and versions. Packaged macOS builds also search the standard
+Homebrew locations (`/opt/homebrew/bin` and `/usr/local/bin`), because apps
+opened from Finder do not inherit a shell's full `PATH`. The explicit
+`AUTOMIXER_*` paths take precedence. The check only reports dependency problems;
+it never installs or repairs software.
 
 The Gemini key can also be entered in the app settings.
 
@@ -144,10 +153,11 @@ uv run uvicorn main:app --host 127.0.0.1 --port 7321
 
 ## Managed Local Model Server
 
-The reproducible launcher for the external llama.cpp/vLLM deployment is tracked
-under [`model-service/`](model-service/README.md). The current Apple-silicon
+The reproducible launcher for the llama.cpp deployment is tracked under
+[`model-service/`](model-service/README.md). The current Apple-silicon
 configuration serves the already-downloaded Qwen3.6 GGUF and vision projector
-from `~/vLLM/models/` at `http://127.0.0.1:2261`.
+from the historically named `~/vLLM/models/` directory at
+`http://127.0.0.1:2261`. The directory name does not mean vLLM is used.
 
 ```sh
 npm run models:status

@@ -206,7 +206,7 @@ pub fn ensure_helper() -> Result<PathBuf, String> {
 
 /// Parse `ffmpeg -f avfoundation -list_devices` output into (video, audio) name lists.
 fn list_avfoundation_devices() -> Result<(Vec<String>, Vec<String>), String> {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(crate::media_tools::ffmpeg_path())
         .args([
             "-hide_banner",
             "-f",
@@ -658,7 +658,7 @@ pub fn start_captures(videos_dir: PathBuf, specs: Vec<CaptureSpec>) -> Result<()
 /// Audio-only camera-mic capture via ffmpeg (none of the USB video constraints
 /// apply to audio). Progress on stdout gives us the media clock for alignment.
 fn spawn_audio_capture(audio_name: &str, wav: &Path) -> Result<AudioJob, String> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(crate::media_tools::ffmpeg_path());
     cmd.args(["-hide_banner", "-loglevel", "error"])
         .args(["-progress", "pipe:1", "-stats_period", "0.2"])
         .args(["-f", "avfoundation", "-i", &format!("none:{audio_name}")])
@@ -743,7 +743,7 @@ pub fn stop_captures_discard() -> Result<(), String> {
 }
 
 fn probe_duration_ms(path: &PathBuf) -> Option<u64> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(crate::media_tools::ffprobe_path())
         .args([
             "-v",
             "error",

@@ -1787,6 +1787,7 @@ button:disabled {
 }
 
 .timeline {
+  --timeline-inspector-w: 208px;
   position: relative;
   z-index: 1;
   overflow: auto;
@@ -9287,7 +9288,10 @@ button.primary:hover { filter: brightness(1.09); }
 .section-ribbon-spacer,
 .track-head {
   position: sticky !important;
-  left: 0;
+  /* The inspector already occupies the viewport's first fixed column. Keep the
+     ruler spacer and every R/M/S track header pinned immediately after it while
+     the zoom anchor updates horizontal scrollLeft. */
+  left: var(--timeline-inspector-w);
 }
 
 .time-ruler-spacer {
@@ -9321,6 +9325,11 @@ button.primary:hover { filter: brightness(1.09); }
   position: relative;
   min-height: 72px;
   touch-action: pan-x pan-y;
+  /* Earlier theme rules used overflow:hidden on the whole row. That turns the
+     row into the sticky containing block, so its header travels horizontally
+     with the waveform. Clips already clip inside .wave-wrap; keep the row
+     visible so the control header can stick to the timeline viewport instead. */
+  overflow: visible;
 }
 
 .track::before,
@@ -9340,7 +9349,7 @@ button.primary:hover { filter: brightness(1.09); }
 }
 
 .track-head {
-  z-index: 15;
+  z-index: 25;
   width: var(--lane-head-w);
   min-width: 0;
   display: flex !important;
@@ -9348,6 +9357,8 @@ button.primary:hover { filter: brightness(1.09); }
   align-items: stretch;
   gap: 5px;
   padding: 6px !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.09) !important;
+  box-shadow: 3px 0 8px rgba(0, 0, 0, 0.36);
   user-select: none;
 }
 
@@ -9386,6 +9397,7 @@ button.primary:hover { filter: brightness(1.09); }
 }
 
 .track-fixed-name {
+  width: 100%;
   min-width: 0;
   height: 20px;
   display: block;
@@ -9398,8 +9410,27 @@ button.primary:hover { filter: brightness(1.09); }
   background: rgba(0, 0, 0, 0.24);
   color: var(--text);
   font-size: 10px;
+  font-family: inherit;
   font-weight: 700;
   line-height: 14px;
+  outline: none;
+  cursor: text;
+}
+
+.track-fixed-name:hover {
+  border-color: rgba(240, 201, 99, 0.38);
+  background: rgba(0, 0, 0, 0.38);
+}
+
+.track-fixed-name:focus {
+  border-color: rgba(240, 201, 99, 0.9);
+  background: #0a0c0c;
+  box-shadow: 0 0 0 1px rgba(240, 201, 99, 0.18);
+}
+
+.track-fixed-name:disabled {
+  cursor: wait;
+  opacity: 0.72;
 }
 
 .track-head-buttons {
@@ -9416,6 +9447,7 @@ button.primary:hover { filter: brightness(1.09); }
   padding: 0;
   border-radius: 2px;
   font-size: 9px;
+  transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
 }
 
 .track-head .track-head-buttons > .record-arm.active {
@@ -9428,6 +9460,28 @@ button.primary:hover { filter: brightness(1.09); }
     inset 0 1px 0 rgba(255, 255, 255, 0.3),
     0 0 0 1px rgba(255, 75, 75, 0.28),
     0 0 11px rgba(255, 65, 65, 0.62);
+}
+
+.track-head .track-head-buttons > .mute-btn.active {
+  border-color: #ffd86c;
+  background: linear-gradient(180deg, #f0c963, #b88b28);
+  color: #251b05;
+  font-weight: 900;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.38),
+    0 0 0 1px rgba(240, 201, 99, 0.26),
+    0 0 10px rgba(240, 201, 99, 0.58);
+}
+
+.track-head .track-head-buttons > .solo-btn.active {
+  border-color: #72dc9c;
+  background: linear-gradient(180deg, #62c98a, #348458);
+  color: #061b0e;
+  font-weight: 900;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.34),
+    0 0 0 1px rgba(98, 201, 138, 0.24),
+    0 0 10px rgba(98, 201, 138, 0.54);
 }
 
 .track.armed .track-fixed-name {
