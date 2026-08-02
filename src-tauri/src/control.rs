@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::{apply_and_sync, redo_and_sync, undo_and_sync};
-use crate::model::{HistorySource, MixAction, MixProject};
+use crate::model::{HistorySource, MixAction, MixProject, TrackKind};
 use crate::AppState;
 
 /// Port + token of the running control server, populated once at startup so that
@@ -148,6 +148,10 @@ pub fn spawn(app: AppHandle) -> Result<&'static ControlInfo, String> {
             get(get_session_selection).post(post_session_selection),
         )
         .route("/control/session/{session_id}/actions", post(post_actions))
+        .route(
+            "/control/session/{session_id}/podcast-cleanup",
+            post(post_podcast_cleanup),
+        )
         .route("/control/session/{session_id}/undo", post(post_undo))
         .route("/control/session/{session_id}/redo", post(post_redo))
         .route(
@@ -295,6 +299,258 @@ async fn post_actions(
     .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     emit_updated(&state.app, &session_id, &project);
     Ok(Json(project))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PodcastCleanupBody {
+    #[serde(default)]
+    track_ids: Vec<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanedPodcastTrack {
+    original_track_id: String,
+    original_track_name: String,
+    cleaned_track_id: String,
+    cleaned_track_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PodcastCleanupResult {
+    status: String,
+    message: String,
+    cleaned_tracks: Vec<CleanedPodcastTrack>,
+}
+
+/// Isolate the close-miked voice on each requested podcast microphone with SAM-Audio.
+/// Originals remain in the project but are muted; the audible replacements are new clean
+/// voice tracks that inherit the original mic's downstream mix processing.
+async fn post_podcast_cleanup(
+    AxumState(state): AxumState<ControlState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+    Json(body): Json<PodcastCleanupBody>,
+) -> CtlResult<PodcastCleanupResult> {
+    check_auth(&state, &headers)?;
+    let app_state = state.app.state::<AppState>();
+    let explicitly_scoped = !body.track_ids.is_empty();
+    let requested_ids = if explicitly_scoped {
+        body.track_ids
+    } else {
+        let selected = get_selection(&session_id);
+        if selected.is_empty() {
+            let store = app_state
+                .store
+                .lock()
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            let project = store
+                .get_project(&session_id)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+            project
+                .session
+                .tracks
+                .iter()
+                .filter(|track| {
+                    track.kind == TrackKind::Audio && !track.ai_generated && !track.muted
+                })
+                .map(|track| track.id.clone())
+                .collect()
+        } else {
+            selected
+        }
+    };
+
+    let project = {
+        let store = app_state
+            .store
+            .lock()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        store
+            .get_project(&session_id)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?
+    };
+    let mut targets = Vec::new();
+    for requested_id in requested_ids {
+        let Some(track) = project
+            .session
+            .tracks
+            .iter()
+            .find(|track| track.id == requested_id)
+        else {
+            continue;
+        };
+        if track.kind != TrackKind::Audio || track.ai_generated {
+            continue;
+        }
+        if !explicitly_scoped && track.muted {
+            continue;
+        }
+        if !targets
+            .iter()
+            .any(|(track_id, _): &(String, String)| track_id == &track.id)
+        {
+            targets.push((track.id.clone(), track.name.clone()));
+        }
+    }
+    if targets.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No original audio microphone tracks are available for podcast cleanup.".into(),
+        ));
+    }
+
+    let prompt = body.prompt.unwrap_or_else(|| {
+        "the close-miked spoken voice; reject steady background noise, room tone, hum, fan noise, and off-mic speech spill while preserving natural consonants and breath detail"
+            .into()
+    });
+    let starting_message = format!(
+        "SAM-Audio voice cleanup is starting for {} microphone track{}. Audio will be sent to the configured SAM-Audio endpoint; each original will be preserved and muted only after its clean voice stem succeeds.",
+        targets.len(),
+        if targets.len() == 1 { "" } else { "s" }
+    );
+    let _ = state.app.emit(
+        "podcast-cleanup:status",
+        serde_json::json!({
+            "sessionId": session_id,
+            "phase": "starting",
+            "message": starting_message,
+            "current": 0,
+            "total": targets.len(),
+        }),
+    );
+
+    if let Err(error) = crate::sam_audio::test_sam_audio_connection().await {
+        let message = format!("SAM-Audio cleanup could not start: {error}");
+        let _ = state.app.emit(
+            "podcast-cleanup:status",
+            serde_json::json!({
+                "sessionId": session_id,
+                "phase": "error",
+                "message": message,
+                "current": 0,
+                "total": targets.len(),
+            }),
+        );
+        return Err((StatusCode::BAD_GATEWAY, message));
+    }
+
+    let mut cleaned_tracks = Vec::new();
+    for (index, (track_id, track_name)) in targets.iter().enumerate() {
+        let current_project = {
+            let store = app_state
+                .store
+                .lock()
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            store
+                .get_project(&session_id)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?
+        };
+        let (start_sample, end_sample) =
+            crate::sam_audio::track_audio_bounds(&current_project.session, track_id)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        let track_message = format!(
+            "SAM-Audio is isolating spoken voice from {} ({} of {}).",
+            track_name,
+            index + 1,
+            targets.len()
+        );
+        let _ = state.app.emit(
+            "podcast-cleanup:status",
+            serde_json::json!({
+                "sessionId": session_id,
+                "phase": "track-start",
+                "message": track_message,
+                "trackId": track_id,
+                "trackName": track_name,
+                "current": index + 1,
+                "total": targets.len(),
+            }),
+        );
+        let preview = crate::sam_audio::prepare_track_split_internal(
+            app_state.inner(),
+            session_id.clone(),
+            track_id.clone(),
+            start_sample,
+            end_sample,
+        )
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        let preview_id = preview.preview_id().to_string();
+        if let Err(error) =
+            crate::sam_audio::run_track_split(state.app.clone(), preview_id.clone(), prompt.clone())
+                .await
+        {
+            let _ = crate::sam_audio::discard_track_split(preview_id);
+            let message = format!("SAM-Audio cleanup failed on {track_name}: {error}");
+            let _ = state.app.emit(
+                "podcast-cleanup:status",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "phase": "error",
+                    "message": message,
+                    "current": index + 1,
+                    "total": targets.len(),
+                }),
+            );
+            return Err((StatusCode::BAD_GATEWAY, message));
+        }
+        let applied = crate::sam_audio::apply_track_split_internal(
+            app_state.inner(),
+            preview_id,
+            crate::sam_audio::SplitApplyMode::PodcastVoiceCleanup,
+            HistorySource::Assistant,
+        )
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        let cleaned_name = applied
+            .project
+            .session
+            .tracks
+            .iter()
+            .find(|track| track.id == applied.extracted_track_id)
+            .map(|track| track.name.clone())
+            .unwrap_or_else(|| format!("{track_name} · Clean Voice"));
+        emit_updated(&state.app, &session_id, &applied.project);
+        cleaned_tracks.push(CleanedPodcastTrack {
+            original_track_id: track_id.clone(),
+            original_track_name: track_name.clone(),
+            cleaned_track_id: applied.extracted_track_id,
+            cleaned_track_name: cleaned_name,
+        });
+    }
+
+    let message = format!(
+        "SAM-Audio cleanup completed: {} clean voice track{} added; the original microphones remain preserved and muted.",
+        cleaned_tracks.len(),
+        if cleaned_tracks.len() == 1 { " was" } else { "s were" }
+    );
+    let cleaned_track_ids: Vec<String> = cleaned_tracks
+        .iter()
+        .map(|track| track.cleaned_track_id.clone())
+        .collect();
+    set_selection(&session_id, cleaned_track_ids.clone());
+    let _ = state.app.emit(
+        "selection:set",
+        serde_json::json!({ "sessionId": session_id, "trackIds": cleaned_track_ids }),
+    );
+    let _ = state.app.emit(
+        "podcast-cleanup:status",
+        serde_json::json!({
+            "sessionId": session_id,
+            "phase": "complete",
+            "message": message,
+            "current": cleaned_tracks.len(),
+            "total": cleaned_tracks.len(),
+        }),
+    );
+    Ok(Json(PodcastCleanupResult {
+        status: "completed".into(),
+        message,
+        cleaned_tracks,
+    }))
 }
 
 async fn post_undo(

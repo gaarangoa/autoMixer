@@ -27,6 +27,15 @@ export type VideoPlanReadyEvent = {
   videoEffects?: AgentVideoEffects;
 };
 export type SamSplitProgressEvent = { previewId: string; sessionId: string; phase: string; message: string; progress: number; chunk?: number; chunks?: number; elapsedSeconds: number };
+export type PodcastCleanupStatusEvent = {
+  sessionId: string;
+  phase: "starting" | "track-start" | "complete" | "error";
+  message: string;
+  current: number;
+  total: number;
+  trackId?: string;
+  trackName?: string;
+};
 export type SplitTrackPreview = {
   previewId: string;
   sessionId: string;
@@ -59,8 +68,49 @@ export type ExternalToolStatus = {
   error?: string;
 };
 
+export type SetupStatus = {
+  complete: boolean;
+  setupVersion: number;
+  platform: string;
+  managedRoot: string;
+  toolsReady: boolean;
+  hermesReady: boolean;
+  audioServiceReady: boolean;
+  agentServiceReady: boolean;
+  modelServerReady: boolean;
+  localModelInstalled: boolean;
+  launchAgentInstalled: boolean;
+  configuredMode?: "remote" | "local";
+  configuredBaseUrl: string;
+  configuredModel: string;
+  modelDownloadBytes: number;
+  modelDownloadTotal: number;
+  memoryBytes?: number;
+  errors: string[];
+};
+
+export type SetupRequest = {
+  mode: "remote" | "local";
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
+};
+
+export type SetupProgressEvent = {
+  stage: string;
+  message: string;
+  currentBytes: number;
+  totalBytes: number;
+  progress: number;
+};
+
 export const api = {
   config: () => tauriInvoke<{ ollamaBaseUrl: string; ollamaModel: string }>("get_config"),
+  setupStatus: () => tauriInvoke<SetupStatus>("get_setup_status"),
+  runSetup: (request: SetupRequest) => tauriInvoke<SetupStatus>("run_setup", { request }),
+  cancelSetup: () => tauriInvoke<void>("cancel_setup"),
+  onSetupProgress: (cb: (event: SetupProgressEvent) => void): Promise<UnlistenFn> =>
+    listen<SetupProgressEvent>("setup:progress", (event) => cb(event.payload)),
   externalDependencies: () => tauriInvoke<ExternalToolStatus[]>("check_external_dependencies"),
   restartApp: () => tauriInvoke<void>("restart_app"),
   cancelAgent: () => tauriInvoke<void>("cancel_agent"),
@@ -220,6 +270,8 @@ export const api = {
     tauriInvoke<{ project: MixProject; extractedTrackId: string }>("apply_track_split", { previewId }),
   onSamSplitProgress: (cb: (event: SamSplitProgressEvent) => void): Promise<UnlistenFn> =>
     listen<SamSplitProgressEvent>("sam-split:progress", event => cb(event.payload)),
+  onPodcastCleanupStatus: (cb: (event: PodcastCleanupStatusEvent) => void): Promise<UnlistenFn> =>
+    listen<PodcastCleanupStatusEvent>("podcast-cleanup:status", event => cb(event.payload)),
   setConfig: (ollamaBaseUrl: string, ollamaModel: string) => tauriInvoke<void>("set_config", { ollamaBaseUrl, ollamaModel }),
   // Push the user's track selection so the video skill edits only selected tracks.
   setVideoSelection: (sessionId: string, trackIds: string[]) => tauriInvoke<void>("set_video_selection", { sessionId, trackIds }),

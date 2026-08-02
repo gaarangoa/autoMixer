@@ -66,7 +66,13 @@ async def _request_async(method: str, path: str, body: dict | None = None, timeo
 
 def _track_summary(project: dict) -> list[dict]:
     """Trim the full project to the fields the agent needs to reason about tracks."""
-    tracks = project.get("session", {}).get("tracks", [])
+    session = project.get("session", {})
+    tracks = session.get("tracks", [])
+    source_analysis = {
+        source.get("id"): source.get("analysis")
+        for source in session.get("sourceFiles", [])
+        if source.get("id")
+    }
     out = []
     for t in tracks:
         entry = {
@@ -94,31 +100,42 @@ def _track_summary(project: dict) -> list[dict]:
                     },
                 })
             entry["clips"] = clips
+        else:
+            # Audio decisions must be based on the actual source, not a generic preset.
+            # Include the persisted processor state as well so a follow-up get_session
+            # can verify more than the fader value.
+            entry["analysis"] = source_analysis.get(t.get("sourceFileId"))
+            entry["chain"] = t.get("chain")
+            entry["sends"] = t.get("sends")
         out.append(entry)
     return out
 
 
 def _track_summary_compact(project: dict) -> list[dict]:
-    """A lean view (no video clips, no filters) for mutation tools to echo back — full
-    state is one get_session away, so we don't bloat the agent's context on every edit."""
+    """A lean mutation result that still proves persisted audio processing."""
     out = []
     for t in project.get("session", {}).get("tracks", []):
-        out.append({
+        entry = {
             "id": t.get("id"),
             "name": t.get("name"),
+            "kind": t.get("kind", "audio"),
             "gainDb": t.get("gainDb"),
             "muted": t.get("muted"),
-        })
+        }
+        if t.get("kind") != "video":
+            entry["chain"] = t.get("chain")
+            entry["sends"] = t.get("sends")
+        out.append(entry)
     return out
 
 
 @mcp.tool()
 def get_session(session_id: str) -> dict:
-    """Return the AutoMixer session's tracks (id, name, role, gain, pan, mute, solo, and
-    for video tracks their clips + crop), plus `selectedTrackIds` and a `selected` flag on
-    each track. Respect the user's selection — if any tracks are selected, act only on
-    those. For audio work see the audio-mixing skill; for video work see the
-    video-editing skill (selection/focus-mode rules and which tool to use live there)."""
+    """Return the AutoMixer session's tracks. Audio tracks include source analysis,
+    processor chain, and sends; video tracks include clips and crop. Also returns
+    `selectedTrackIds` and a `selected` flag on each track. Respect the user's selection
+    — if any tracks are selected, act only on those. For audio work see the audio-mixing
+    skill; for video work see the video-editing skill."""
     project = _request("GET", f"/control/session/{session_id}")
     selected = set()
     try:
@@ -164,6 +181,39 @@ def apply_actions(session_id: str, actions: list[dict], explanation: str = "") -
         {"actions": actions, "explanation": explanation or "hermes: apply_actions"},
     )
     return {"ok": True, "tracks": _track_summary_compact(project)}
+
+
+@mcp.tool()
+def clean_podcast_audio(
+    session_id: str,
+    track_ids: list[str] | None = None,
+    prompt: str = "",
+) -> dict:
+    """Run the high-quality SAM-Audio spoken-voice cleanup stage for podcast mics.
+
+    This is a long-running, non-destructive operation. Before processing, AutoMixer posts
+    a visible notice that audio is being sent to the configured SAM-Audio endpoint. For
+    each successful microphone it creates a new ``<original> · Clean Voice`` track,
+    preserves and mutes the original mic, and inherits the mic's downstream gain/EQ/
+    compression on the cleaned replacement. It does NOT leave the separated background
+    residual audible. The project history can undo each replacement.
+
+    Pass explicit audio ``track_ids`` to scope the cleanup. If omitted, the current audio
+    selection is used; if no tracks are selected, all unmuted original audio tracks are
+    cleaned. Do not call this on existing Clean Voice / AI-generated tracks. Use the
+    optional ``prompt`` only to refine what counts as the wanted spoken voice; the default
+    rejects steady noise, room tone, hum, fan noise, and off-mic spill while preserving
+    natural speech detail.
+    """
+    body: dict[str, Any] = {"trackIds": track_ids or []}
+    if prompt.strip():
+        body["prompt"] = prompt.strip()
+    return _request(
+        "POST",
+        f"/control/session/{session_id}/podcast-cleanup",
+        body,
+        timeout=AUTO_MIX_HTTP_TIMEOUT_SECONDS,
+    )
 
 
 @mcp.tool()

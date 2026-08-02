@@ -177,6 +177,13 @@ fn bundled_candidates(executable_name: &str) -> Vec<PathBuf> {
                 .join("bin")
                 .join(executable_name),
         );
+        candidates.push(
+            contents_dir
+                .join("Resources")
+                .join("runtime")
+                .join("bin")
+                .join(executable_name),
+        );
     }
     candidates
 }

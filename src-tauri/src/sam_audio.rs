@@ -76,6 +76,12 @@ pub struct SplitTrackPreview {
     prompt: Option<String>,
 }
 
+impl SplitTrackPreview {
+    pub(crate) fn preview_id(&self) -> &str {
+        &self.preview_id
+    }
+}
+
 impl From<&PendingSplit> for SplitTrackPreview {
     fn from(value: &PendingSplit) -> Self {
         Self {
@@ -106,8 +112,14 @@ impl From<&PendingSplit> for SplitTrackPreview {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplySplitResponse {
-    project: MixProject,
-    extracted_track_id: String,
+    pub(crate) project: MixProject,
+    pub(crate) extracted_track_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitApplyMode {
+    Standard,
+    PodcastVoiceCleanup,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,6 +230,22 @@ pub async fn test_sam_audio_connection() -> Result<SamAudioHealthResponse, Strin
 #[tauri::command]
 pub fn prepare_track_split(
     state: State<'_, AppState>,
+    session_id: String,
+    track_id: String,
+    start_sample: u64,
+    end_sample: u64,
+) -> Result<SplitTrackPreview, String> {
+    prepare_track_split_internal(
+        state.inner(),
+        session_id,
+        track_id,
+        start_sample,
+        end_sample,
+    )
+}
+
+pub(crate) fn prepare_track_split_internal(
+    state: &AppState,
     session_id: String,
     track_id: String,
     start_sample: u64,
@@ -456,6 +484,20 @@ pub fn apply_track_split(
     state: State<'_, AppState>,
     preview_id: String,
 ) -> Result<ApplySplitResponse, String> {
+    apply_track_split_internal(
+        state.inner(),
+        preview_id,
+        SplitApplyMode::Standard,
+        HistorySource::User,
+    )
+}
+
+pub(crate) fn apply_track_split_internal(
+    state: &AppState,
+    preview_id: String,
+    mode: SplitApplyMode,
+    history_source: HistorySource,
+) -> Result<ApplySplitResponse, String> {
     let pending = previews()
         .lock()
         .map_err(|error| error.to_string())?
@@ -494,43 +536,69 @@ pub fn apply_track_split(
         target_path,
         project.session.sample_rate,
     )?;
-    let residual_source = store.import_source_standalone(
-        &pending.session_id,
-        residual_path,
-        project.session.sample_rate,
-    )?;
     let before_tracks = project.session.tracks.clone();
     let before_sources = project.session.source_files.clone();
     let mut after_tracks = before_tracks.clone();
     let source_track = after_tracks[track_index].clone();
-    let residual_clip = ClipRegion {
-        id: Uuid::new_v4().to_string(),
-        source_file_id: Some(residual_source.id.clone()),
-        name: Some("Background".into()),
-        start_sample: pending.start_sample,
-        end_sample: pending.end_sample,
-        source_offset_sample: 0,
-        gain_db: 0.0,
+    let mut after_sources = before_sources.clone();
+    let (extracted_name, extracted_role, explanation) = match mode {
+        SplitApplyMode::Standard => {
+            let residual_source = store.import_source_standalone(
+                &pending.session_id,
+                residual_path,
+                project.session.sample_rate,
+            )?;
+            let residual_clip = ClipRegion {
+                id: Uuid::new_v4().to_string(),
+                source_file_id: Some(residual_source.id.clone()),
+                name: Some("Background".into()),
+                start_sample: pending.start_sample,
+                end_sample: pending.end_sample,
+                source_offset_sample: 0,
+                gain_db: 0.0,
+            };
+            let clips = replace_range_with_clip(
+                &project.session,
+                &source_track,
+                pending.start_sample,
+                pending.end_sample,
+                residual_clip,
+            )?;
+            after_tracks[track_index].clips = clips;
+            after_tracks[track_index].clips_materialized = true;
+            after_sources.push(residual_source);
+            (
+                extracted_track_name(prompt),
+                "separated stem".to_string(),
+                format!("Split track: {prompt}"),
+            )
+        }
+        SplitApplyMode::PodcastVoiceCleanup => {
+            // Preserve the original microphone and all of its source media, but remove
+            // it from the audible mix. The clean voice stem below inherits its fader,
+            // EQ, compressor, and automation, so separation happens before mixing.
+            after_tracks[track_index].muted = true;
+            (
+                format!("{} · Clean Voice", source_track.name),
+                "lead_vocal".to_string(),
+                format!(
+                    "SAM-Audio podcast cleanup: isolated speech from {} and muted the preserved original microphone",
+                    source_track.name
+                ),
+            )
+        }
     };
-    let clips = replace_range_with_clip(
-        &project.session,
-        &source_track,
-        pending.start_sample,
-        pending.end_sample,
-        residual_clip,
-    )?;
-    after_tracks[track_index].clips = clips;
-    after_tracks[track_index].clips_materialized = true;
 
     let extracted_track_id = Uuid::new_v4().to_string();
-    let extracted_name = extracted_track_name(prompt);
     let mut extracted_track = source_track;
     extracted_track.id = extracted_track_id.clone();
     extracted_track.name = extracted_name.clone();
-    extracted_track.role = Some("separated stem".into());
+    extracted_track.role = Some(extracted_role);
     extracted_track.source_file_id = target_source.id.clone();
     extracted_track.start_sample = pending.start_sample;
     extracted_track.ai_generated = true;
+    extracted_track.muted = false;
+    extracted_track.solo = false;
     extracted_track.color = split_track_color(after_tracks.len());
     extracted_track.clips = vec![ClipRegion {
         id: Uuid::new_v4().to_string(),
@@ -550,8 +618,6 @@ pub fn apply_track_split(
     }
     after_tracks.push(extracted_track);
 
-    let mut after_sources = before_sources.clone();
-    after_sources.push(residual_source);
     after_sources.push(target_source);
     record_patch(
         &mut project,
@@ -579,8 +645,8 @@ pub fn apply_track_split(
                 value: Some(serde_json::json!(before_tracks)),
             },
         ],
-        HistorySource::User,
-        Some(format!("Split track: {prompt}")),
+        history_source,
+        Some(explanation),
     )?;
     store.save(&project)?;
     if let Ok(mut audio) = state.audio.lock() {
@@ -747,6 +813,35 @@ fn materialized_clips(session: &MixSession, track: &Track) -> Result<Vec<ClipReg
         source_offset_sample: 0,
         gain_db: 0.0,
     }])
+}
+
+pub(crate) fn track_audio_bounds(
+    session: &MixSession,
+    track_id: &str,
+) -> Result<(u64, u64), String> {
+    let track = session
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .ok_or_else(|| format!("Unknown track {track_id}"))?;
+    if track.kind != TrackKind::Audio {
+        return Err(format!("{} is not an audio track.", track.name));
+    }
+    let clips = materialized_clips(session, track)?;
+    let start = clips
+        .iter()
+        .map(|clip| clip.start_sample)
+        .min()
+        .ok_or_else(|| format!("{} has no audio to clean.", track.name))?;
+    let end = clips
+        .iter()
+        .map(|clip| clip.end_sample)
+        .max()
+        .ok_or_else(|| format!("{} has no audio to clean.", track.name))?;
+    if end <= start {
+        return Err(format!("{} has no audio to clean.", track.name));
+    }
+    Ok((start, end))
 }
 
 fn render_raw_track_region(

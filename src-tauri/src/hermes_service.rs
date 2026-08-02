@@ -392,6 +392,25 @@ pub fn automixer_hermes_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".automixer/hermes-home"))
 }
 
+/// Optional bearer token shared by the embedded agent and direct model calls
+/// (video analysis / legacy auto-mix). Setup stores it only in AutoMixer's
+/// dedicated Hermes home rather than the project or application bundle.
+pub fn model_api_key() -> Option<String> {
+    if let Ok(value) = std::env::var("OPENAI_API_KEY") {
+        if !value.trim().is_empty() {
+            return Some(value.trim().to_string());
+        }
+    }
+    let text = std::fs::read_to_string(automixer_hermes_home().join(".env")).ok()?;
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("OPENAI_API_KEY=")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// Ensure the dedicated home exists with a usable config + empty skill dirs. On first
 /// run we seed `config.yaml` from the user's `~/.hermes` (so the working model + the
 /// automixer MCP registration carry over); afterwards it's fully independent — model

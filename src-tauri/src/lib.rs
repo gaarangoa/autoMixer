@@ -17,6 +17,7 @@ pub mod media_tools;
 pub mod model;
 pub mod recorder;
 pub mod sam_audio;
+pub mod setup;
 pub mod store;
 pub mod web;
 
@@ -219,6 +220,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            setup::get_setup_status,
+            setup::run_setup,
+            setup::cancel_setup,
             media_tools::check_external_dependencies,
             commands::get_config,
             commands::get_skill_catalog,

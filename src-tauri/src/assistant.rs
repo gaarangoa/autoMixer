@@ -75,6 +75,22 @@ fn provider_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Strin
     PROVIDER_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn openai_compat_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/{}", path.trim_start_matches('/'))
+    } else {
+        format!("{base}/v1/{}", path.trim_start_matches('/'))
+    }
+}
+
+fn with_model_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match crate::hermes_service::model_api_key() {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
+}
+
 /// Detect the protocol of the server at `base_url`. Prefer the
 /// OpenAI-compatible path used by llama.cpp and vLLM; fall back to Ollama's
 /// native API only for legacy configurations.
@@ -93,7 +109,7 @@ pub async fn detect_provider(base_url: &str) -> Result<LlmProvider, String> {
     let client = reqwest::Client::new();
     if let Ok(Ok(response)) = timeout(
         Duration::from_millis(2500),
-        client.get(format!("{key}/v1/models")).send(),
+        with_model_auth(client.get(openai_compat_url(&key, "models"))).send(),
     )
     .await
     {
@@ -691,8 +707,7 @@ async fn openai_generate(
     if let Some(n) = max_tokens {
         body["max_tokens"] = json!(n);
     }
-    let resp = client
-        .post(format!("{base_url}/v1/chat/completions"))
+    let resp = with_model_auth(client.post(openai_compat_url(base_url, "chat/completions")))
         .json(&body)
         .send()
         .await
@@ -1907,7 +1922,7 @@ pub async fn list_models(base_url: String) -> Result<(LlmProvider, Vec<String>),
             }
             let response = timeout(
                 Duration::from_millis(4500),
-                client.get(format!("{base_url}/v1/models")).send(),
+                with_model_auth(client.get(openai_compat_url(&base_url, "models"))).send(),
             )
             .await
             .map_err(|_| format!("Timed out connecting to the model server at {base_url}"))?

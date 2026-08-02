@@ -46,7 +46,12 @@
     ],
     "resources": {
       "resources/audio-service": "audio-service",
-      "resources/hermes-service": "hermes-service"
+      "resources/hermes-service": "hermes-service",
+      "resources/model-service": "model-service",
+      "resources/runtime": "runtime"
+    },
+    "macOS": {
+      "signingIdentity": "-"
     }
   }
 }

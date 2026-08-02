@@ -28,6 +28,9 @@ copy_clean() {
 
 copy_clean "$ROOT/audio-service"  "$STAGE/audio-service"
 copy_clean "$ROOT/hermes-service" "$STAGE/hermes-service"
+copy_clean "$ROOT/model-service"  "$STAGE/model-service"
+
+"$ROOT/scripts/fetch-macos-runtime.sh" "$STAGE/runtime"
 
 echo "staged sidecars -> $STAGE"
 du -sh "$STAGE"/* 2>/dev/null || true

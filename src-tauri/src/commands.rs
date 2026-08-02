@@ -1079,12 +1079,11 @@ async fn detect_model_context_tokens(base_url: &str, model: &str) -> Result<Opti
     } else {
         format!("{root}/v1/models")
     };
-    if let Ok(response) = client
-        .get(models_url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    {
+    let models_request = match crate::hermes_service::model_api_key() {
+        Some(key) => client.get(models_url).bearer_auth(key),
+        None => client.get(models_url),
+    };
+    if let Ok(response) = models_request.timeout(Duration::from_secs(5)).send().await {
         if response.status().is_success() {
             if let Ok(value) = response.json::<serde_json::Value>().await {
                 if let Some(items) = value.get("data").and_then(serde_json::Value::as_array) {
@@ -8274,8 +8273,18 @@ async fn call_openai_chat(
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|error| error.to_string())?;
-    let response = client
-        .post(format!("{base_url}/v1/chat/completions"))
+    let base = base_url.trim().trim_end_matches('/');
+    let chat_url = if base.ends_with("/v1") {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    };
+    let request = client.post(chat_url);
+    let request = match crate::hermes_service::model_api_key() {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    };
+    let response = request
         .json(&body)
         .send()
         .await

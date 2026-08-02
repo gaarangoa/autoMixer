@@ -1,4 +1,5 @@
 node_modules/
+.runtime-cache/
 dist/
 data/
 src-tauri/target/

@@ -1,14 +1,14 @@
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertCircle, Aperture, ArrowDown, ArrowUp, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Copy, Download, FilePlus2, Focus, FolderOpen, Gauge, GitCompareArrows, GripVertical, Info, Keyboard, Magnet, Maximize2, MessageSquare, Mic, MoveRight, Music2, Palette, Pause, Pencil, Play, Plus, Power, RefreshCw, Repeat, RotateCcw, RotateCw, Save, Scissors, Settings, Share2, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X, ZoomIn, ZoomOut } from "lucide-react";
+import { AlertCircle, Aperture, ArrowDown, ArrowUp, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Cloud, Copy, Cpu, Download, FilePlus2, Focus, FolderOpen, Gauge, GitCompareArrows, GripVertical, HardDrive, Info, Keyboard, Magnet, Maximize2, MessageSquare, Mic, MoveRight, Music2, Palette, PanelBottom, PanelRight, Pause, Pencil, Play, Plus, Power, RefreshCw, Repeat, RotateCcw, RotateCw, Save, Scissors, Server, Settings, Share2, ShieldCheck, SkipBack, SlidersHorizontal, Sun, Square, Trash2, Upload, Video, X, ZoomIn, ZoomOut } from "lucide-react";
 import type { AbJudgeResponse, AgentColorGrade, AgentCreativeFreedom, AgentEditBrief, AgentEditPacing, AgentEditSourceRole, AgentEditValidation, AgentLookMode, AgentVideoEffects, AgentVideoScriptEntry, AssistantResponse, ClipRegion, JsonPatch, MixAction, MixAlbum, MixCritique, MixerProfile, MixProject, MixSession, ProfilePreset, Track, VideoCanvas, VideoClipRegion, VideoFilterPreset, VideoLayout } from "../../shared/types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow, getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getVersion } from "@tauri-apps/api/app";
-import { api, type ExportAspect, type ExportQuality, type SamSplitProgressEvent, type SplitTrackPreview } from "./api";
+import { api, type ExportAspect, type ExportQuality, type SamSplitProgressEvent, type SetupProgressEvent, type SetupStatus, type SplitTrackPreview } from "./api";
 import { recordingTimelineDuration, shouldStopPlaybackAtTimelineEnd } from "./timeline";
 import {
   barSeconds,
@@ -53,6 +53,7 @@ const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 const SHIFT_KEY = IS_MAC ? "⇧" : "Shift";
 
 type Toast = { id: number; kind: "success" | "error" | "info"; text: string };
+type AssistantDock = "right" | "bottom";
 
 type AutoMixStageState = {
   stageId: string;
@@ -566,6 +567,184 @@ function DirectedEditBriefPanel({
   );
 }
 
+function setupBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 GB";
+  const gib = value / (1024 ** 3);
+  return gib >= 1 ? `${gib.toFixed(gib >= 10 ? 1 : 2)} GB` : `${(value / (1024 ** 2)).toFixed(0)} MB`;
+}
+
+function SetupAssistant({
+  initialStatus,
+  required,
+  onStatus,
+  onClose,
+}: {
+  initialStatus: SetupStatus;
+  required: boolean;
+  onStatus: (status: SetupStatus) => void;
+  onClose: () => void;
+}) {
+  const [status, setStatus] = useState(initialStatus);
+  const [mode, setMode] = useState<"remote" | "local">(initialStatus.configuredMode ?? "remote");
+  const [baseUrl, setBaseUrl] = useState(
+    initialStatus.configuredMode !== "local" ? initialStatus.configuredBaseUrl : "",
+  );
+  const [model, setModel] = useState(
+    initialStatus.configuredMode !== "local" ? initialStatus.configuredModel : "",
+  );
+  const [apiKey, setApiKey] = useState("");
+  const [running, setRunning] = useState(false);
+  const [finished, setFinished] = useState(false);
+  const [progress, setProgress] = useState<SetupProgressEvent | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void api.onSetupProgress(setProgress).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
+  const localDownloadTotal = status.modelDownloadTotal;
+  const remainingDownload = Math.max(0, localDownloadTotal - status.modelDownloadBytes);
+  const memoryIsLimited = Boolean(status.memoryBytes && status.memoryBytes < 48 * 1024 ** 3);
+  const startSetup = async () => {
+    setError(null);
+    setFinished(false);
+    if (mode === "remote" && (!baseUrl.trim() || !model.trim())) {
+      setError("Enter the OpenAI-compatible endpoint URL and model name.");
+      return;
+    }
+    setRunning(true);
+    setProgress({ stage: "runtime", message: "Starting setup…", currentBytes: 0, totalBytes: 1, progress: 0 });
+    try {
+      const updated = await api.runSetup({
+        mode,
+        baseUrl: mode === "remote" ? baseUrl.trim() : undefined,
+        model: mode === "remote" ? model.trim() : undefined,
+        apiKey: mode === "remote" ? apiKey.trim() || undefined : undefined,
+      });
+      setStatus(updated);
+      onStatus(updated);
+      setFinished(true);
+    } catch (setupError) {
+      setError(setupError instanceof Error ? setupError.message : String(setupError));
+      const updated = await api.setupStatus().catch(() => undefined);
+      if (updated) {
+        setStatus(updated);
+        onStatus(updated);
+      }
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const health = [
+    ["Media tools", status.toolsReady],
+    ["Hermes ACP", status.hermesReady],
+    ["Agent service", status.agentServiceReady],
+    ["Audio service", status.audioServiceReady],
+    ["Model endpoint", status.modelServerReady],
+  ] as const;
+
+  return (
+    <div className={required ? "setup-screen" : "setup-backdrop"} onPointerDown={required ? undefined : onClose}>
+      <section className="setup-assistant" role="dialog" aria-modal="true" aria-label="AutoMixer setup" onPointerDown={(event) => event.stopPropagation()}>
+        <header className="setup-head">
+          <div className="setup-mark"><SlidersHorizontal size={22} /></div>
+          <div>
+            <span>AutoMixer</span>
+            <h1>{finished ? "Your studio is ready" : "Set up this Mac"}</h1>
+          </div>
+          {!required && !running ? <button type="button" className="icon-btn" onClick={onClose} aria-label="Close setup"><X size={18} /></button> : null}
+        </header>
+
+        {finished ? (
+          <div className="setup-content setup-finished">
+            <div className="setup-success-icon"><Check size={28} /></div>
+            <h2>Everything passed the final check.</h2>
+            <p>{mode === "local" ? "AutoMixer is connected to its managed llama.cpp model." : "AutoMixer is connected to your remote OpenAI-compatible model endpoint."}</p>
+            <div className="setup-health-grid">
+              {health.map(([label, ready]) => (
+                <div key={label} className={ready ? "ready" : "pending"}>
+                  {ready ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+                  <span>{label}</span>
+                  <b>{ready ? "Ready" : "Check"}</b>
+                </div>
+              ))}
+            </div>
+            <div className="setup-actions">
+              <button type="button" onClick={onClose}>Continue</button>
+              <button type="button" className="primary" onClick={() => void api.restartApp()}><RefreshCw size={15} /> Restart AutoMixer</button>
+            </div>
+          </div>
+        ) : (
+          <div className="setup-content">
+            <div className="setup-intro">
+              <h2>Choose where the editing agent runs</h2>
+              <p>Core media tools and the agent runtime are managed automatically. You only need to choose the model source.</p>
+            </div>
+
+            <div className="setup-mode-grid" role="radiogroup" aria-label="Model source">
+              <button type="button" role="radio" aria-checked={mode === "remote"} className={mode === "remote" ? "selected" : ""} onClick={() => !running && setMode("remote")}>
+                <span className="setup-mode-icon"><Cloud size={22} /></span>
+                <span className="setup-mode-copy"><strong>Remote endpoint</strong><small>Use a model on another machine or hosted OpenAI-compatible API.</small></span>
+                <span className="setup-radio">{mode === "remote" ? <Check size={13} /> : null}</span>
+              </button>
+              <button type="button" role="radio" aria-checked={mode === "local"} className={mode === "local" ? "selected" : ""} onClick={() => !running && setMode("local")}>
+                <span className="setup-mode-icon"><Cpu size={22} /></span>
+                <span className="setup-mode-copy"><strong>Local llama.cpp</strong><small>Private, offline inference after a one-time {setupBytes(localDownloadTotal)} download.</small></span>
+                <span className="setup-radio">{mode === "local" ? <Check size={13} /> : null}</span>
+              </button>
+            </div>
+
+            {mode === "remote" ? (
+              <div className="setup-fields">
+                <label><span>Endpoint URL</span><input autoFocus value={baseUrl} disabled={running} onChange={(event) => setBaseUrl(event.target.value)} placeholder="http://model-server.local:2260" /></label>
+                <label><span>Model name</span><input value={model} disabled={running} onChange={(event) => setModel(event.target.value)} placeholder="qwen3.6-35b-a3b" /></label>
+                <label><span>API key <em>optional</em></span><input type="password" value={apiKey} disabled={running} onChange={(event) => setApiKey(event.target.value)} placeholder="Stored only on this Mac" /></label>
+                <p className="setup-note"><ShieldCheck size={14} /> The key is saved in AutoMixer’s private agent configuration. SAM-Audio remains a separate optional service.</p>
+              </div>
+            ) : (
+              <div className="setup-local-summary">
+                <div><HardDrive size={17} /><span><strong>{setupBytes(remainingDownload)} remaining</strong><small>Downloads are verified and resume if interrupted.</small></span></div>
+                <div><Server size={17} /><span><strong>llama.cpp only</strong><small>AutoMixer connects directly to llama.cpp and never uses Ollama, vLLM, or LM Studio.</small></span></div>
+                {memoryIsLimited ? <p className="setup-warning"><AlertCircle size={15} /> This Mac has {setupBytes(status.memoryBytes ?? 0)} of memory. The included 35B MoE model works best with at least 48 GB.</p> : null}
+              </div>
+            )}
+
+            {running && progress ? (
+              <div className="setup-progress" aria-live="polite">
+                <div className="setup-progress-row"><span>{progress.message}</span><b>{Math.round(progress.progress * 100)}%</b></div>
+                <div className="setup-progress-track"><span style={{ width: `${Math.max(2, progress.progress * 100)}%` }} /></div>
+                {progress.totalBytes > 1024 ? <small>{setupBytes(progress.currentBytes)} of {setupBytes(progress.totalBytes)}</small> : <small>{progress.stage.replaceAll("-", " ")}</small>}
+              </div>
+            ) : null}
+
+            {error ? <div className="setup-error"><AlertCircle size={16} /><span>{error}</span></div> : null}
+
+            <div className="setup-included">
+              <span><Check size={13} /> uv + managed Python</span>
+              <span><Check size={13} /> FFmpeg + FFprobe</span>
+              <span><Check size={13} /> Hermes ACP</span>
+              <span><Check size={13} /> Final health check</span>
+            </div>
+            <div className="setup-actions">
+              {!required && !running ? <button type="button" onClick={onClose}>Cancel</button> : <span />}
+              {running ? (
+                <button type="button" onClick={() => void api.cancelSetup()}>Cancel setup</button>
+              ) : (
+                <button type="button" className="primary" onClick={() => void startSetup()}>
+                  {mode === "local" ? <><Download size={15} /> Install local model</> : <><Power size={15} /> Connect and finish</>}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 export function App() {
   const initialOllamaUrlRef = useRef(localStorage.getItem("autoMixer.ollamaUrl"));
   const initialOllamaModelRef = useRef(localStorage.getItem("autoMixer.ollamaModel"));
@@ -617,6 +796,12 @@ export function App() {
   const [snapEnabled, setSnapEnabled] = useState(true);
   const [snapResolution, setSnapResolution] = useState<SnapResolution>("beat");
   const [chatText, setChatText] = useState("");
+  const [assistantDock, setAssistantDock] = useState<AssistantDock>(() =>
+    localStorage.getItem("autoMixer.assistantDock") === "bottom" ? "bottom" : "right"
+  );
+  const [assistantVisible, setAssistantVisible] = useState(() =>
+    localStorage.getItem("autoMixer.assistantVisible") !== "false"
+  );
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [startupError, setStartupError] = useState<string>();
@@ -656,6 +841,8 @@ export function App() {
   const [playhead, setPlayhead] = useState(0);
   const [bypass, setBypass] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [setupStatus, setSetupStatus] = useState<SetupStatus>();
+  const [setupOpen, setSetupOpen] = useState(false);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [addTrackMenuOpen, setAddTrackMenuOpen] = useState(false);
   // When true, clicking on a clip splits it at the click position instead of selecting.
@@ -1220,6 +1407,28 @@ export function App() {
     // updater so this empty-deps effect never reads a stale session id.
     reg(api.onSessionExternallyUpdated((event) => {
       setProject((prev) => (prev && prev.session.id === event.sessionId ? event.project : prev));
+    }));
+    // Podcast cleanup is a long-running remote separation step. Persist the start
+    // notice in chat before any microphone is uploaded, then close the loop on
+    // completion or failure so the user is never left guessing what happened.
+    reg(api.onPodcastCleanupStatus((event) => {
+      if (event.sessionId === currentSessionIdRef.current) {
+        setAnalysisProgress({
+          stage: event.phase === "error" ? "error" : event.phase === "complete" ? "done" : "sam-audio",
+          message: event.message,
+          elapsedSeconds: 0,
+        });
+        if (event.phase === "complete" || event.phase === "error") {
+          setTimeout(() => setAnalysisProgress(null), 6000);
+        }
+      }
+      if (event.phase === "starting" || event.phase === "complete" || event.phase === "error") {
+        const next = updateMessagesForSession(event.sessionId, (items) => [
+          ...items,
+          { role: "system", text: event.message },
+        ]);
+        void api.saveChatMessages(event.sessionId, next).catch(() => undefined);
+      }
     }));
     // A video render finished: drop a result chip in the chat (click to open the
     // monitor). We don't auto-open — the monitor is a user-toggled window now.
@@ -2404,6 +2613,11 @@ export function App() {
   async function bootstrap() {
     setLoading(true);
     try {
+      const runtimeSetup = await api.setupStatus().catch(() => undefined);
+      if (runtimeSetup) {
+        setSetupStatus(runtimeSetup);
+        setSetupOpen(!runtimeSetup.complete);
+      }
       const config = await api.config().catch(() => undefined);
       if (config) {
         if (!initialOllamaUrlRef.current) setOllamaUrl(config.ollamaBaseUrl);
@@ -2412,7 +2626,9 @@ export function App() {
           setModelOptions([config.ollamaModel]);
         }
       }
-      const dependencies = await api.externalDependencies().catch(() => []);
+      const dependencies = runtimeSetup?.complete === false
+        ? []
+        : await api.externalDependencies().catch(() => []);
       const missingDependencies = dependencies.filter((dependency) => !dependency.available);
       if (missingDependencies.length > 0) {
         const message = missingDependencies
@@ -3929,6 +4145,10 @@ export function App() {
     if (!userText) return;
     const launchSession = session;
     const launchSessionId = launchSession.id;
+    // One Hermes turn may make several apply_actions calls. Keep the history ids
+    // that existed before the turn so the resulting chat card can group every new
+    // entry instead of displaying only the final tool call.
+    const launchHistoryEntryIds = new Set(project?.history.map((entry) => entry.id) ?? []);
     if (overrideText === undefined) setChatText("");
     const withUser = updateMessagesForSession(launchSessionId, (items) => [...items, { role: "user", text: userText }]);
     void api.saveChatMessages(launchSessionId, withUser).catch(() => undefined);
@@ -3952,7 +4172,12 @@ export function App() {
         ollamaModel,
         recentCritique
       });
-      handleAssistantResponse(launchSessionId, response, reasoningBySessionRef.current[launchSessionId] ?? reasoningRef.current);
+      handleAssistantResponse(
+        launchSessionId,
+        response,
+        reasoningBySessionRef.current[launchSessionId] ?? reasoningRef.current,
+        launchHistoryEntryIds,
+      );
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
       const next = updateMessagesForSession(launchSessionId, (items) => [...items, { role: "system", text }]);
@@ -3963,10 +4188,19 @@ export function App() {
     }
   }
 
-  function handleAssistantResponse(sessionId: string, response: AssistantResponse, turnSnapshot: ReasoningEntry[]) {
+  function handleAssistantResponse(
+    sessionId: string,
+    response: AssistantResponse,
+    turnSnapshot: ReasoningEntry[],
+    historyEntryIdsBeforeTurn: Set<string>,
+  ) {
     if (response.status === "ok") {
       setProject((current) => current && current.session.id === sessionId ? { ...current, session: response.session, history: response.history } : current);
-      const turnEntry = response.history[response.history.length - 1];
+      const turnEntries = response.history.filter((entry) => !historyEntryIdsBeforeTurn.has(entry.id));
+      const turnForwardPatch = turnEntries.flatMap((entry) => entry.forwardPatch);
+      // Undo the newest history entry first. Each entry's inverse patch is already
+      // internally ordered, so reverse entries without reversing their operations.
+      const turnInversePatch = [...turnEntries].reverse().flatMap((entry) => entry.inversePatch);
       // Snapshot the full reasoning and tool track so it remains auditable after
       // the live activity card closes.
       const snap = turnSnapshot;
@@ -3993,8 +4227,8 @@ export function App() {
             warnings: response.warnings,
             rationale: response.rationale,
             perActionNotes: response.perActionNotes,
-            forwardPatch: turnEntry?.forwardPatch ?? [],
-            inversePatch: turnEntry?.inversePatch ?? [],
+            forwardPatch: turnForwardPatch,
+            inversePatch: turnInversePatch,
             applied: true
           }
         ]);
@@ -5086,6 +5320,16 @@ export function App() {
       </main>
     );
   }
+  if (setupOpen && setupStatus) {
+    return (
+      <SetupAssistant
+        initialStatus={setupStatus}
+        required={!setupStatus.complete}
+        onStatus={setSetupStatus}
+        onClose={() => setSetupOpen(false)}
+      />
+    );
+  }
   if (!project || !session) {
     const albumIsOpen = Boolean(currentAlbumId && currentAlbum);
     return (
@@ -5123,6 +5367,11 @@ export function App() {
           <div className="project-welcome-layout" aria-label="Album folder structure">
             <code>Album / album.json / Song / song.json + Audio + Peaks + Recordings + Video + Renders</code>
           </div>
+          {setupStatus ? (
+            <button type="button" className="project-runtime-button" onClick={() => setSetupOpen(true)}>
+              <Settings size={14} /> Runtime setup · {setupStatus.configuredMode ?? "existing install"}
+            </button>
+          ) : null}
         </section>
         {renderNamePrompt()}
         {renderToasts()}
@@ -5275,6 +5524,19 @@ export function App() {
             <span className="topbar-sep" aria-hidden="true" />
             <div className="topbar-group" role="group" aria-label="Windows">
               <button
+                className={assistantVisible ? "active" : ""}
+                onClick={() => {
+                  const visible = !assistantVisible;
+                  setAssistantVisible(visible);
+                  localStorage.setItem("autoMixer.assistantVisible", String(visible));
+                }}
+                title={assistantVisible ? "Hide agent chat" : "Show agent chat"}
+                aria-label={assistantVisible ? "Hide agent chat" : "Show agent chat"}
+                aria-pressed={assistantVisible}
+              >
+                <MessageSquare size={15} />
+              </button>
+              <button
                 className={mixerWindowOpen ? "active" : ""}
                 onClick={() => void toggleMixerWindow()}
                 title={mixerWindowOpen ? "Hide mixer window" : "Show mixer window"}
@@ -5301,7 +5563,7 @@ export function App() {
           <div className="topbar-right" />
         </header>
 
-      <div className="app-body">
+      <div className={`app-body ${assistantVisible ? `assistant-dock-${assistantDock}` : "assistant-hidden"}`}>
         <section className="mix">
 
         {analysisProgress ? (
@@ -6085,17 +6347,44 @@ export function App() {
         />
       </section>
 
-      <aside className="assistant">
+      <aside className={`assistant${assistantVisible ? "" : " assistant-is-hidden"}`} aria-hidden={!assistantVisible}>
         <div className="assistant-head">
+          <div className="assistant-title">
+            <span className="assistant-mark" aria-hidden="true"><MessageSquare size={14} /></span>
+            <span className="assistant-title-copy">
+              <strong>Agent</strong>
+              <small>{visibleBusy || autoMixRunning ? "Working" : "Ready"}</small>
+            </span>
+          </div>
           <div className="assistant-head-actions">
-            {agentUsage ? (
-              <span
-                className="agent-ctx-badge"
-                title={`This conversation: ~${(agentUsage.output + agentUsage.thought).toLocaleString()} tokens generated (${agentUsage.output.toLocaleString()} reply + ${agentUsage.thought.toLocaleString()} reasoning). Context is ${agentUsage.turns}/${agentUsage.compactAfter} turns full — it auto-compacts (resets) at ${agentUsage.compactAfter}.`}
+            <div className="assistant-dock-toggle" role="group" aria-label="Agent panel position">
+              <button
+                type="button"
+                className={assistantDock === "right" ? "active" : ""}
+                onClick={() => {
+                  setAssistantDock("right");
+                  localStorage.setItem("autoMixer.assistantDock", "right");
+                }}
+                title="Dock agent chat on the right"
+                aria-label="Dock agent chat on the right"
+                aria-pressed={assistantDock === "right"}
               >
-                {agentUsage.turns}/{agentUsage.compactAfter} ctx · {(agentUsage.output + agentUsage.thought).toLocaleString()} tok
-              </span>
-            ) : null}
+                <PanelRight size={14} />
+              </button>
+              <button
+                type="button"
+                className={assistantDock === "bottom" ? "active" : ""}
+                onClick={() => {
+                  setAssistantDock("bottom");
+                  localStorage.setItem("autoMixer.assistantDock", "bottom");
+                }}
+                title="Dock agent chat at the bottom"
+                aria-label="Dock agent chat at the bottom"
+                aria-pressed={assistantDock === "bottom"}
+              >
+                <PanelBottom size={14} />
+              </button>
+            </div>
             {visibleBusy || autoMixRunning ? (
               <button
                 className="chat-stop"
@@ -6117,6 +6406,17 @@ export function App() {
             </button>
             <button className="icon-btn" onClick={() => setSettingsOpen(true)} title="Settings" aria-label="Settings">
               <Settings size={14} />
+            </button>
+            <button
+              className="icon-btn"
+              onClick={() => {
+                setAssistantVisible(false);
+                localStorage.setItem("autoMixer.assistantVisible", "false");
+              }}
+              title="Hide agent chat"
+              aria-label="Hide agent chat"
+            >
+              <X size={14} />
             </button>
           </div>
         </div>
@@ -6352,7 +6652,11 @@ export function App() {
           <>
             <div className="chat-log" ref={chatLogRef}>
               {messages.length === 0 ? (
-                <div className="hint">Select a track and ask for a mix change.</div>
+                <div className="chat-empty-state">
+                  <span className="chat-empty-icon" aria-hidden="true"><MessageSquare size={20} /></span>
+                  <strong>How can I help with this session?</strong>
+                  <span>Ask for a mix change, an analysis, or a video edit. Your current track selection sets the scope.</span>
+                </div>
               ) : (
                 messages.map((message, index) => {
                   if (message.role === "critique") {
@@ -6495,36 +6799,33 @@ export function App() {
                 <div className="vrp-msg">{agentEditProgress.message || agentEditProgress.stage}</div>
               </div>
             ) : null}
-            <div className="chat-selected">
-              {selectedTrackIds.length === 0 ? (
-                <>Scope: <strong>all tracks</strong> (click a track to narrow and arm recording)</>
-              ) : (
-                <>Scope: {selectedTrackIds.map((id) => session.tracks.find((track) => track.id === id)?.name).filter(Boolean).join(", ")}</>
-              )}
+            <div className="chat-context-bar">
+              <div className="chat-context-scope" title="The agent applies requests to the selected tracks. No selection means the whole session.">
+                <Focus size={12} aria-hidden="true" />
+                <span>
+                  {selectedTrackIds.length === 0
+                    ? <><strong>All tracks</strong></>
+                    : <strong>{selectedTrackIds.map((id) => session.tracks.find((track) => track.id === id)?.name).filter(Boolean).join(", ")}</strong>}
+                </span>
+              </div>
+              {scopedSection ? (
+                <div className="chat-context-section">
+                  <span><strong>{scopedSection.label}</strong> · {formatTime(scopedSection.start)}–{formatTime(scopedSection.end)}</span>
+                  <button type="button" onClick={() => setScopedSection(null)} title="Clear section scope" aria-label="Clear section scope">×</button>
+                </div>
+              ) : null}
+              {agentUsage ? (
+                <div
+                  className="chat-context-usage"
+                  title={`Context: ${agentUsage.turns}/${agentUsage.compactAfter} turns. Approximately ${(agentUsage.output + agentUsage.thought).toLocaleString()} tokens generated (${agentUsage.output.toLocaleString()} reply + ${agentUsage.thought.toLocaleString()} reasoning).`}
+                >
+                  <span className="chat-context-meter" aria-hidden="true">
+                    <span style={{ width: `${Math.min(100, (agentUsage.turns / Math.max(1, agentUsage.compactAfter)) * 100)}%` }} />
+                  </span>
+                  <span>{agentUsage.turns}/{agentUsage.compactAfter} ctx</span>
+                </div>
+              ) : null}
             </div>
-            {scopedSection ? (
-              <div className="chat-scope">
-                <span>scope: <strong>{scopedSection.label}</strong> {formatTime(scopedSection.start)}–{formatTime(scopedSection.end)}</span>
-                <button type="button" onClick={() => setScopedSection(null)}>×</button>
-              </div>
-            ) : null}
-            {agentUsage ? (
-              <div className="chat-usage" title="Context fills as the conversation grows, then auto-compacts (resets) to keep it light. Tokens are an estimate of what the agent generated this session (reply + reasoning).">
-                <div className="chat-usage-row">
-                  <span className="chat-usage-label">context</span>
-                  <div className="chat-usage-bar">
-                    <div
-                      className="chat-usage-fill"
-                      style={{ width: `${Math.min(100, (agentUsage.turns / Math.max(1, agentUsage.compactAfter)) * 100)}%` }}
-                    />
-                  </div>
-                  <span className="chat-usage-meta">{agentUsage.turns}/{agentUsage.compactAfter} turns</span>
-                </div>
-                <div className="chat-usage-tokens">
-                  ~{(agentUsage.output + agentUsage.thought).toLocaleString()} tok generated · {agentUsage.output.toLocaleString()} reply · {agentUsage.thought.toLocaleString()} reasoning
-                </div>
-              </div>
-            ) : null}
             <form
               className="chat-input"
               onSubmit={(event) => {
@@ -6532,21 +6833,34 @@ export function App() {
                 if (!busy && chatText.trim()) void sendChat();
               }}
             >
-              <textarea
-                value={chatText}
-                onChange={(event) => setChatText(event.target.value)}
-                onKeyDown={(event) => {
-                  // Enter sends; Shift+Enter inserts a newline. Ignore Enter while
-                  // an IME composition is active so CJK input commits cleanly.
-                  if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    if (!busy && chatText.trim()) void sendChat();
-                  }
-                }}
-                placeholder={busy ? (visibleBusy ? "Working…" : "Agent is running in another session…") : "Make a change or ask anything…"}
-                disabled={busy}
-                rows={1}
-              />
+              <div className="chat-composer-shell">
+                <textarea
+                  value={chatText}
+                  onChange={(event) => setChatText(event.target.value)}
+                  onKeyDown={(event) => {
+                    // Enter sends; Shift+Enter inserts a newline. Ignore Enter while
+                    // an IME composition is active so CJK input commits cleanly.
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      if (!busy && chatText.trim()) void sendChat();
+                    }
+                  }}
+                  placeholder={busy ? (visibleBusy ? "Working…" : "Agent is running in another session…") : "Ask the agent to change or analyze the session…"}
+                  disabled={busy}
+                  rows={1}
+                  aria-label="Message the agent"
+                />
+                <button
+                  type="submit"
+                  className="chat-send"
+                  disabled={busy || !chatText.trim()}
+                  title="Send message"
+                  aria-label="Send message"
+                >
+                  <ArrowUp size={16} />
+                </button>
+              </div>
+              <div className="chat-composer-hint">Enter to send · Shift+Enter for a new line</div>
             </form>
           </>
         )}
@@ -6561,6 +6875,17 @@ export function App() {
               <button className="icon-btn" onClick={() => setDownloadOpen(false)} aria-label="Close"><X size={18} /></button>
             </header>
             <div className="settings-modal-body">
+              <section className="settings-group settings-runtime-summary">
+                <div className="settings-group-title">Installation & runtime</div>
+                <p className="settings-group-desc">AutoMixer manages uv, Python, FFmpeg, FFprobe, Hermes ACP, and the optional local llama.cpp service. Reopen setup to change between a remote endpoint and the local model.</p>
+                <div className="settings-runtime-row">
+                  <span className={setupStatus?.complete ? "ready" : "attention"}>
+                    {setupStatus?.complete ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
+                    {setupStatus?.complete ? `Ready · ${setupStatus.configuredMode ?? "existing install"}` : "Setup required"}
+                  </span>
+                  <button type="button" onClick={() => { setSettingsOpen(false); setSetupOpen(true); }}>Open Setup Assistant</button>
+                </div>
+              </section>
               <section className="settings-group">
                 <label className="settings-field">
                   <span>Format</span>

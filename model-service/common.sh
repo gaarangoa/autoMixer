@@ -29,10 +29,6 @@ AUTOMIXER_MODEL_CACHE_REUSE="${AUTOMIXER_MODEL_CACHE_REUSE:-256}"
 AUTOMIXER_MODEL_SLOT_SAVE_PATH="${AUTOMIXER_MODEL_SLOT_SAVE_PATH:-$AUTOMIXER_MODEL_ROOT/kv_cache}"
 AUTOMIXER_MODEL_FLASH_ATTN="${AUTOMIXER_MODEL_FLASH_ATTN:-1}"
 
-AUTOMIXER_MODEL_VLLM_BIN="${AUTOMIXER_MODEL_VLLM_BIN:-vllm}"
-AUTOMIXER_MODEL_VLLM_ID="${AUTOMIXER_MODEL_VLLM_ID:-Qwen/Qwen3.6-35B-A3B-FP8}"
-AUTOMIXER_MODEL_VLLM_GPU_MEMORY_UTILIZATION="${AUTOMIXER_MODEL_VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
-
 AUTOMIXER_MODEL_STATE_DIR="${AUTOMIXER_MODEL_STATE_DIR:-$HOME/.automixer/model-server}"
 AUTOMIXER_MODEL_PID_FILE="${AUTOMIXER_MODEL_PID_FILE:-$AUTOMIXER_MODEL_STATE_DIR/model-server.pid}"
 AUTOMIXER_MODEL_LOG_FILE="${AUTOMIXER_MODEL_LOG_FILE:-$AUTOMIXER_MODEL_STATE_DIR/model-server.log}"
@@ -44,10 +40,6 @@ AUTOMIXER_MODEL_LAUNCH_AGENT_PATH="${AUTOMIXER_MODEL_LAUNCH_AGENT_PATH:-$HOME/Li
 if ! declare -p AUTOMIXER_MODEL_LLAMA_EXTRA_ARGS >/dev/null 2>&1; then
   declare -a AUTOMIXER_MODEL_LLAMA_EXTRA_ARGS=()
 fi
-if ! declare -p AUTOMIXER_MODEL_VLLM_EXTRA_ARGS >/dev/null 2>&1; then
-  declare -a AUTOMIXER_MODEL_VLLM_EXTRA_ARGS=()
-fi
-
 automixer_model_base_url() {
   printf 'http://%s:%s' "$AUTOMIXER_MODEL_HOST" "$AUTOMIXER_MODEL_PORT"
 }
@@ -77,26 +69,15 @@ automixer_model_pid_is_ours() {
   model_command="$(ps -p "$model_pid" -o command= 2>/dev/null || true)"
 
   # The detached starter records the PID just before run.sh replaces itself
-  # with llama-server/vLLM. Accept that short, well-scoped startup window.
+  # with llama-server. Accept that short, well-scoped startup window.
   if [[ "$model_command" == *"$AUTOMIXER_MODEL_SERVICE_DIR/run.sh"* ]]; then
     return 0
   fi
 
-  case "$AUTOMIXER_MODEL_RUNTIME" in
-    llama_cpp)
-      [[ "$model_command" == *"$AUTOMIXER_MODEL_LLAMA_SERVER_BIN"* &&
-        "$model_command" == *"$AUTOMIXER_MODEL_LLAMA_FILE"* &&
-        "$model_command" == *"--port $AUTOMIXER_MODEL_PORT"* ]]
-      ;;
-    vllm)
-      [[ "$model_command" == *"vllm"*"serve"* &&
-        "$model_command" == *"$AUTOMIXER_MODEL_VLLM_ID"* &&
-        "$model_command" == *"--port $AUTOMIXER_MODEL_PORT"* ]]
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  [[ "$AUTOMIXER_MODEL_RUNTIME" == "llama_cpp" &&
+    "$model_command" == *"$AUTOMIXER_MODEL_LLAMA_SERVER_BIN"* &&
+    "$model_command" == *"$AUTOMIXER_MODEL_LLAMA_FILE"* &&
+    "$model_command" == *"--port $AUTOMIXER_MODEL_PORT"* ]]
 }
 
 automixer_model_print_command() {

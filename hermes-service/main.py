@@ -54,13 +54,14 @@ def _default_hermes_bin() -> str:
 HERMES = os.environ.get("AUTOMIXER_HERMES_BIN", _default_hermes_bin())
 UV = os.environ.get("AUTOMIXER_UV", str(Path.home() / ".local" / "bin" / "uv"))
 MCP_DIR = os.environ.get("AUTOMIXER_MCP_DIR", str(Path(__file__).parent / "automixer-mcp"))
-MCP_REQUIRED_TOOLS = {"get_session", "select_tracks", "edit_video"}
+MCP_REQUIRED_TOOLS = {"get_session", "select_tracks", "edit_video", "clean_podcast_audio"}
 
 # Tool-name fragments we trust (our control-surface tools). Anything else the
 # agent tries to call is refused.
 ALLOWED_TOOL_HINTS = ("automixer", "get_session", "set_track", "adjust_track", "mute_track",
                       "solo_track", "set_eq", "set_compressor", "set_high_pass", "set_low_pass",
-                      "set_reverb", "set_delay", "set_master", "undo", "redo")
+                      "set_reverb", "set_delay", "set_master", "clean_podcast", "podcast_cleanup",
+                      "sam_audio", "undo", "redo")
 
 
 def _tool_allowed(tool_call) -> bool:
