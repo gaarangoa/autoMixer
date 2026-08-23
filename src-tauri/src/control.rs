@@ -25,8 +25,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::commands::{apply_and_sync, redo_and_sync, undo_and_sync};
-use crate::model::{HistorySource, MixAction, MixProject, TrackKind};
+use crate::commands::{apply_and_sync, redo_and_sync, reset_all_changes_and_sync, undo_and_sync};
+use crate::model::{HistorySource, MixAction, MixProject, Track, TrackKind};
 use crate::AppState;
 
 /// Port + token of the running control server, populated once at startup so that
@@ -70,8 +70,8 @@ pub fn get_selection(session_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// True while a background video plan is being generated. Guards against launching a
-/// concurrent analysis that would fight over the single model slot and progress events.
+/// True while a background video edit is being generated. Guards against launching a
+/// concurrent analysis/render that would fight over the single model slot and progress events.
 static VIDEO_EDIT_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -149,11 +149,19 @@ pub fn spawn(app: AppHandle) -> Result<&'static ControlInfo, String> {
         )
         .route("/control/session/{session_id}/actions", post(post_actions))
         .route(
+            "/control/session/{session_id}/mix-track",
+            post(post_create_mix_track),
+        )
+        .route(
             "/control/session/{session_id}/podcast-cleanup",
             post(post_podcast_cleanup),
         )
         .route("/control/session/{session_id}/undo", post(post_undo))
         .route("/control/session/{session_id}/redo", post(post_redo))
+        .route(
+            "/control/session/{session_id}/reset-all-changes",
+            post(post_reset_all_changes),
+        )
         .route(
             "/control/session/{session_id}/video-edit",
             post(post_video_edit),
@@ -303,6 +311,55 @@ async fn post_actions(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CreateMixTrackBody {
+    #[serde(default)]
+    track_ids: Vec<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    mono: bool,
+    #[serde(default)]
+    include_master: bool,
+    #[serde(default)]
+    mute_sources: bool,
+}
+
+async fn post_create_mix_track(
+    AxumState(state): AxumState<ControlState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+    Json(body): Json<CreateMixTrackBody>,
+) -> CtlResult<crate::mix_track::CreateMixTrackResult> {
+    check_auth(&state, &headers)?;
+    let track_ids = if body.track_ids.is_empty() {
+        get_selection(&session_id)
+    } else {
+        body.track_ids
+    };
+    let app_state = state.app.state::<AppState>();
+    let result = crate::mix_track::create_mix_track_and_sync(
+        app_state.inner(),
+        &session_id,
+        &track_ids,
+        crate::mix_track::CreateMixTrackOptions {
+            name: body.name,
+            mono: body.mono,
+            include_master: body.include_master,
+            mute_sources: body.mute_sources,
+        },
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    emit_updated(&state.app, &session_id, &result.project);
+    set_selection(&session_id, vec![result.mix_track_id.clone()]);
+    let _ = state.app.emit(
+        "selection:set",
+        serde_json::json!({ "sessionId": session_id, "trackIds": [result.mix_track_id.clone()] }),
+    );
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PodcastCleanupBody {
     #[serde(default)]
     track_ids: Vec<String>,
@@ -327,9 +384,33 @@ struct PodcastCleanupResult {
     cleaned_tracks: Vec<CleanedPodcastTrack>,
 }
 
-/// Isolate the close-miked voice on each requested podcast microphone with SAM-Audio.
-/// Originals remain in the project but are muted; the audible replacements are new clean
-/// voice tracks that inherit the original mic's downstream mix processing.
+fn podcast_cleanup_track_is_eligible(track: &Track, request_scoped: bool) -> bool {
+    if track.kind != TrackKind::Audio {
+        return false;
+    }
+    // Clean Voice stems must not recursively clean themselves. A rendered mix track is
+    // also generated, but is valid input when the user or agent selected it explicitly.
+    if track.ai_generated && (!request_scoped || track.role.as_deref() != Some("mix")) {
+        return false;
+    }
+    request_scoped || !track.muted
+}
+
+fn podcast_cleanup_prompt(track: &Track, requested_prompt: &str) -> String {
+    let requested_prompt = requested_prompt.trim();
+    if !requested_prompt.is_empty() {
+        return requested_prompt.to_lowercase();
+    }
+    if track.role.as_deref() == Some("mix") {
+        crate::sam_audio::PODCAST_CONVERSATION_PROMPT.to_string()
+    } else {
+        crate::sam_audio::PODCAST_VOICE_PROMPT.to_string()
+    }
+}
+
+/// Isolate spoken conversation on each requested microphone or selected mix track with
+/// SAM-Audio. Sources remain in the project but are muted; the audible replacements are
+/// new clean voice tracks that inherit the source track's downstream processing.
 async fn post_podcast_cleanup(
     AxumState(state): AxumState<ControlState>,
     headers: HeaderMap,
@@ -338,9 +419,8 @@ async fn post_podcast_cleanup(
 ) -> CtlResult<PodcastCleanupResult> {
     check_auth(&state, &headers)?;
     let app_state = state.app.state::<AppState>();
-    let explicitly_scoped = !body.track_ids.is_empty();
-    let requested_ids = if explicitly_scoped {
-        body.track_ids
+    let (requested_ids, request_scoped) = if !body.track_ids.is_empty() {
+        (body.track_ids, true)
     } else {
         let selected = get_selection(&session_id);
         if selected.is_empty() {
@@ -351,17 +431,20 @@ async fn post_podcast_cleanup(
             let project = store
                 .get_project(&session_id)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-            project
-                .session
-                .tracks
-                .iter()
-                .filter(|track| {
-                    track.kind == TrackKind::Audio && !track.ai_generated && !track.muted
-                })
-                .map(|track| track.id.clone())
-                .collect()
+            (
+                project
+                    .session
+                    .tracks
+                    .iter()
+                    .filter(|track| {
+                        track.kind == TrackKind::Audio && !track.ai_generated && !track.muted
+                    })
+                    .map(|track| track.id.clone())
+                    .collect(),
+                false,
+            )
         } else {
-            selected
+            (selected, true)
         }
     };
 
@@ -384,32 +467,29 @@ async fn post_podcast_cleanup(
         else {
             continue;
         };
-        if track.kind != TrackKind::Audio || track.ai_generated {
-            continue;
-        }
-        if !explicitly_scoped && track.muted {
+        if !podcast_cleanup_track_is_eligible(track, request_scoped) {
             continue;
         }
         if !targets
             .iter()
-            .any(|(track_id, _): &(String, String)| track_id == &track.id)
+            .any(|(track_id, _, _): &(String, String, String)| track_id == &track.id)
         {
-            targets.push((track.id.clone(), track.name.clone()));
+            targets.push((
+                track.id.clone(),
+                track.name.clone(),
+                podcast_cleanup_prompt(track, body.prompt.as_deref().unwrap_or_default()),
+            ));
         }
     }
     if targets.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "No original audio microphone tracks are available for podcast cleanup.".into(),
+            "No eligible microphone or selected mix tracks are available for podcast cleanup. Existing Clean Voice tracks cannot be cleaned again.".into(),
         ));
     }
 
-    let prompt = body.prompt.unwrap_or_else(|| {
-        "the close-miked spoken voice; reject steady background noise, room tone, hum, fan noise, and off-mic speech spill while preserving natural consonants and breath detail"
-            .into()
-    });
     let starting_message = format!(
-        "SAM-Audio voice cleanup is starting for {} microphone track{}. Audio will be sent to the configured SAM-Audio endpoint; each original will be preserved and muted only after its clean voice stem succeeds.",
+        "SAM-Audio voice cleanup is starting for {} audio track{}. Audio will be sent to the configured SAM-Audio endpoint; each source will be preserved and muted only after its clean voice stem succeeds.",
         targets.len(),
         if targets.len() == 1 { "" } else { "s" }
     );
@@ -440,7 +520,7 @@ async fn post_podcast_cleanup(
     }
 
     let mut cleaned_tracks = Vec::new();
-    for (index, (track_id, track_name)) in targets.iter().enumerate() {
+    for (index, (track_id, track_name, prompt)) in targets.iter().enumerate() {
         let current_project = {
             let store = app_state
                 .store
@@ -498,6 +578,37 @@ async fn post_podcast_cleanup(
             );
             return Err((StatusCode::BAD_GATEWAY, message));
         }
+        let validation_message = format!(
+            "Checking that SAM-Audio kept {}'s speech in the clean voice result.",
+            track_name
+        );
+        let _ = state.app.emit(
+            "podcast-cleanup:status",
+            serde_json::json!({
+                "sessionId": session_id,
+                "phase": "validating",
+                "message": validation_message,
+                "trackId": track_id,
+                "trackName": track_name,
+                "current": index + 1,
+                "total": targets.len(),
+            }),
+        );
+        if let Err(error) = crate::sam_audio::validate_podcast_voice_preview(&preview_id) {
+            let _ = crate::sam_audio::discard_track_split(preview_id);
+            let message = format!("SAM-Audio cleanup was rejected for {track_name}: {error}");
+            let _ = state.app.emit(
+                "podcast-cleanup:status",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "phase": "error",
+                    "message": message,
+                    "current": index + 1,
+                    "total": targets.len(),
+                }),
+            );
+            return Err((StatusCode::BAD_GATEWAY, message));
+        }
         let applied = crate::sam_audio::apply_track_split_internal(
             app_state.inner(),
             preview_id,
@@ -523,7 +634,7 @@ async fn post_podcast_cleanup(
     }
 
     let message = format!(
-        "SAM-Audio cleanup completed: {} clean voice track{} added; the original microphones remain preserved and muted.",
+        "SAM-Audio cleanup completed: {} clean voice track{} added; the source tracks remain preserved and muted.",
         cleaned_tracks.len(),
         if cleaned_tracks.len() == 1 { " was" } else { "s were" }
     );
@@ -579,6 +690,41 @@ async fn post_redo(
     Ok(Json(project))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetAllChangesResult {
+    status: &'static str,
+    reverted_entries: usize,
+    message: String,
+    project: MixProject,
+}
+
+async fn post_reset_all_changes(
+    AxumState(state): AxumState<ControlState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+) -> CtlResult<ResetAllChangesResult> {
+    check_auth(&state, &headers)?;
+    let app_state = state.app.state::<AppState>();
+    let (project, reverted_entries) = reset_all_changes_and_sync(app_state.inner(), &session_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    emit_updated(&state.app, &session_id, &project);
+    let message = if reverted_entries == 0 {
+        "The project is already at its original state.".into()
+    } else {
+        format!(
+            "Restored the original project state by reverting {reverted_entries} edit history {}. Original media and tracks were preserved.",
+            if reverted_entries == 1 { "entry" } else { "entries" }
+        )
+    };
+    Ok(Json(ResetAllChangesResult {
+        status: "completed",
+        reverted_entries,
+        message,
+        project,
+    }))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VideoEditBody {
@@ -592,6 +738,10 @@ struct VideoEditBody {
     end_sample: Option<u64>,
     #[serde(default)]
     interval_seconds: Option<f64>,
+    /// Optional review workflow. The normal chat command renders and attaches the final
+    /// video automatically; this mode deliberately stops at the editable cut plan.
+    #[serde(default)]
+    review_only: bool,
 }
 
 #[derive(Serialize)]
@@ -601,9 +751,9 @@ struct VideoEditResult {
     message: String,
 }
 
-/// The video-edit skill: run AutoMixer's review-first planning pipeline (frame analysis
-/// via the configured video VLM), then surface the directing contract and editable
-/// timeline. Rendering is an explicit user-approved second step.
+/// Run AutoMixer's directed edit pipeline (frame analysis via the configured video VLM),
+/// render the result, and attach it to the timeline. An explicit review-only request can
+/// stop at the editable plan instead.
 async fn post_video_edit(
     AxumState(state): AxumState<ControlState>,
     headers: HeaderMap,
@@ -686,15 +836,16 @@ async fn post_video_edit(
     if VIDEO_EDIT_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err((
             StatusCode::CONFLICT,
-            "A video edit plan is already being generated. Wait for it to appear in the Video Editor.".into(),
+            "A video edit is already running. Wait for it to finish before starting another."
+                .into(),
         ));
     }
 
-    // Plan in a DETACHED background task so it survives the agent's chat turn ending.
-    // The result is surfaced in the same review-first editor used by direct UI requests;
-    // the user approves/adjusts the plan before any expensive final render begins.
+    // Run in a DETACHED background task so analysis and rendering survive the agent's
+    // chat turn ending. Direct chat requests create the output track automatically.
     let instructions = body.instructions.clone();
     let interval_seconds = body.interval_seconds;
+    let review_only = body.review_only;
     let task_session = session_id.clone();
     tauri::async_runtime::spawn(async move {
         // Releases the running-flag on ANY exit (return, error, panic, drop).
@@ -708,6 +859,7 @@ async fn post_video_edit(
             interval_seconds,
             config,
             instructions,
+            review_only,
         )
         .await;
         if let Err(error) = result {
@@ -722,13 +874,17 @@ async fn post_video_edit(
 
     Ok(Json(VideoEditResult {
         status: "started".into(),
-        message: "The directed edit plan is being generated in the background. When ready, it opens in the Video Editor with the interpreted source roles, constraints, timeline decisions, and compliance report; the user reviews it and clicks Process to render. YOUR TURN IS COMPLETE: reply with ONE short sentence saying the plan is being generated, then STOP. Do NOT call any more tools or re-run edit_video.".into(),
+        message: if review_only {
+            "The directed edit plan is being generated in the background for optional review. YOUR TURN IS COMPLETE: reply with ONE short sentence saying the review plan is being generated, then STOP. Do NOT call any more tools or re-run edit_video.".into()
+        } else {
+            "The directed edit is being analyzed and rendered in the background. The finished video will be added automatically as the Agent video edit track. YOUR TURN IS COMPLETE: reply with ONE short sentence saying rendering started, then STOP. Do NOT call any more tools or re-run edit_video.".into()
+        },
     }))
 }
 
-/// The review-first planner, run in a detached background task (see post_video_edit).
-/// Emits the structured contract + editable shot plan; rendering happens only after the
-/// user approves it in the Video Editor.
+/// The directed video job, run in a detached background task (see post_video_edit).
+/// Normally it renders and attaches the result; explicit review-only mode emits the
+/// structured contract and editable shot plan instead.
 #[allow(clippy::too_many_arguments)]
 async fn render_video_edit_job(
     app: AppHandle,
@@ -739,6 +895,7 @@ async fn render_video_edit_job(
     interval_seconds: Option<f64>,
     config: crate::config::Config,
     instructions: Option<String>,
+    review_only: bool,
 ) -> Result<(), String> {
     let source_track_ids = track_ids.clone();
     let resp = crate::commands::render_agent_video_edit(
@@ -756,23 +913,61 @@ async fn render_video_edit_job(
         Some(config.video_model),
         instructions,
         None,
-        Some(true),
+        Some(review_only),
     )
     .await?;
+    if review_only {
+        let _ = app.emit(
+            "video:plan-ready",
+            serde_json::json!({
+                "sessionId": session_id,
+                "sourceTrackIds": source_track_ids,
+                "startSample": start_sample,
+                "endSample": end_sample,
+                "intervalSeconds": interval_seconds.unwrap_or(0.5),
+                "script": resp.script,
+                "editBrief": resp.edit_brief,
+                "validation": resp.validation,
+                "lookPreset": resp.look_preset,
+                "colorGrade": resp.color_grade,
+                "videoEffects": resp.video_effects,
+            }),
+        );
+        return Ok(());
+    }
+
+    let render_path = std::path::Path::new(&resp.path);
+    let app_state = app.state::<AppState>();
+    let sample_rate = {
+        let store = app_state.store.lock().map_err(|error| error.to_string())?;
+        store.get_project(&session_id)?.session.sample_rate
+    };
+    let fallback_duration_ms = end_sample
+        .unwrap_or(start_sample.unwrap_or(0).saturating_add(1))
+        .saturating_sub(start_sample.unwrap_or(0))
+        .saturating_mul(1_000)
+        .checked_div(sample_rate.max(1) as u64)
+        .unwrap_or(1)
+        .max(1);
+    let duration_ms = crate::commands::probe_video_duration(render_path)
+        .map(|seconds| (seconds * 1_000.0).round() as u64)
+        .unwrap_or(fallback_duration_ms)
+        .max(1);
+    let project = crate::commands::upsert_agent_video_track(
+        app_state.inner(),
+        &session_id,
+        render_path,
+        start_sample.unwrap_or(0),
+        duration_ms,
+    )?;
+    emit_updated(&app, &session_id, &project);
     let _ = app.emit(
-        "video:plan-ready",
+        "video:rendered",
         serde_json::json!({
             "sessionId": session_id,
-            "sourceTrackIds": source_track_ids,
-            "startSample": start_sample,
-            "endSample": end_sample,
-            "intervalSeconds": interval_seconds.unwrap_or(2.0),
-            "script": resp.script,
-            "editBrief": resp.edit_brief,
-            "validation": resp.validation,
+            "path": resp.path,
+            "cuts": resp.script.len(),
             "lookPreset": resp.look_preset,
-            "colorGrade": resp.color_grade,
-            "videoEffects": resp.video_effects,
         }),
     );
     Ok(())
@@ -1098,4 +1293,46 @@ async fn get_camera_preview(
         .header("cache-control", "no-store")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicitly_selected_mix_track_is_valid_podcast_cleanup_input() {
+        let mut mix =
+            crate::defaults::make_track("source".into(), "Selected Tracks · Mix".into(), 0);
+        mix.ai_generated = true;
+        mix.role = Some("mix".into());
+        mix.muted = true;
+
+        assert!(podcast_cleanup_track_is_eligible(&mix, true));
+        assert!(!podcast_cleanup_track_is_eligible(&mix, false));
+    }
+
+    #[test]
+    fn clean_voice_stem_cannot_be_cleaned_recursively() {
+        let mut clean =
+            crate::defaults::make_track("source".into(), "Dialogue · Clean Voice".into(), 0);
+        clean.ai_generated = true;
+        clean.role = Some("lead_vocal".into());
+
+        assert!(!podcast_cleanup_track_is_eligible(&clean, true));
+    }
+
+    #[test]
+    fn cleanup_prompt_matches_single_mic_or_conversation_mix() {
+        let mic = crate::defaults::make_track("source-a".into(), "David".into(), 0);
+        let mut mix =
+            crate::defaults::make_track("source-b".into(), "Selected Tracks · Mix".into(), 1);
+        mix.role = Some("mix".into());
+
+        assert_eq!(podcast_cleanup_prompt(&mic, ""), "person speaking");
+        assert_eq!(podcast_cleanup_prompt(&mix, ""), "people speaking");
+        assert_eq!(
+            podcast_cleanup_prompt(&mix, "  Group Conversation  "),
+            "group conversation"
+        );
+    }
 }

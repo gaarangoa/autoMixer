@@ -29,7 +29,7 @@ export type VideoPlanReadyEvent = {
 export type SamSplitProgressEvent = { previewId: string; sessionId: string; phase: string; message: string; progress: number; chunk?: number; chunks?: number; elapsedSeconds: number };
 export type PodcastCleanupStatusEvent = {
   sessionId: string;
-  phase: "starting" | "track-start" | "complete" | "error";
+  phase: "starting" | "track-start" | "validating" | "complete" | "error";
   message: string;
   current: number;
   total: number;

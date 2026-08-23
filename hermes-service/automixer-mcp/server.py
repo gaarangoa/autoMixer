@@ -12,9 +12,9 @@ Run via uv:  uv run --directory <this dir> server.py
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import asyncio
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -25,7 +25,7 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("automixer")
 
 CONTROL_FILE = Path(os.environ.get("AUTOMIXER_CONTROL_FILE", str(Path.home() / ".automixer" / "control.json")))
-AUTO_MIX_HTTP_TIMEOUT_SECONDS = 2 * 60 * 60
+LONG_RUNNING_HTTP_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 def _control() -> tuple[str, str]:
@@ -61,6 +61,7 @@ def _request(method: str, path: str, body: dict | None = None, timeout: float = 
 
 
 async def _request_async(method: str, path: str, body: dict | None = None, timeout: float = 30) -> Any:
+    """Run a blocking control-surface request without blocking MCP keepalives."""
     return await asyncio.to_thread(_request, method, path, body, timeout)
 
 
@@ -173,8 +174,9 @@ def apply_actions(session_id: str, actions: list[dict], explanation: str = "") -
 
     A real mix is PROCESSING, not just faders: for a "professional / clear / punchy / make
     it sit / cut through" request, use set_eq_band + set_compressor + high-pass + sends —
-    NOT gain alone. For a whole-mix request, consider auto_mix. ALWAYS read the
-    **audio-mixing** skill first for the vocabulary and the doctrine."""
+    NOT gain alone. For a whole-mix request, build the measured full processing chain
+    in this one batched action call. ALWAYS read the **audio-mixing** skill first for
+    the vocabulary and the doctrine."""
     project = _request(
         "POST",
         f"/control/session/{session_id}/actions",
@@ -184,12 +186,59 @@ def apply_actions(session_id: str, actions: list[dict], explanation: str = "") -
 
 
 @mcp.tool()
-def clean_podcast_audio(
+async def create_mix_track(
+    session_id: str,
+    track_ids: list[str] | None = None,
+    name: str = "",
+    mono: bool = False,
+    include_master: bool = False,
+    mute_sources: bool = False,
+) -> dict:
+    """Bounce selected audio tracks through their current processing into a new track.
+
+    Normally omit ``track_ids`` so the tool uses the user's current track selection.
+    The bounce includes clip edits, gain, pan, filters, EQ, compression, automation, and
+    shared sends. Master processing is excluded by default so it is applied exactly once
+    when the new track plays in the project. Set ``mono`` for a mono dialogue bounce.
+
+    Sources are preserved. To prevent doubled playback, the new mix track starts muted
+    unless ``mute_sources`` is true; with ``mute_sources=true`` the selected sources are
+    muted and the new mix track is audible. The whole operation is one undoable change.
+    ``include_master=true`` bakes the current master into the file and is intended only
+    when the user explicitly requests a master-processed print.
+    """
+    body = {
+        "trackIds": track_ids or [],
+        "name": name.strip() or None,
+        "mono": mono,
+        "includeMaster": include_master,
+        "muteSources": mute_sources,
+    }
+    result = await _request_async(
+        "POST",
+        f"/control/session/{session_id}/mix-track",
+        body,
+        timeout=LONG_RUNNING_HTTP_TIMEOUT_SECONDS,
+    )
+    return {
+        "ok": True,
+        "mixTrackId": result.get("mixTrackId"),
+        "mixTrackName": result.get("mixTrackName"),
+        "sourceTrackIds": result.get("sourceTrackIds", []),
+        "channels": result.get("channels"),
+        "includedMaster": result.get("includedMaster", False),
+        "sourcesMuted": result.get("sourcesMuted", False),
+        "mixTrackMuted": result.get("mixTrackMuted", True),
+    }
+
+
+@mcp.tool()
+async def clean_podcast_audio(
     session_id: str,
     track_ids: list[str] | None = None,
     prompt: str = "",
 ) -> dict:
-    """Run the high-quality SAM-Audio spoken-voice cleanup stage for podcast mics.
+    """Run the high-quality SAM-Audio spoken-voice cleanup stage for podcast audio.
 
     This is a long-running, non-destructive operation. Before processing, AutoMixer posts
     a visible notice that audio is being sent to the configured SAM-Audio endpoint. For
@@ -200,19 +249,23 @@ def clean_podcast_audio(
 
     Pass explicit audio ``track_ids`` to scope the cleanup. If omitted, the current audio
     selection is used; if no tracks are selected, all unmuted original audio tracks are
-    cleaned. Do not call this on existing Clean Voice / AI-generated tracks. Use the
-    optional ``prompt`` only to refine what counts as the wanted spoken voice; the default
-    rejects steady noise, room tone, hum, fan noise, and off-mic spill while preserving
-    natural speech detail.
+    cleaned. An explicitly selected generated mix/bounce track (role ``mix``), including
+    ``Selected Tracks · Mix``, is valid input and should be cleaned directly when the user
+    asks. Do not call this on an existing Clean Voice track or another generated stem. Use the
+    optional ``prompt`` only to describe the sound to retain with a short lowercase noun
+    or verb phrase such as ``woman speaking`` or ``people speaking``. Normally omit it:
+    AutoMixer uses ``person speaking`` for an individual microphone and ``people speaking``
+    for a mix/bounce that may contain a conversation. Never put denoising instructions or
+    a production brief in this field: SAM-Audio may classify the requested voice as residual.
     """
     body: dict[str, Any] = {"trackIds": track_ids or []}
     if prompt.strip():
         body["prompt"] = prompt.strip()
-    return _request(
+    return await _request_async(
         "POST",
         f"/control/session/{session_id}/podcast-cleanup",
         body,
-        timeout=AUTO_MIX_HTTP_TIMEOUT_SECONDS,
+        timeout=LONG_RUNNING_HTTP_TIMEOUT_SECONDS,
     )
 
 
@@ -231,25 +284,59 @@ def redo(session_id: str) -> dict:
 
 
 @mcp.tool()
-def edit_video(session_id: str, instructions: str = "", interval_seconds: float = 1.0) -> dict:
-    """Start a review-first multicam video plan. The configured video model "sees" the
-    frames and proposes a directed cut plan. `instructions` guides source roles,
-    constraints, look, and pacing
-    (e.g. "cinematic, cut on the beat"). `interval_seconds` sets how often it samples a
-    frame (smaller = more cuts; 2-3 is a good default — 1 is fine-grained but slower).
+def reset_all_changes(session_id: str) -> dict:
+    """Hard-reset all edits and restore the project's original imported state.
 
-    IMPORTANT: this returns IMMEDIATELY with {"status":"started"}. Planning runs in the
-    BACKGROUND and the user sees live progress. When ready, AutoMixer opens the editable
-    plan + directing contract; the user reviews it and clicks Process to render. So after
-    calling this, say the PLAN is being generated — do NOT claim rendering is finished,
-    do NOT call it again to "check", and do
-    NOT call get_session expecting the new track yet. One edit runs at a time; calling
-    again while one is planning returns a 409 (already running).
+    Use this when the user asks for a complete reset, hard reset, untouched project,
+    original starting state, or to remove every change. This reverses the entire edit
+    history (both agent and manual edits) while preserving the imported audio/video,
+    source files, and tracks. It is deliberately different from clearing/deleting a
+    session. The reverted history remains redoable until a new edit is made. Do not call
+    ``undo`` repeatedly for this request; call this tool exactly once.
+    """
+    result = _request("POST", f"/control/session/{session_id}/reset-all-changes")
+    project = result.get("project", {})
+    return {
+        "ok": True,
+        "status": result.get("status"),
+        "revertedEntries": result.get("revertedEntries", 0),
+        "message": result.get("message", "Project reset completed."),
+        "tracks": _track_summary_compact(project),
+    }
+
+
+@mcp.tool()
+def edit_video(
+    session_id: str,
+    instructions: str = "",
+    interval_seconds: float = 0.5,
+    review_only: bool = False,
+) -> dict:
+    """Create a directed multicam video. The configured video model "sees" the frames,
+    proposes the cuts, renders the MP4, and adds/updates the ``Agent video edit`` track.
+    `instructions` guides source roles, constraints, look, and pacing
+    (e.g. "cinematic, cut on the beat"). `interval_seconds` sets the audio/frame decision
+    resolution. The 0.5-second default is appropriate for speaker-aware conversation edits.
+
+    IMPORTANT: this returns IMMEDIATELY with {"status":"started"}. Analysis and rendering
+    continue in the BACKGROUND and the user sees live progress. After calling it, say that
+    rendering started — do NOT claim it is already finished, call it again to "check", or
+    call get_session expecting the output immediately. One edit runs at a time; another
+    call while it is running returns a 409.
 
     Scope: automatically targets the user's SELECTED video tracks (see
-    get_session.selectedTrackIds); it does not analyze unselected cameras. No output
-    track is created until the user approves the plan and clicks Process."""
-    body = {"instructions": instructions, "intervalSeconds": interval_seconds}
+    get_session.selectedTrackIds); it does not analyze unselected cameras. In conversation
+    sessions it automatically pairs participant microphones and cameras by labels such as
+    speaker-a/camera-a or a shared participant name. Clear speech selects that participant's
+    camera; an unpaired room overview is reserved for brief pauses or overlap. Set
+    ``review_only=true`` only when the user explicitly asks to inspect/approve the cut
+    plan before rendering; that mode stops at the editable plan and creates no output
+    track until the user chooses to render it."""
+    body = {
+        "instructions": instructions,
+        "intervalSeconds": interval_seconds,
+        "reviewOnly": review_only,
+    }
     return _request("POST", f"/control/session/{session_id}/video-edit", body, timeout=60)
 
 
@@ -327,25 +414,6 @@ def auto_crop(session_id: str, track_id: str, clip_id: str, instructions: str = 
     on the face'). Use when you don't have exact crop numbers. Get ids from get_session."""
     body = {"trackId": track_id, "clipId": clip_id, "instructions": instructions}
     return _request("POST", f"/control/session/{session_id}/auto-crop", body, timeout=300)
-
-
-@mcp.tool()
-async def auto_mix(session_id: str, stages: list[str] | None = None) -> dict:
-    """Run AutoMixer auto-mix STAGES and return a report (actions applied + rationale).
-    Each stage is slow on local llama.cpp (~3-8 min, calls the mix model). ALWAYS call
-    this ONE STAGE AT A TIME (pass exactly one stage in `stages`) and report progress
-    to the user between calls. Do NOT call with no stages or many stages unless the
-    user explicitly asks for a single opaque background run; a full run can exceed
-    30 minutes. Stage order: prep_intent, static_balance, cleanup_filters,
-    subtractive_eq, dynamics, tonal_enhancement, depth_space, mix_bus_loudness
-    (raw_session_prep and section_automation are optional). See the auto-mix skill."""
-    body = {"stages": stages} if stages else {}
-    return await _request_async(
-        "POST",
-        f"/control/session/{session_id}/auto-mix",
-        body,
-        timeout=AUTO_MIX_HTTP_TIMEOUT_SECONDS,
-    )
 
 
 if __name__ == "__main__":

@@ -23,13 +23,15 @@ use uuid::Uuid;
 use crate::{
     actions::record_patch,
     config::Config,
-    engine::source::{cache::read_cache_all, decode::decode_file},
+    engine::source::{analysis::analyze, cache::read_cache_all, decode::decode_file},
     model::{ClipRegion, HistorySource, JsonPatchOp, MixProject, MixSession, Track, TrackKind},
     AppState,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(800);
 const JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const PODCAST_VOICE_PROMPT: &str = "person speaking";
+pub(crate) const PODCAST_CONVERSATION_PROMPT: &str = "people speaking";
 
 #[derive(Clone)]
 struct PendingSplit {
@@ -574,7 +576,7 @@ pub(crate) fn apply_track_split_internal(
             )
         }
         SplitApplyMode::PodcastVoiceCleanup => {
-            // Preserve the original microphone and all of its source media, but remove
+            // Preserve the source track and all of its media, but remove
             // it from the audible mix. The clean voice stem below inherits its fader,
             // EQ, compressor, and automation, so separation happens before mixing.
             after_tracks[track_index].muted = true;
@@ -582,7 +584,7 @@ pub(crate) fn apply_track_split_internal(
                 format!("{} · Clean Voice", source_track.name),
                 "lead_vocal".to_string(),
                 format!(
-                    "SAM-Audio podcast cleanup: isolated speech from {} and muted the preserved original microphone",
+                    "SAM-Audio podcast cleanup: isolated speech from {} and muted the preserved source track",
                     source_track.name
                 ),
             )
@@ -663,6 +665,51 @@ pub(crate) fn apply_track_split_internal(
         project,
         extracted_track_id,
     })
+}
+
+/// Reject a podcast replacement when SAM-Audio put the wanted speech in the
+/// residual instead of the target. This check runs before the original mic is
+/// muted or a Clean Voice track is added.
+pub(crate) fn validate_podcast_voice_preview(preview_id: &str) -> Result<(), String> {
+    let pending = previews()
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(preview_id)
+        .cloned()
+        .ok_or_else(|| "This split preview expired.".to_string())?;
+    let target_path = pending
+        .target_path
+        .as_deref()
+        .ok_or("Extracted audio is not ready.")?;
+    let residual_path = pending
+        .residual_path
+        .as_deref()
+        .ok_or("Background audio is not ready.")?;
+
+    let original = decode_mono(&pending.original_path)?;
+    let target = decode_mono(target_path)?;
+    let residual = decode_mono(residual_path)?;
+    if original.sample_rate != target.sample_rate || original.sample_rate != residual.sample_rate {
+        return Err(
+            "SAM-Audio voice validation failed because the returned sample rates do not match."
+                .into(),
+        );
+    }
+
+    let threshold = speech_activity_threshold(&original.samples, original.sample_rate);
+    let original_profile = voice_stem_profile(&original, threshold);
+    let target_profile = voice_stem_profile(&target, threshold);
+    let residual_profile = voice_stem_profile(&residual, threshold);
+
+    if podcast_voice_target_is_plausible(original_profile, target_profile, residual_profile) {
+        Ok(())
+    } else {
+        Err(format!(
+            "SAM-Audio voice validation failed: the extracted target retained only {:.0}% speech-like activity while the background retained {:.0}%. The requested voice appears to be in the background result, so the source track was left unchanged.",
+            target_profile.activity_fraction * 100.0,
+            residual_profile.activity_fraction * 100.0,
+        ))
+    }
 }
 
 async fn poll_job(
@@ -933,6 +980,99 @@ fn peaks_from_audio_file(path: &Path) -> Result<Vec<f32>, String> {
     Ok(build_peaks(&mono))
 }
 
+struct MonoAudio {
+    samples: Vec<f32>,
+    sample_rate: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VoiceStemProfile {
+    rms_db: f32,
+    mid_energy: f32,
+    high_energy: f32,
+    activity_fraction: f32,
+}
+
+fn decode_mono(path: &Path) -> Result<MonoAudio, String> {
+    let decoded = decode_file(path)?;
+    let channels = decoded.channels.max(1) as usize;
+    let mut samples = Vec::with_capacity(decoded.samples.len() / channels);
+    for frame in decoded.samples.chunks(channels) {
+        samples.push(frame.iter().copied().sum::<f32>() / frame.len() as f32);
+    }
+    Ok(MonoAudio {
+        samples,
+        sample_rate: decoded.sample_rate,
+    })
+}
+
+fn frame_rms_values(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    let frame_samples = ((sample_rate as usize * 30) / 1000).max(1);
+    samples
+        .chunks(frame_samples)
+        .filter(|frame| frame.len() == frame_samples)
+        .map(|frame| {
+            let sum_squares = frame
+                .iter()
+                .map(|sample| (*sample as f64) * (*sample as f64))
+                .sum::<f64>();
+            (sum_squares / frame.len() as f64).sqrt() as f32
+        })
+        .collect()
+}
+
+fn speech_activity_threshold(samples: &[f32], sample_rate: u32) -> f32 {
+    let mut frames = frame_rms_values(samples, sample_rate);
+    if frames.is_empty() {
+        return 1.0e-6;
+    }
+    let overall_rms = (samples
+        .iter()
+        .map(|sample| (*sample as f64) * (*sample as f64))
+        .sum::<f64>()
+        / samples.len().max(1) as f64)
+        .sqrt() as f32;
+    frames.sort_by(f32::total_cmp);
+    let noise_floor = frames[(frames.len() - 1) / 5];
+    (noise_floor * 10.0_f32.powf(10.0 / 20.0))
+        .max(overall_rms * 0.1)
+        .max(1.0e-6)
+}
+
+fn voice_stem_profile(audio: &MonoAudio, activity_threshold: f32) -> VoiceStemProfile {
+    let metrics = analyze(&audio.samples, 1, audio.sample_rate);
+    let frames = frame_rms_values(&audio.samples, audio.sample_rate);
+    let active = frames
+        .iter()
+        .filter(|rms| **rms >= activity_threshold)
+        .count();
+    VoiceStemProfile {
+        rms_db: metrics.rms_db,
+        mid_energy: metrics.mid_energy,
+        high_energy: metrics.high_energy,
+        activity_fraction: active as f32 / frames.len().max(1) as f32,
+    }
+}
+
+fn podcast_voice_target_is_plausible(
+    original: VoiceStemProfile,
+    target: VoiceStemProfile,
+    residual: VoiceStemProfile,
+) -> bool {
+    let target_lost_most_activity = original.activity_fraction > 0.02
+        && target.activity_fraction < original.activity_fraction * 0.35;
+    let residual_dominates_activity =
+        residual.activity_fraction > target.activity_fraction * 1.8 + 0.02;
+    let residual_dominates_level = residual.rms_db > target.rms_db + 10.0;
+    let target_is_high_frequency_residue = target.high_energy > 0.55
+        && residual.mid_energy > target.mid_energy + 0.12
+        && residual.activity_fraction > target.activity_fraction;
+
+    !((target_lost_most_activity && residual_dominates_activity)
+        || residual_dominates_level
+        || target_is_high_frequency_residue)
+}
+
 fn build_peaks(samples: &[f32]) -> Vec<f32> {
     const BINS: usize = 360;
     if samples.is_empty() {
@@ -1073,6 +1213,56 @@ mod tests {
         let peaks = build_peaks(&[0.0, -0.5, 1.2, 0.25]);
         assert!(peaks.iter().all(|peak| (0.0..=1.0).contains(peak)));
         assert_eq!(peaks.iter().copied().fold(0.0_f32, f32::max), 1.0);
+    }
+
+    #[test]
+    fn podcast_voice_validation_rejects_reversed_stems() {
+        let original = VoiceStemProfile {
+            rms_db: -40.0,
+            mid_energy: 0.55,
+            high_energy: 0.18,
+            activity_fraction: 0.65,
+        };
+        let target = VoiceStemProfile {
+            rms_db: -78.0,
+            mid_energy: 0.08,
+            high_energy: 0.75,
+            activity_fraction: 0.01,
+        };
+        let residual = VoiceStemProfile {
+            rms_db: -40.5,
+            mid_energy: 0.54,
+            high_energy: 0.19,
+            activity_fraction: 0.64,
+        };
+        assert!(!podcast_voice_target_is_plausible(
+            original, target, residual
+        ));
+    }
+
+    #[test]
+    fn podcast_voice_validation_accepts_voice_in_target() {
+        let original = VoiceStemProfile {
+            rms_db: -40.0,
+            mid_energy: 0.55,
+            high_energy: 0.18,
+            activity_fraction: 0.65,
+        };
+        let target = VoiceStemProfile {
+            rms_db: -40.4,
+            mid_energy: 0.57,
+            high_energy: 0.17,
+            activity_fraction: 0.64,
+        };
+        let residual = VoiceStemProfile {
+            rms_db: -67.0,
+            mid_energy: 0.25,
+            high_energy: 0.31,
+            activity_fraction: 0.0,
+        };
+        assert!(podcast_voice_target_is_plausible(
+            original, target, residual
+        ));
     }
 
     #[test]

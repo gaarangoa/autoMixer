@@ -12,7 +12,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     ab_judge::{AbJudgeOptions, AbJudgeResponse},
-    actions::{apply_actions, record_patch, redo, undo},
+    actions::{apply_actions, record_patch, redo, reset_all_changes, undo},
     assistant, audio,
     engine::commands::EngineCommand,
     media_tools,
@@ -260,6 +260,77 @@ struct RenderedAudioAnalysis {
     /// `range_start` for a range render — used by `audio_features_for_window` to look
     /// up the right frames without rendering the unused leading section.
     timeline_start_sample: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SpeakerTrackPair {
+    video_track_id: String,
+    video_track_name: String,
+    audio_track_id: String,
+    audio_track_name: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpeakerWindowLevel {
+    rms_db: f32,
+    activity: f32,
+}
+
+#[derive(Clone, Debug)]
+struct SpeakerAudioTimeline {
+    pair: SpeakerTrackPair,
+    levels: Vec<SpeakerWindowLevel>,
+}
+
+#[derive(Clone, Debug)]
+enum SpeakerCue {
+    Unavailable,
+    Pause,
+    Active {
+        video_track_id: String,
+        video_track_name: String,
+        audio_track_name: String,
+        rms_db: f32,
+        activity: f32,
+    },
+    Overlap {
+        speakers: Vec<(String, String, f32)>,
+    },
+}
+
+impl SpeakerCue {
+    fn active_video_track_id(&self) -> Option<&str> {
+        match self {
+            Self::Active { video_track_id, .. } => Some(video_track_id),
+            _ => None,
+        }
+    }
+
+    fn editorial_text(&self) -> String {
+        match self {
+            Self::Unavailable => "No reliable microphone-to-camera mapping is available; use visual evidence and continuity.".into(),
+            Self::Pause => "No mapped microphone has clear foreground speech. Prefer holding the current speaker shot; a room overview is allowed only as a brief, intentional pause/establishing shot.".into(),
+            Self::Active {
+                video_track_name,
+                audio_track_name,
+                rms_db,
+                activity,
+                ..
+            } => format!(
+                "Clear active speaker: {audio_track_name} ({rms_db:.1} dBFS, activity {activity:.2}). The authoritative paired shot is {video_track_name}; use it whenever its frame is readable. Do not choose the room overview during this clear speech window."
+            ),
+            Self::Overlap { speakers } => {
+                let names = speakers
+                    .iter()
+                    .map(|(audio, video, activity)| format!("{audio} → {video} ({activity:.2})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Overlapping or ambiguous speakers: {names}. Do not chase half-second switches; hold a useful participant/reaction shot or use the room overview briefly when it improves clarity."
+                )
+            }
+        }
+    }
 }
 
 const MAX_DYNAMIC_HOLD_WINDOWS: u32 = 4;
@@ -769,6 +840,25 @@ pub fn redo_and_sync(state: &AppState, session_id: &str) -> Result<MixProject, S
         audio.publish_automation(&project.session);
     }
     Ok(project)
+}
+
+/// Restore the imported project state by reversing every recorded edit, then perform
+/// one engine/store synchronization. Unlike `reset_session`, this preserves the source
+/// files and tracks. Returned edits remain redoable until another change is made.
+pub fn reset_all_changes_and_sync(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(MixProject, usize), String> {
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    let mut project = store.get_project(session_id)?;
+    let reverted_entries = reset_all_changes(&mut project)?;
+    store.save(&project)?;
+    if let Ok(mut audio) = state.audio.lock() {
+        audio.bind_session_sources(&project.session)?;
+        sync_session_to_engine(&mut audio, &project.session);
+        audio.publish_automation(&project.session);
+    }
+    Ok((project, reverted_entries))
 }
 
 #[tauri::command]
@@ -3884,7 +3974,7 @@ pub async fn export_video(
 }
 
 /// Total duration in seconds via ffprobe (None if unavailable → indeterminate progress).
-fn probe_video_duration(path: &Path) -> Option<f64> {
+pub(crate) fn probe_video_duration(path: &Path) -> Option<f64> {
     let out = Command::new(media_tools::ffprobe_path())
         .args([
             "-v",
@@ -4046,7 +4136,7 @@ pub fn render_auto_video_edit(
     if video_inputs.is_empty() {
         return Err("The selected video tracks have no recorded clips in the edit range.".into());
     }
-    let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0)
+    let interval_samples = ((sample_interval_seconds.unwrap_or(0.5).clamp(0.25, 16.0)
         * project.session.sample_rate as f64)
         .round() as u64)
         .max(1);
@@ -4535,7 +4625,7 @@ pub async fn render_agent_video_edit(
         );
         return Err("The selected video tracks have no recorded clips in the edit range.".into());
     }
-    let interval_samples = ((sample_interval_seconds.unwrap_or(1.0).clamp(0.25, 16.0)
+    let interval_samples = ((sample_interval_seconds.unwrap_or(0.5).clamp(0.25, 16.0)
         * project.session.sample_rate as f64)
         .round() as u64)
         .max(1);
@@ -4616,6 +4706,45 @@ pub async fn render_agent_video_edit(
         sample_rate: rendered_range.sample_rate,
         timeline_start_sample: range_start,
     };
+    emit_agent_progress(
+        &app,
+        &session_id,
+        &started,
+        "speaker-audio",
+        "Matching participant microphones to cameras and detecting active speakers...",
+        0,
+        total_windows,
+    );
+    let speaker_audio = build_speaker_audio_timelines(
+        &project.session,
+        &video_inputs,
+        range_start,
+        range_end,
+        interval_samples,
+    );
+    let speaker_mapping = if speaker_audio.is_empty() {
+        "No microphone/camera name pairs were detected; using visual decisions only.".into()
+    } else {
+        speaker_audio
+            .iter()
+            .map(|timeline| {
+                format!(
+                    "{} → {}",
+                    timeline.pair.audio_track_name, timeline.pair.video_track_name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    emit_agent_progress(
+        &app,
+        &session_id,
+        &started,
+        "speaker-audio",
+        &format!("Active-speaker mapping: {speaker_mapping}"),
+        0,
+        total_windows,
+    );
     // The final render still needs the mixed audio on disk for the ffmpeg-step (only
     // when the user clicks Process / when this isn't plan_only). Defer that until we
     // know we're not in plan_only mode.
@@ -4656,6 +4785,7 @@ pub async fn render_agent_video_edit(
             instructions.as_deref(),
             &edit_brief,
             Some(&audio_analysis),
+            &speaker_audio,
             &temp_dir,
         )
         .await
@@ -7065,6 +7195,244 @@ fn audio_features_text(features: &AgentAudioWindowFeatures) -> String {
     )
 }
 
+fn speaker_pair_tokens(value: &str) -> HashSet<String> {
+    const GENERIC: [&str; 14] = [
+        "audio",
+        "camera",
+        "cam",
+        "clean",
+        "microphone",
+        "mic",
+        "speaker",
+        "track",
+        "video",
+        "voice",
+        "source",
+        "recording",
+        "channel",
+        "stem",
+    ];
+    normalize_edit_text(value)
+        .split_whitespace()
+        .filter(|token| !GENERIC.contains(token))
+        .map(str::to_string)
+        .collect()
+}
+
+fn speaker_camera_pair_score(video_name: &str, audio_name: &str) -> i32 {
+    let video_tokens = speaker_pair_tokens(video_name);
+    let audio_tokens = speaker_pair_tokens(audio_name);
+    video_tokens
+        .intersection(&audio_tokens)
+        .map(|token| {
+            if token.len() == 1 || token.chars().all(|ch| ch.is_ascii_digit()) {
+                4
+            } else {
+                6
+            }
+        })
+        .sum()
+}
+
+/// Pair participant microphones with their corresponding close-up cameras using the
+/// stable labels already present in a session (for example speaker-a-david ↔ Camera A
+/// — David). The assignment is one-to-one; room/overview cameras naturally remain
+/// unpaired and are therefore never mistaken for an active speaker.
+fn pair_speaker_audio_to_video(
+    session: &MixSession,
+    clips: &[VideoRenderClip],
+) -> Vec<SpeakerTrackPair> {
+    let mut video_tracks = Vec::<(String, String)>::new();
+    for clip in clips {
+        if !video_tracks.iter().any(|(id, _)| id == &clip.track_id) {
+            video_tracks.push((clip.track_id.clone(), clip.track_name.clone()));
+        }
+    }
+    let audio_tracks = session
+        .tracks
+        .iter()
+        .filter(|track| {
+            track.kind == crate::model::TrackKind::Audio
+                && track.role.as_deref() != Some("mix")
+                && !track.name.to_lowercase().contains("background")
+        })
+        .collect::<Vec<_>>();
+
+    let mut candidates = Vec::<(i32, usize, usize)>::new();
+    for (video_index, (_, video_name)) in video_tracks.iter().enumerate() {
+        for (audio_index, audio) in audio_tracks.iter().enumerate() {
+            let name_score = speaker_camera_pair_score(video_name, &audio.name);
+            if name_score == 0 {
+                continue;
+            }
+            let clean_bonus = if normalize_edit_text(&audio.name).contains("clean voice") {
+                3
+            } else {
+                0
+            };
+            let audible_bonus = if audio.muted { 0 } else { 2 };
+            let generated_bonus = if audio.ai_generated { 1 } else { 0 };
+            candidates.push((
+                name_score + clean_bonus + audible_bonus + generated_bonus,
+                video_index,
+                audio_index,
+            ));
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut used_video = HashSet::new();
+    let mut used_audio = HashSet::new();
+    let mut pairs = Vec::new();
+    for (_, video_index, audio_index) in candidates {
+        if used_video.contains(&video_index) || used_audio.contains(&audio_index) {
+            continue;
+        }
+        used_video.insert(video_index);
+        used_audio.insert(audio_index);
+        let (video_track_id, video_track_name) = &video_tracks[video_index];
+        let audio = audio_tracks[audio_index];
+        pairs.push(SpeakerTrackPair {
+            video_track_id: video_track_id.clone(),
+            video_track_name: video_track_name.clone(),
+            audio_track_id: audio.id.clone(),
+            audio_track_name: audio.name.clone(),
+        });
+    }
+    pairs
+}
+
+fn percentile(values: &mut [f32], fraction: f32) -> f32 {
+    if values.is_empty() {
+        return -90.0;
+    }
+    values.sort_by(f32::total_cmp);
+    let index =
+        ((values.len().saturating_sub(1)) as f32 * fraction.clamp(0.0, 1.0)).round() as usize;
+    values[index]
+}
+
+fn build_speaker_audio_timelines(
+    session: &MixSession,
+    clips: &[VideoRenderClip],
+    range_start: u64,
+    range_end: u64,
+    interval_samples: u64,
+) -> Vec<SpeakerAudioTimeline> {
+    let pairs = pair_speaker_audio_to_video(session, clips);
+    let mut timelines = Vec::new();
+    for pair in pairs {
+        let mut isolated = session.clone();
+        for track in &mut isolated.tracks {
+            track.solo = false;
+            track.muted =
+                track.kind != crate::model::TrackKind::Audio || track.id != pair.audio_track_id;
+            if track.id == pair.audio_track_id {
+                // Sends can smear a voice into later windows and create false activity.
+                track.sends.reverb_db = -60.0;
+                track.sends.delay_db = -60.0;
+            }
+        }
+        let rendered = match crate::engine::render::render_session_range_to_buffer(
+            &isolated,
+            range_start,
+            range_end,
+        ) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                eprintln!(
+                    "[video] Could not analyze paired microphone {}: {error}",
+                    pair.audio_track_name
+                );
+                continue;
+            }
+        };
+        let analysis = RenderedAudioAnalysis {
+            samples: rendered.samples,
+            channels: rendered.channels as usize,
+            sample_rate: rendered.sample_rate,
+            timeline_start_sample: range_start,
+        };
+        let mut raw_levels = Vec::new();
+        let mut cursor = range_start;
+        while cursor < range_end {
+            let next = (cursor + interval_samples).min(range_end);
+            raw_levels.push(
+                audio_features_for_window(Some(&analysis), cursor, next, session.sample_rate)
+                    .rms_db,
+            );
+            cursor = next;
+        }
+        let mut for_noise = raw_levels.clone();
+        let mut for_speech = raw_levels.clone();
+        let noise_floor = percentile(&mut for_noise, 0.20);
+        let speech_level = percentile(&mut for_speech, 0.90);
+        let dynamic_span = (speech_level - noise_floor).max(8.0);
+        let levels = raw_levels
+            .into_iter()
+            .map(|rms_db| SpeakerWindowLevel {
+                rms_db,
+                activity: ((rms_db - noise_floor) / dynamic_span).clamp(0.0, 1.0),
+            })
+            .collect();
+        timelines.push(SpeakerAudioTimeline { pair, levels });
+    }
+    timelines
+}
+
+fn speaker_cue_for_window(
+    timelines: &[SpeakerAudioTimeline],
+    window_index: usize,
+    active_video_track_ids: &HashSet<&str>,
+) -> SpeakerCue {
+    if timelines.is_empty() {
+        return SpeakerCue::Unavailable;
+    }
+    let mut candidates = timelines
+        .iter()
+        .filter(|timeline| active_video_track_ids.contains(timeline.pair.video_track_id.as_str()))
+        .filter_map(|timeline| {
+            timeline
+                .levels
+                .get(window_index)
+                .copied()
+                .map(|level| (timeline, level))
+        })
+        .filter(|(_, level)| level.activity >= 0.25)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| b.1.activity.total_cmp(&a.1.activity));
+    let Some((leader, leader_level)) = candidates.first().copied() else {
+        return SpeakerCue::Pause;
+    };
+    if let Some((runner_up, runner_up_level)) = candidates.get(1).copied() {
+        let close_activity = leader_level.activity - runner_up_level.activity < 0.18;
+        let close_level = leader_level.rms_db - runner_up_level.rms_db < 3.0;
+        if runner_up_level.activity >= 0.35 && (close_activity || close_level) {
+            return SpeakerCue::Overlap {
+                speakers: vec![
+                    (
+                        leader.pair.audio_track_name.clone(),
+                        leader.pair.video_track_name.clone(),
+                        leader_level.activity,
+                    ),
+                    (
+                        runner_up.pair.audio_track_name.clone(),
+                        runner_up.pair.video_track_name.clone(),
+                        runner_up_level.activity,
+                    ),
+                ],
+            };
+        }
+    }
+    SpeakerCue::Active {
+        video_track_id: leader.pair.video_track_id.clone(),
+        video_track_name: leader.pair.video_track_name.clone(),
+        audio_track_name: leader.pair.audio_track_name.clone(),
+        rms_db: leader_level.rms_db,
+        activity: leader_level.activity,
+    }
+}
+
 async fn build_agent_edit_segments(
     app: &AppHandle,
     started: &std::time::Instant,
@@ -7079,6 +7447,7 @@ async fn build_agent_edit_segments(
     instructions: Option<&str>,
     edit_brief: &AgentEditBrief,
     audio_analysis: Option<&RenderedAudioAnalysis>,
+    speaker_audio: &[SpeakerAudioTimeline],
     temp_dir: &Path,
 ) -> Result<
     (
@@ -7202,6 +7571,16 @@ async fn build_agent_edit_segments(
             cursor = next;
             continue;
         }
+        let active_video_track_ids = active
+            .iter()
+            .map(|(_, clip)| clip.track_id.as_str())
+            .collect::<HashSet<_>>();
+        let speaker_cue = speaker_cue_for_window(
+            speaker_audio,
+            window_index.saturating_sub(1) as usize,
+            &active_video_track_ids,
+        );
+        let speaker_cue_text = speaker_cue.editorial_text();
         emit_agent_progress(
             app,
             &session.id,
@@ -7353,7 +7732,36 @@ async fn build_agent_edit_segments(
         } else {
             edit_history.join("\n")
         };
-        let merged = if image_count >= 2 && !vision_off {
+        let speaker_choice_index = speaker_cue.active_video_track_id().and_then(|track_id| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.track_id.as_deref() == Some(track_id))
+        });
+        // A clearly active mapped microphone is a stronger directing signal than a
+        // generic visual preference. Choose its readable paired camera directly and
+        // save the vision model for pauses, overlaps and ambiguous moments.
+        let merged = if let Some(choice_index) = speaker_choice_index {
+            let candidate = &candidates[choice_index];
+            Some(AgentMergedChoice {
+                candidate_labels: None,
+                candidate_notes: None,
+                window_summary: Some(format!(
+                    "Microphone activity identifies {} as the clear active-speaker shot.",
+                    candidate.track_name
+                )),
+                choice: Some(choice_index + 1),
+                chosen_track_id: candidate.track_id.clone(),
+                decision: Some("cut".into()),
+                reason: Some(speaker_cue_text.clone()),
+                edit_intent: Some("active speaker".into()),
+                continuity_plan: Some(
+                    "Hold this participant while their microphone remains dominant.".into(),
+                ),
+                look_preset: None,
+                color_grade: None,
+                video_effects: None,
+            })
+        } else if image_count >= 2 && !vision_off {
             match analyze_and_decide_window(
                 base_url,
                 vision_model,
@@ -7368,6 +7776,7 @@ async fn build_agent_edit_segments(
                 edit_brief,
                 primary_chosen_windows,
                 primary_eligible_windows,
+                &speaker_cue_text,
             )
             .await
             {
@@ -7598,6 +8007,8 @@ async fn build_agent_edit_segments(
                 }
             }
         }
+        let speaker_directed = speaker_choice_index.is_some();
+        let speaker_override_reason = speaker_directed.then(|| speaker_cue_text.clone());
         let mut direction_override_reason: Option<String> = None;
         if let Some(primary) = primary_rule {
             if let Some(primary_label_index) = labels
@@ -7605,42 +8016,46 @@ async fn build_agent_edit_segments(
                 .position(|(input_index, _)| clips[*input_index].track_id == primary.track_id)
             {
                 primary_eligible_windows += 1;
-                let chosen_clip = &clips[labels[chosen_label_index].0];
-                let minimum = primary.minimum_coverage.unwrap_or(0.70).clamp(0.0, 1.0);
-                let required_primary =
-                    ((minimum * primary_eligible_windows as f32) - 0.0001).ceil() as u32;
-                if chosen_clip.track_id != primary.track_id
-                    && primary_chosen_windows < required_primary
-                {
-                    chosen_label_index = primary_label_index;
-                    direction_override_reason = Some(format!(
-                        "Enforced the directing contract: {} must remain at or above {:.0}% coverage.",
-                        primary.track_name,
-                        minimum * 100.0
-                    ));
-                } else if chosen_clip.track_id != primary.track_id {
-                    if let Some(insert_rule) = edit_brief
-                        .sources
-                        .iter()
-                        .find(|rule| rule.track_id == chosen_clip.track_id && rule.role == "insert")
+                // During clearly detected speech, the matching participant camera is
+                // authoritative. Main-camera coverage still governs pauses/overlaps.
+                if !speaker_directed {
+                    let chosen_clip = &clips[labels[chosen_label_index].0];
+                    let minimum = primary.minimum_coverage.unwrap_or(0.70).clamp(0.0, 1.0);
+                    let required_primary =
+                        ((minimum * primary_eligible_windows as f32) - 0.0001).ceil() as u32;
+                    if chosen_clip.track_id != primary.track_id
+                        && primary_chosen_windows < required_primary
                     {
-                        if let Some(maximum_seconds) = insert_rule.maximum_insert_seconds {
-                            let prior_same_seconds = previous_input_index
-                                .filter(|previous| {
-                                    clips[*previous].track_id == chosen_clip.track_id
-                                })
-                                .map(|_| {
-                                    consecutive_same as f64 * interval_samples as f64
-                                        / sample_rate as f64
-                                })
-                                .unwrap_or(0.0);
-                            let this_seconds = (next - cursor) as f64 / sample_rate as f64;
-                            if prior_same_seconds + this_seconds > maximum_seconds as f64 + 0.001 {
-                                chosen_label_index = primary_label_index;
-                                direction_override_reason = Some(format!(
-                                    "Enforced the directing contract: {} inserts are limited to {:.1}s.",
-                                    insert_rule.track_name, maximum_seconds
-                                ));
+                        chosen_label_index = primary_label_index;
+                        direction_override_reason = Some(format!(
+                            "Enforced the directing contract: {} must remain at or above {:.0}% coverage.",
+                            primary.track_name,
+                            minimum * 100.0
+                        ));
+                    } else if chosen_clip.track_id != primary.track_id {
+                        if let Some(insert_rule) = edit_brief.sources.iter().find(|rule| {
+                            rule.track_id == chosen_clip.track_id && rule.role == "insert"
+                        }) {
+                            if let Some(maximum_seconds) = insert_rule.maximum_insert_seconds {
+                                let prior_same_seconds = previous_input_index
+                                    .filter(|previous| {
+                                        clips[*previous].track_id == chosen_clip.track_id
+                                    })
+                                    .map(|_| {
+                                        consecutive_same as f64 * interval_samples as f64
+                                            / sample_rate as f64
+                                    })
+                                    .unwrap_or(0.0);
+                                let this_seconds = (next - cursor) as f64 / sample_rate as f64;
+                                if prior_same_seconds + this_seconds
+                                    > maximum_seconds as f64 + 0.001
+                                {
+                                    chosen_label_index = primary_label_index;
+                                    direction_override_reason = Some(format!(
+                                        "Enforced the directing contract: {} inserts are limited to {:.1}s.",
+                                        insert_rule.track_name, maximum_seconds
+                                    ));
+                                }
                             }
                         }
                     }
@@ -7699,7 +8114,9 @@ async fn build_agent_edit_segments(
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
             let chosen_image_number = chosen_label_index + 1;
-            let model_decision = if direction_override_reason.is_some() {
+            let model_decision = if speaker_directed {
+                "active-speaker"
+            } else if direction_override_reason.is_some() {
                 "contract"
             } else if coverage_override {
                 "coverage-cut"
@@ -7743,7 +8160,12 @@ async fn build_agent_edit_segments(
                 .and_then(|choice| choice.continuity_plan.as_deref())
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            let reason = if let Some(contract_reason) = direction_override_reason.as_deref() {
+            let reason = if let Some(speaker_reason) = speaker_override_reason.as_deref() {
+                format!(
+                    "Decision active-speaker. Image {chosen_image_number} ({}). {speaker_reason}",
+                    clip.track_name
+                )
+            } else if let Some(contract_reason) = direction_override_reason.as_deref() {
                 format!(
                     "Decision contract. Image {chosen_image_number} ({}). {contract_reason} Model rationale: {model_reason}",
                     clip.track_name
@@ -7810,6 +8232,7 @@ async fn build_agent_edit_segments(
                 format!("Vision model: {vision_model}"),
                 format!("Edit decision model: {edit_model}"),
                 format!("Audio features: {}", audio_features_text(&audio_features)),
+                format!("Active-speaker analysis: {speaker_cue_text}"),
                 format!("Frame-analysis summary: {frame_summary}"),
             ];
             data_provided.extend(candidates.iter().map(|candidate| {
@@ -8090,6 +8513,7 @@ async fn analyze_and_decide_window(
     edit_brief: &AgentEditBrief,
     primary_chosen_windows: u32,
     primary_eligible_windows: u32,
+    speaker_cue: &str,
 ) -> Result<AgentMergedChoice, String> {
     let label_text = labels
         .iter()
@@ -8132,6 +8556,8 @@ async fn analyze_and_decide_window(
          1. Explicit source roles, minimum/maximum coverage, insert duration, exclusions, and original-look rules are NON-NEGOTIABLE.\n\
          2. The user's creative and pacing direction controls the edit inside those boundaries.\n\
          3. Your professional taste resolves only choices the user left open. Never override levels 1 or 2 to add variety or show a locally prettier frame.\n\
+         ACTIVE-SPEAKER AUDIO CUE: {speaker_cue}\n\
+         For conversation edits, a clear mapped active-speaker cue outranks visual variety. The room overview is not a default shot: use it only briefly during a genuine pause, overlap, reaction, or establishing moment.\n\
          Creative-freedom mode `{}` means: faithful = conservative and literal; balanced = tasteful initiative inside the contract; director = bold storytelling inside the same hard constraints. Pacing mode is `{}`.\n\
          Primary-camera compliance before this window: {primary_chosen_windows}/{primary_eligible_windows} eligible decisions.\n\
          Images are in this order:\n{label_text}\n\
@@ -8767,11 +9193,14 @@ mod video_solo_tests {
 
 #[cfg(test)]
 mod directed_video_edit_tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     use super::{
-        normalize_agent_edit_brief, validate_agent_edit_script, AgentEditBrief,
-        AgentEditSourceRule, AgentVideoScriptCandidate, AgentVideoScriptEntry, VideoRenderClip,
+        normalize_agent_edit_brief, speaker_camera_pair_score, speaker_cue_for_window,
+        validate_agent_edit_script, AgentEditBrief, AgentEditSourceRule, AgentVideoScriptCandidate,
+        AgentVideoScriptEntry, SpeakerAudioTimeline, SpeakerCue, SpeakerTrackPair,
+        SpeakerWindowLevel, VideoRenderClip,
     };
     use crate::model::VideoLayout;
 
@@ -8838,6 +9267,58 @@ mod directed_video_edit_tests {
         assert_eq!(camera_one.role, "insert");
         assert_eq!(camera_one.maximum_insert_seconds, Some(3.0));
         assert_eq!(normalized.look_mode, "original");
+    }
+
+    #[test]
+    fn participant_names_pair_mics_to_closeups_but_not_room_overview() {
+        assert!(
+            speaker_camera_pair_score("Camera A — David", "speaker-a-david · Clean Voice")
+                > speaker_camera_pair_score(
+                    "Camera A — David",
+                    "speaker-b-project-manager · Clean Voice"
+                )
+        );
+        assert!(
+            speaker_camera_pair_score("Camera B — Project Manager", "speaker-b-project-manager")
+                > 0
+        );
+        assert_eq!(
+            speaker_camera_pair_score("Camera 5 — Room Overview", "speaker-a-david"),
+            0
+        );
+    }
+
+    #[test]
+    fn clear_microphone_activity_selects_its_paired_camera() {
+        let timeline = |video_id: &str, video_name: &str, audio_name: &str, activity: f32| {
+            SpeakerAudioTimeline {
+                pair: SpeakerTrackPair {
+                    video_track_id: video_id.into(),
+                    video_track_name: video_name.into(),
+                    audio_track_id: format!("audio-{video_id}"),
+                    audio_track_name: audio_name.into(),
+                },
+                levels: vec![SpeakerWindowLevel {
+                    rms_db: -18.0 - (1.0 - activity) * 10.0,
+                    activity,
+                }],
+            }
+        };
+        let timelines = vec![
+            timeline("camera-a", "Camera A — David", "speaker-a-david", 0.92),
+            timeline(
+                "camera-b",
+                "Camera B — Project Manager",
+                "speaker-b-project-manager",
+                0.20,
+            ),
+        ];
+        let active = HashSet::from(["camera-a", "camera-b", "camera-room"]);
+        let cue = speaker_cue_for_window(&timelines, 0, &active);
+        assert!(matches!(
+            cue,
+            SpeakerCue::Active { video_track_id, .. } if video_track_id == "camera-a"
+        ));
     }
 
     #[test]

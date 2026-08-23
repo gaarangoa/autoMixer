@@ -63,6 +63,29 @@ pub fn redo(project: &mut MixProject) -> Result<Option<HistoryEntry>, String> {
     Ok(Some(entry))
 }
 
+/// Return a project to the state it had before its first undoable edit.
+///
+/// The reset is assembled on a clone so a malformed historical patch cannot leave the
+/// live project half-reset. Original imported media is not part of the edit history and
+/// therefore remains in place. The reverted entries are kept on the redo stack, making
+/// the operation recoverable until the user makes a new edit.
+pub fn reset_all_changes(project: &mut MixProject) -> Result<usize, String> {
+    let reverted_entries = project.history.len();
+    if reverted_entries == 0 {
+        return Ok(0);
+    }
+
+    let mut reset = project.clone();
+    // A hard reset should expose one clean redo path back to the state that existed at
+    // invocation time, not retain an older abandoned branch as well.
+    reset.redo_stack.clear();
+    while !reset.history.is_empty() {
+        undo(&mut reset)?;
+    }
+    *project = reset;
+    Ok(reverted_entries)
+}
+
 pub fn record_patch(
     project: &mut MixProject,
     forward_patch: Vec<JsonPatchOp>,
@@ -951,6 +974,46 @@ mod tests {
         undo(&mut p).unwrap();
         assert!((p.session.tracks[0].pan - 0.0).abs() < 1e-6);
         redo(&mut p).unwrap();
+        assert!((p.session.tracks[0].pan - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reset_all_changes_restores_initial_state_and_keeps_redo_path() {
+        let mut p = project(fresh_session());
+        let id = p.session.tracks[0].id.clone();
+        let original = p.session.clone();
+        apply_actions(
+            &mut p,
+            &[MixAction::SetTrackGain {
+                track_id: id.clone(),
+                gain_db: -6.0,
+            }],
+            HistorySource::Assistant,
+            Some("agent gain".into()),
+        )
+        .unwrap();
+        apply_actions(
+            &mut p,
+            &[MixAction::SetTrackPan {
+                track_id: id,
+                pan: 0.5,
+            }],
+            HistorySource::User,
+            Some("manual pan".into()),
+        )
+        .unwrap();
+
+        assert_eq!(reset_all_changes(&mut p).unwrap(), 2);
+        assert_eq!(p.history.len(), 0);
+        assert_eq!(p.redo_stack.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&p.session).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+
+        redo(&mut p).unwrap();
+        redo(&mut p).unwrap();
+        assert!((p.session.tracks[0].gain_db - (-6.0)).abs() < 1e-6);
         assert!((p.session.tracks[0].pan - 0.5).abs() < 1e-6);
     }
 }

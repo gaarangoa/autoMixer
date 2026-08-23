@@ -21,7 +21,7 @@ scope to specific source cameras before an edit.
 
 | The user wants… | Use | Notes |
 |---|---|---|
-| A multicam cut / "edit the video" / a color **look** ("cinematic", "vivid", "warm") | `edit_video` | Returns IMMEDIATELY ("started") and generates a reviewable plan in the background. Tell the user planning started; do NOT claim rendering is done or re-run to "check". The user reviews source roles, constraints, cuts, and compliance, then clicks Process. Looks are applied only at render time — never bake them into source clips. |
+| A multicam cut / "edit the video" / a color **look** ("cinematic", "vivid", "warm") | `edit_video` | Returns IMMEDIATELY ("started"), analyzes and renders in the background, then adds/updates the `Agent video edit` track. Tell the user rendering started; do NOT claim it is already done or re-run to "check". Use `review_only=true` only when the user explicitly asks to approve the plan first. Looks are applied to the rendered edit — never bake them into source clips. |
 | **Fade in/out** or **speed** ("fade in 2s, fade out 10s", "half speed") | `apply_video_effects` | Fast, in place, reversible. fadeIn/fadeOut 0–10s, speed 0.25–4. This is the ONLY way to fade — never fake it with audio gain/automation. |
 | A persistent **crop / reframe / rotate** of a SOURCE clip | `set_clip_layout` | Geometry only (see fields below). Modifies the source recording, so use only when the user wants a permanent geometry change. |
 | "Auto-crop to the subject" / "reframe to portrait" (no exact numbers) | `auto_crop` | The video model looks at a frame and chooses the crop. |
@@ -35,15 +35,27 @@ scope to specific source cameras before an edit.
 ## edit_video instructions — looks & pacing
 Put the look + pacing in `instructions`. Recognized look words include: cinematic/epic,
 vivid/saturated/punchy, warm/golden/sunset, cool/teal, vintage/retro, moody, noir, mono,
-dream. `interval_seconds` sets sampling density (2–3 is a good default; 1 = more cuts,
-slower). Fades/speed can also be requested here, but for fade-only changes prefer
+dream. `interval_seconds` sets decision density. Use the 0.5-second default for
+speaker-aware conversation edits; longer values are suitable for slower music edits.
+Fades/speed can also be requested here, but for fade-only changes prefer
 `apply_video_effects` (no re-edit).
+
+For a conversation with separately recorded participant microphones and corresponding
+cameras, preserve the A/B/C/D (or participant-name) relationship in the source names.
+AutoMixer measures each microphone independently, pairs it with the matching camera, and
+uses clear foreground speech as the authoritative cut cue. An unpaired room/overview
+camera is reserved for brief pauses, overlap, reactions, or establishing context; it must
+not replace a readable active-speaker camera merely because the wide frame looks cleaner.
 
 When the user assigns source roles or limits, preserve them precisely in `instructions`:
 name the main camera, the requested minimum coverage, which tracks are inserts/excluded,
 maximum insert length/count, and whether visuals must remain original. These are binding
 directing constraints, not suggestions. The backend compiles them into a visible directing
 contract, validates the plan, and enforces main-camera coverage and insert duration.
+
+By default, a direct request such as "create/edit the video" proceeds through analysis and
+final rendering without another approval step. Set `review_only=true` only for an explicit
+request to inspect or modify the cut plan before rendering.
 
 ## Editing taste
 - Cut on the energy: hold a shot while it's working; cut when the moment shifts or the

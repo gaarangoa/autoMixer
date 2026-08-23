@@ -171,6 +171,30 @@ fn physical_memory_bytes() -> Option<u64> {
     }
 }
 
+fn hermes_runtime_ready(hermes: &Path) -> bool {
+    if !hermes.is_file()
+        || !Command::new(hermes)
+            .args(["acp", "--check"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    {
+        return false;
+    }
+    let Some(bin_dir) = hermes.parent() else {
+        return false;
+    };
+    let python = if cfg!(windows) {
+        bin_dir.join("python.exe")
+    } else {
+        bin_dir.join("python")
+    };
+    python.is_file()
+        && Command::new(python)
+            .args(["-c", "import mcp"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+}
+
 fn setup_status_sync() -> SetupStatus {
     let root = managed_root().unwrap_or_else(|_| PathBuf::from(".automixer"));
     let tool_status = crate::media_tools::check_external_dependencies();
@@ -192,13 +216,9 @@ fn setup_status_sync() -> SetupStatus {
         .filter(|path| path.is_file())
         .cloned()
         .unwrap_or(fallback_hermes);
-    let hermes_ready = hermes_path.is_file()
-        && Command::new(&hermes_path)
-            .args(["acp", "--check"])
-            .output()
-            .is_ok_and(|output| output.status.success());
+    let hermes_ready = hermes_runtime_ready(&hermes_path);
     if !hermes_ready {
-        errors.push("Hermes ACP runtime is not installed".into());
+        errors.push("Hermes ACP runtime or its MCP client is not installed".into());
     }
 
     let model_path = root.join("models").join(MODEL_FILE);
@@ -391,12 +411,7 @@ fn ensure_not_cancelled() -> Result<(), String> {
 
 async fn install_managed_hermes(app: &AppHandle) -> Result<(), String> {
     let hermes = managed_hermes_bin()?;
-    if hermes.is_file()
-        && Command::new(&hermes)
-            .args(["acp", "--check"])
-            .output()
-            .is_ok_and(|output| output.status.success())
-    {
+    if hermes_runtime_ready(&hermes) {
         emit_progress(app, "hermes", "Hermes ACP runtime is ready.", 1, 1);
         return Ok(());
     }
@@ -433,13 +448,17 @@ async fn install_managed_hermes(app: &AppHandle) -> Result<(), String> {
                 .env("UV_PYTHON_INSTALL_DIR", &python_install)
                 .args(["pip", "install", "--python"])
                 .arg(&python)
-                .arg(format!("hermes-agent[acp]=={HERMES_VERSION}")),
-            "install Hermes ACP",
+                .arg(format!("hermes-agent[acp,mcp]=={HERMES_VERSION}")),
+            "install Hermes ACP and MCP client",
         )?;
         let hermes = venv.join("bin").join("hermes");
         run_checked(
             Command::new(&hermes).args(["acp", "--check"]),
             "verify Hermes ACP",
+        )?;
+        run_checked(
+            Command::new(&python).args(["-c", "import mcp"]),
+            "verify Hermes MCP client",
         )
     })
     .await?;

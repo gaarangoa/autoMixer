@@ -14,6 +14,7 @@ pub mod defaults;
 pub mod engine;
 pub mod hermes_service;
 pub mod media_tools;
+pub mod mix_track;
 pub mod model;
 pub mod recorder;
 pub mod sam_audio;

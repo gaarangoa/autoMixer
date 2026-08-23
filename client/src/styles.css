@@ -10781,11 +10781,11 @@ button.primary:hover { filter: brightness(1.09); }
 
 .assistant > .chat-input .chat-composer-shell textarea {
   width: 100%;
-  min-height: 44px;
-  max-height: 130px;
+  min-height: 52px;
+  max-height: 150px;
   box-sizing: border-box;
   margin: 0;
-  padding: 11px 46px 11px 13px;
+  padding: 13px 46px 13px 13px;
   border: 1px solid #313737;
   border-radius: 10px;
   color: #dce1e2;
@@ -10807,7 +10807,7 @@ button.primary:hover { filter: brightness(1.09); }
 .assistant > .chat-input .chat-send {
   position: absolute;
   right: 7px;
-  bottom: 7px;
+  bottom: 11px;
   display: grid;
   place-items: center;
   width: 30px;

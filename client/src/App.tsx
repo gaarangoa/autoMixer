@@ -889,7 +889,7 @@ export function App() {
   const splitPrepareTokenRef = useRef(0);
   const [exportFormat, setExportFormat] = useState<"wav" | "mp3">("mp3");
   const [videoEditorOpen, setVideoEditorOpen] = useState(false);
-  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("2");
+  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("0.5");
   const [agentVideoModel, setAgentVideoModel] = useState(() => initialAgentVideoModelRef.current ?? DEFAULT_AGENT_VIDEO_MODEL);
   const [agentVideoEditModel, setAgentVideoEditModel] = useState(() => initialAgentVideoEditModelRef.current ?? initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
   const [agentVideoInstructions, setAgentVideoInstructions] = useState(() => initialAgentVideoInstructionsRef.current ?? "");
@@ -9053,7 +9053,7 @@ export function VideoEditorWindowApp() {
   const [selectedRange, setSelectedRange] = useState<{ start: number; end: number } | undefined>(initialPayloadRef.current?.range);
   const [playhead, setPlayhead] = useState(initialPayloadRef.current?.playhead ?? 0);
   const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
-  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("2");
+  const [agentIntervalSeconds, setAgentIntervalSeconds] = useState("0.5");
   const [agentVideoModel, setAgentVideoModel] = useState(() => initialAgentVideoModelRef.current ?? DEFAULT_AGENT_VIDEO_MODEL);
   const [agentVideoEditModel, setAgentVideoEditModel] = useState(() => initialAgentVideoEditModelRef.current ?? initialOllamaModelRef.current ?? DEFAULT_OLLAMA_MODEL);
   const [agentVideoInstructions, setAgentVideoInstructions] = useState(() => initialAgentVideoInstructionsRef.current ?? "");

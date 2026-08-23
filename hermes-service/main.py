@@ -32,7 +32,6 @@ import acp
 from acp.schema import (
     AllowedOutcome,
     DeniedOutcome,
-    McpServerStdio,
     RequestPermissionResponse,
 )
 from fastapi import FastAPI
@@ -54,14 +53,22 @@ def _default_hermes_bin() -> str:
 HERMES = os.environ.get("AUTOMIXER_HERMES_BIN", _default_hermes_bin())
 UV = os.environ.get("AUTOMIXER_UV", str(Path.home() / ".local" / "bin" / "uv"))
 MCP_DIR = os.environ.get("AUTOMIXER_MCP_DIR", str(Path(__file__).parent / "automixer-mcp"))
-MCP_REQUIRED_TOOLS = {"get_session", "select_tracks", "edit_video", "clean_podcast_audio"}
+MCP_REQUIRED_TOOLS = {
+    "get_session",
+    "select_tracks",
+    "edit_video",
+    "clean_podcast_audio",
+    "create_mix_track",
+    "reset_all_changes",
+}
 
 # Tool-name fragments we trust (our control-surface tools). Anything else the
 # agent tries to call is refused.
 ALLOWED_TOOL_HINTS = ("automixer", "get_session", "set_track", "adjust_track", "mute_track",
                       "solo_track", "set_eq", "set_compressor", "set_high_pass", "set_low_pass",
                       "set_reverb", "set_delay", "set_master", "clean_podcast", "podcast_cleanup",
-                      "sam_audio", "undo", "redo")
+                      "sam_audio", "create_mix_track", "mix_track", "bounce", "undo", "redo",
+                      "reset_all_changes", "hard_reset")
 
 
 def _tool_allowed(tool_call) -> bool:
@@ -226,7 +233,7 @@ class Bridge:
         no_skills = Path.home() / ".automixer" / "hermes-no-skills"
         no_skills.mkdir(parents=True, exist_ok=True)
         env["HERMES_BUNDLED_SKILLS"] = str(no_skills)
-        # Deploy AutoMixer's CURATED skills (mixing/video/auto-mix doctrine) into the
+        # Deploy AutoMixer's CURATED skills (mixing/video doctrine) into the
         # dedicated home's skills dir, so the agent loads only these — the heavy
         # vocabulary/taste lives here (loaded on demand) instead of bloating every tool
         # description. Synced each launch so editing a repo skill updates the agent.
@@ -247,6 +254,8 @@ class Bridge:
             return
         dst_root = Path(hermes_home) / "skills"
         dst_root.mkdir(parents=True, exist_ok=True)
+        # Remove the generated copy of the retired agent-facing auto-mix skill.
+        shutil.rmtree(dst_root / "auto-mix", ignore_errors=True)
         for skill_dir in src.iterdir():
             if not skill_dir.is_dir():
                 continue
@@ -270,10 +279,9 @@ class Bridge:
         existing = self.acp_for_mix.get(mix_session_id)
         if existing:
             return existing
-        # Rely on the globally-configured `automixer` MCP server (in ~/.hermes/config.yaml)
-        # rather than passing one per-session: only the config entry can carry a per-server
-        # `timeout` (ACP's McpServerStdio has no timeout field), and the long-running
-        # edit_video / auto_mix tools need more than the default 300s.
+        # Use the AutoMixer MCP server from the dedicated Hermes config. Unlike ACP's
+        # per-session server descriptor, that config carries the 7,200-second timeout
+        # required by SAM-Audio cleanup and video renders.
         new = await self.conn.new_session(cwd=MCP_DIR, mcp_servers=None)
         self.acp_for_mix[mix_session_id] = new.session_id
         return new.session_id

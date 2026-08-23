@@ -6,7 +6,6 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [audio, mix, mixing, eq, gain, pan, compress, fader, vocal, master]
-    related_skills: [auto-mix]
 ---
 
 # AutoMixer — Audio Mixing
@@ -77,19 +76,30 @@ So:
   everything that isn't kick/bass.
 - **To give DEPTH/space:** `set_reverb_send` / `set_delay_send` — leads drier/forward,
   backgrounds wetter/back.
-- **Whole-mix request** ("mix this", "make it sound good/professional", "auto-mix"):
-  strongly consider running **`auto_mix`** (see the auto-mix skill) — it applies the full
-  chain (cleanup filters, subtractive EQ, compression, tonal shaping, depth/space,
-  section automation, master) across all tracks. Then refine specifics (e.g. feature a
-  solo) with targeted `apply_actions` moves. Do NOT hand-apply 6 gain changes and call it
-  a professional mix.
-
-An explicit instruction such as **"do not use auto mix" always wins**. In that case stay
-inside `apply_actions`, make measured per-track moves, and do not call or suggest
-`auto_mix` during that turn.
+- **Whole-mix request** ("mix this", "make it sound good/professional"): stay inside
+  `apply_actions` and build one measured, per-track processing pass: balance, cleanup
+  filters, subtractive EQ, compression, tonal shaping, restrained depth, and master
+  headroom as appropriate. Then verify the persisted state with `get_session`. Do NOT
+  hand-apply a few generic gain changes and call it a professional mix.
 
 Use the full vocabulary above. After a request like this, your applied actions should
 include EQ and/or compression and/or sends — not only `set_track_gain`.
+
+## Bounce selected tracks into a mix track
+
+Use `create_mix_track` when the user asks to create, print, bounce, or consolidate a mix
+track from selected audio tracks. Omit `track_ids` to respect the current UI selection.
+This renders the selected tracks through their clip edits and track processing into one
+timeline-aligned track; it is not a file export.
+
+- Leave `include_master=false` unless the user explicitly requests a master-processed
+  print. The normal bounce excludes master processing so project playback applies it once.
+- By default the source tracks stay unchanged and the new mix track starts muted, avoiding
+  doubled playback. For “replace these with a mix track” or “mute the sources,” pass
+  `mute_sources=true`; the sources are muted and the new track is audible.
+- Use `mono=true` for a deliberately mono dialogue/podcast bounce. Otherwise keep stereo.
+- The operation is one undoable history entry. Never approximate it by exporting a file
+  and claiming a session track was created.
 
 ## Podcast / spoken-word doctrine
 
@@ -98,21 +108,33 @@ effects. It is a dry, centered production unless the user asks for a stylized so
 
 ### SAM-Audio voice cleanup comes first
 
-For a request to create a high-quality podcast mix from original microphone tracks, run
+For a request to create a high-quality podcast mix from microphone or conversation tracks, run
 **`clean_podcast_audio` before EQ, compression, or level matching**. SAM-Audio is the
 dialogue-cleanup stage: it isolates the close-miked spoken voice and rejects steady
 background noise, room tone, hum, fan noise, and off-mic speech spill.
 
+Normally omit the optional prompt. AutoMixer uses the SAM-compatible lowercase phrase
+`person speaking` for an individual microphone and `people speaking` for a generated
+mix/bounce that may contain multiple speakers. If refinement is necessary, pass only a
+short noun/verb phrase such as `woman speaking`, `man speaking`, or `people speaking`.
+Never pass a denoising instruction list or production brief as the SAM prompt; verbose
+prompts can put speech in the residual.
+
 - AutoMixer posts a visible notice before processing begins, including that audio is sent
   to the configured SAM-Audio endpoint. Do not hide this stage from the user.
-- The tool preserves and mutes each original microphone, adds only the isolated
-  `<original> · Clean Voice` replacement to the audible mix, and inherits the original
-  mic's downstream processing. It deliberately does **not** leave the background residual
+- The tool preserves and mutes each source track, adds only the isolated
+  `<source> · Clean Voice` replacement to the audible mix, and inherits the source's
+  downstream processing. It deliberately does **not** leave the background residual
   audible, because voice + residual would reconstruct the noisy source.
 - Respect selected audio tracks. With no selection, clean all unmuted original podcast
-  microphones. Never run the tool again on AI-generated or `Clean Voice` tracks.
+  microphones. An explicitly selected generated mix/bounce track with role `mix`, such as
+  `Selected Tracks · Mix`, is valid input and must be cleaned directly when requested.
+  Never run the tool again on a `Clean Voice` track or another generated stem.
 - If SAM-Audio is unavailable or separation fails, say exactly that and leave the source
   unchanged. Never claim the noise was removed because a job merely started.
+- AutoMixer validates that speech-like activity remains in the target before it mutes an
+  source track. If the voice lands in the residual, validation rejects the stem and leaves
+  that source unchanged; report the failure instead of continuing the mix.
 - If the user explicitly refuses remote processing or asks to preserve the original sound
   without source separation, skip SAM-Audio and explain the limitation.
 - Source separation can occasionally create speech artifacts. Keep the original muted,
